@@ -158,9 +158,10 @@ class AgentPrompt:
             if mcp_tools:
                 if default_tool_format:
                     parts.append(default_tool_format)
-                parts.append(
-                    f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
-                )
+                if self.tool_format != "native":
+                    parts.append(
+                        f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
+                    )
             return "\n\n".join(parts)
 
         # 1. 自定义模板覆盖整个主体，通过占位符按需引用默认模块
@@ -190,11 +191,18 @@ class AgentPrompt:
                     intro = extra_context.strip() + "\n\n" + intro
                 parts.append(intro)
 
-                if default_tool_format:
-                    parts.append(default_tool_format)
-                parts.append(
-                    f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
-                )
+                if self.tool_format == "native":
+                    # native 模式：工具定义通过 API tools 参数传递，
+                    # system prompt 只保留简要使用说明，不注入工具 JSON schema
+                    if default_tool_format:
+                        parts.append(default_tool_format)
+                else:
+                    # xml 模式：在 system prompt 中注入完整工具格式说明 + JSON schema
+                    if default_tool_format:
+                        parts.append(default_tool_format)
+                    parts.append(
+                        f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
+                    )
             else:
                 # 无工具：只保留日期时间，不注入工具相关描述
                 date_line = f"Today is: {formatted_date}. Current time: {formatted_time}."

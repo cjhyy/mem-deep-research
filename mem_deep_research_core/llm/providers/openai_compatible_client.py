@@ -188,6 +188,14 @@ class OpenAICompatibleClient(LLMProviderClientBase):
             if extra_body:
                 params["extra_body"] = extra_body
 
+            # Native tool calling: convert tool definitions to OpenAI tools format
+            # and pass via API `tools` parameter (required for models that don't
+            # follow XML tool format instructions, e.g. Sonnet 4.6 via OpenRouter)
+            if tools_definitions:
+                tool_list = await self.convert_tool_definition_to_tool_call(tools_definitions)
+                if tool_list:
+                    params["tools"] = tool_list
+
             # Add optional parameters only if they have non-default values
             if self.top_p != 1.0:
                 params["top_p"] = self.top_p
@@ -296,13 +304,18 @@ class OpenAICompatibleClient(LLMProviderClientBase):
             return "", True
 
         # Extract LLM response text
-        if llm_response.choices[0].finish_reason == "stop":
+        finish_reason = llm_response.choices[0].finish_reason
+        if finish_reason == "stop":
             assistant_response_text = llm_response.choices[0].message.content or ""
             assistant_response_text = self._clean_user_content_from_response(
                 assistant_response_text
             )
             message_history.append({"role": "assistant", "content": assistant_response_text})
-        elif llm_response.choices[0].finish_reason == "length":
+        elif finish_reason == "tool_calls":
+            # Native tool calling: model returned tool_calls via API
+            assistant_response_text = llm_response.choices[0].message.content or ""
+            message_history.append({"role": "assistant", "content": assistant_response_text})
+        elif finish_reason == "length":
             assistant_response_text = llm_response.choices[0].message.content or ""
             if assistant_response_text == "":
                 assistant_response_text = "LLM response is empty. This is likely due to thinking block used up all tokens."
@@ -312,10 +325,9 @@ class OpenAICompatibleClient(LLMProviderClientBase):
                 )
             message_history.append({"role": "assistant", "content": assistant_response_text})
         else:
-            logger.error(f"Unsupported finish reason: {llm_response.choices[0].finish_reason}")
-            assistant_response_text = (
-                "Successful response, but unsupported finish reason: "
-                + llm_response.choices[0].finish_reason
+            logger.error(f"Unsupported finish reason: {finish_reason}")
+            assistant_response_text = "Successful response, but unsupported finish reason: " + str(
+                finish_reason
             )
             message_history.append({"role": "assistant", "content": assistant_response_text})
         logger.debug(f"LLM Response: {truncate_for_log(assistant_response_text)}")
@@ -323,9 +335,20 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         return assistant_response_text, False
 
     def extract_tool_calls_info(self, llm_response, assistant_response_text):
-        """Extract tool call information from OpenAI LLM response."""
+        """Extract tool call information from OpenAI LLM response.
+
+        Checks native tool_calls first (from API response), then falls back
+        to XML text parsing for models using xml tool_format.
+        """
         from mem_deep_research_core.utils.parsing_utils import parse_llm_response_for_tool_calls
 
+        # Check for native tool_calls in the API response (e.g. Sonnet via OpenRouter)
+        if llm_response and llm_response.choices:
+            message = llm_response.choices[0].message
+            if hasattr(message, "tool_calls") and message.tool_calls:
+                return parse_llm_response_for_tool_calls(message.tool_calls)
+
+        # Fallback: parse XML <use_mcp_tool> tags from text
         return parse_llm_response_for_tool_calls(assistant_response_text)
 
     def _deduplicate_tool_results(self, tool_call_info: list) -> list:
