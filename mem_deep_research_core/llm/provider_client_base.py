@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import dataclasses
 import json
 import os
@@ -10,6 +11,10 @@ from typing import (
 )
 
 from omegaconf import DictConfig
+
+_temperature_override_var: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    '_temperature_override', default=None
+)
 from tenacity import (
     retry,
     retry_if_not_exception_type,
@@ -51,7 +56,7 @@ class LLMProviderClientBase(ABC):
         self.max_context_length: int = self.cfg.llm.get("max_context_length", -1)
         self.oai_tool_thinking: bool = self.cfg.llm.oai_tool_thinking
         self.async_client: bool = self.cfg.llm.async_client
-        self.enable_streaming: bool = self.cfg.llm.get("enable_streaming", False)
+        self.enable_streaming: bool = self.cfg.llm.get("enable_streaming", True)
 
         self.use_tool_calls: bool | None = self.cfg.llm.get("use_tool_calls")
         self.openrouter_provider: str | None = self.cfg.llm.get("openrouter_provider")
@@ -78,9 +83,6 @@ class LLMProviderClientBase(ABC):
         logger.info(
             f"disable_cache_control config value: {disable_cache_control_val} (type: {type(disable_cache_control_val)}) -> parsed as: {self.disable_cache_control}"
         )
-
-        # Temperature override for temporary boosts (e.g., loop-breaking)
-        self.temperature_override: float | None = None
 
         self.client = self._create_client(self.cfg)
 
@@ -115,17 +117,27 @@ class LLMProviderClientBase(ABC):
 
     def get_effective_temperature(self) -> float:
         """Return temperature_override if set, otherwise the configured temperature."""
-        if self.temperature_override is not None:
-            return self.temperature_override
+        override = _temperature_override_var.get(None)
+        if override is not None:
+            return override
         return self.temperature
 
     def set_temperature_boost(self, boost: float = 0.3, cap: float = 1.0):
         """Temporarily boost temperature by `boost`, capped at `cap`."""
-        self.temperature_override = min(self.temperature + boost, cap)
+        _temperature_override_var.set(min(self.temperature + boost, cap))
 
     def clear_temperature_override(self):
         """Remove the temporary temperature override."""
-        self.temperature_override = None
+        _temperature_override_var.set(None)
+
+    def reset_for_new_task(self, task_id: str) -> None:
+        """Reset mutable state for reuse across tasks.
+
+        Preserves the HTTP client/connection pool while clearing
+        task-specific state like temperature overrides.
+        """
+        self.task_id = task_id
+        _temperature_override_var.set(None)
 
     @abstractmethod
     def _create_client(self, config: DictConfig) -> Any:

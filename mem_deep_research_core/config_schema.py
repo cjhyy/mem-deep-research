@@ -6,7 +6,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LLMConfig(BaseModel):
@@ -49,9 +49,6 @@ class LLMConfig(BaseModel):
     disable_cache_control: bool = Field(default=False, description="是否禁用缓存控制")
 
     # Tool handling
-    keep_tool_result: int = Field(
-        default=5, description="保留工具结果数，-1 表示全部保留，0+ 保留最近 N 个完整结果"
-    )
     oai_tool_thinking: bool = Field(default=False, description="OpenAI 工具思考模式")
 
     # Context management
@@ -188,6 +185,11 @@ class ContextManagerConfig(BaseModel):
         default=0.8, ge=0.0, le=1.0, description="token 占比超过此值时触发 LLM 压缩"
     )
 
+    # Dedup cache
+    max_dedup_cache_size: int = Field(
+        default=200, ge=1, description="Maximum entries in dedup cache"
+    )
+
     # Token 估算
     chars_per_token: float = Field(
         default=3.5, gt=0.0, description="无 tiktoken 时的 fallback 估算比例"
@@ -200,6 +202,20 @@ class ContextManagerConfig(BaseModel):
     enable_masking: bool = Field(
         default=True, description="[已废弃] 旧配置，被 enable_compact 取代"
     )
+
+    @model_validator(mode='after')
+    def warn_deprecated(self) -> 'ContextManagerConfig':
+        import logging
+        _logger = logging.getLogger("mem_deep_research")
+        if self.mask_after_n_turns != 5:  # non-default means user set it
+            _logger.warning(
+                "Config 'mask_after_n_turns' is deprecated, use 'compact_keep_recent' instead"
+            )
+        if not self.enable_masking:  # non-default means user set it
+            _logger.warning(
+                "Config 'enable_masking' is deprecated, use 'enable_compact' instead"
+            )
+        return self
 
 
 class InterceptorConfig(BaseModel):
@@ -259,9 +275,13 @@ class MainAgentConfig(BaseModel):
         default_factory=MonitoringConfigSchema, description="执行监控配置"
     )
 
-    # Context
+    # Language
+    response_language: str = Field(
+        default="auto",
+        description="响应语言: 'auto' 从 query 自动检测, 或指定语言如 'Chinese', 'English', 'Japanese' 等"
+    )
     add_message_id: bool = Field(default=True, description="是否添加消息 ID")
-    chinese_context: bool = Field(default=False, description="是否使用中文上下文")
+    chinese_context: bool = Field(default=False, description="[已废弃] 使用 response_language 代替。设为 true 等同 response_language='Chinese'")
 
     class Config:
         extra = "allow"
@@ -282,6 +302,20 @@ class AgentConfig(BaseModel):
         default_factory=BenchmarkConfig, description="Benchmark 配置"
     )
     output_dir: str = Field(default="logs/", description="输出目录")
+
+    @field_validator("sub_agents")
+    @classmethod
+    def validate_sub_agents(cls, v):
+        if v is None:
+            return v
+        for name, cfg in v.items():
+            if not name.startswith("agent-"):
+                raise ValueError(f"Sub-agent name must start with 'agent-': {name}")
+            if not isinstance(cfg, dict):
+                raise ValueError(f"Sub-agent '{name}' config must be a dict")
+            if "llm" not in cfg and "max_turns" not in cfg:
+                raise ValueError(f"Sub-agent '{name}' must have at least 'llm' or 'max_turns' config")
+        return v
 
     class Config:
         extra = "allow"  # 允许额外字段（如 defaults, env 等 Hydra 特定字段）

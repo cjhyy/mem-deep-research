@@ -5,6 +5,7 @@
 支持三级升级策略：WARN → INJECT_HINT → TERMINATE
 """
 
+import hashlib
 import logging
 import time
 from collections import Counter
@@ -51,6 +52,9 @@ class MonitoringConfig:
     max_tool_loop_retries: int = 2
     # 停滞终止：超过 stall_detection_threshold × 此倍数则终止
     stall_terminate_multiplier: float = 2.0
+    # 温度提升（响应循环升级时使用）
+    temperature_boost: float = 0.3
+    temperature_boost_cap: float = 1.0
 
     @classmethod
     def from_schema(cls, schema) -> "MonitoringConfig":
@@ -66,6 +70,8 @@ class MonitoringConfig:
             response_hash_repeat_threshold=schema.response_hash_repeat_threshold,
             max_tool_loop_retries=schema.max_tool_loop_retries,
             stall_terminate_multiplier=schema.stall_terminate_multiplier,
+            temperature_boost=schema.temperature_boost,
+            temperature_boost_cap=schema.temperature_boost_cap,
         )
 
 
@@ -80,7 +86,7 @@ class MonitoringState:
     # 连续空轮次计数
     consecutive_empty_turns: int = 0
     # 上次响应的哈希值（用于检测循环）
-    last_response_hash: int | None = None
+    last_response_hash: str | None = None
     # 响应循环升级计数
     response_loop_escalation_count: int = 0
     # 滑动窗口（存最近 N 个 hash）
@@ -215,8 +221,7 @@ class ExecutionMonitor:
             self._last_loop_action = EscalationAction.NONE
             return EscalationAction.NONE
 
-        text_for_hash = response_text[: self.config.loop_detection_text_length]
-        current_hash = hash(text_for_hash)
+        current_hash = hashlib.sha256(response_text.encode()).hexdigest()
 
         # 维护滑动窗口
         self.state.response_hash_window.append(current_hash)
@@ -319,12 +324,42 @@ class ExecutionMonitor:
             if len(self.state.attempted_strategies) > 10:
                 self.state.attempted_strategies = self.state.attempted_strategies[-10:]
 
-    def get_loop_break_hint(self, recent_tool_names: list = None) -> str:
+    def get_loop_break_hint(self, recent_tool_names: list = None, chinese: bool = False) -> str:
         """返回注入 message_history 的强制策略变更指令
 
         Args:
             recent_tool_names: 最近使用的工具名列表（可选，向后兼容）
+            chinese: 是否返回中文版本
         """
+        if chinese:
+            lines = []
+            lines.append("⚠️ [强制指令 — 系统监控]")
+            lines.append("")
+            lines.append("检测到重复响应模式。你必须立即改变策略。")
+            lines.append("")
+
+            if self.state.attempted_strategies:
+                lines.append("== 已尝试的策略（禁止重复）==")
+                for i, s in enumerate(self.state.attempted_strategies, 1):
+                    lines.append(f"  {i}. {s}")
+                lines.append("")
+
+            if recent_tool_names:
+                lines.append(f"== 最近使用的工具（请使用不同的）== {', '.join(recent_tool_names)}")
+                lines.append("")
+
+            lines.append("禁止：")
+            lines.append("- 重复上述任何查询或工具调用")
+            lines.append("- 使用相同或类似参数调用同一工具")
+            lines.append("- 忽略此指令")
+            lines.append("")
+            lines.append("必须执行以下之一：")
+            lines.append("A) 根据已收集的信息综合出最终答案")
+            lines.append("B) 尝试全新的策略，使用不同的工具/参数")
+            lines.append("C) 承认限制并提供当前最佳答案")
+
+            return "\n".join(lines)
+
         lines = []
         lines.append("⚠️ [MANDATORY DIRECTIVE — SYSTEM MONITOR]")
         lines.append("")

@@ -54,14 +54,29 @@ class ConfigLoader:
         self._llm_skill_selector_initialized = False
         self._project_dir: Path | None = None
 
+    def reset(self) -> None:
+        """Reset all cached state for a fresh start."""
+        self._skill_injector = None
+        self._skill_injector_initialized = False
+        self._llm_skill_selector = None
+        self._llm_skill_selector_initialized = False
+        self._project_dir = None
+
     def set_project_dir(self, project_dir: str | Path | None) -> None:
         """设置项目目录，用于加载项目级别的工具配置
 
         Args:
             project_dir: 项目目录路径，设置为 None 清除
         """
-        if project_dir is not None:
-            self._project_dir = Path(project_dir)
+        new_dir = Path(project_dir) if project_dir is not None else None
+        if new_dir != self._project_dir:
+            # Project changed — invalidate cached skills/selectors
+            self._skill_injector = None
+            self._skill_injector_initialized = False
+            self._llm_skill_selector = None
+            self._llm_skill_selector_initialized = False
+        if new_dir is not None:
+            self._project_dir = new_dir
             logger.info(f"[ConfigLoader] Project directory set to: {self._project_dir}")
         else:
             self._project_dir = None

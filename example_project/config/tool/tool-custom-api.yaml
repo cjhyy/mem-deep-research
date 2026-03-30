@@ -1,0 +1,16 @@
+# 自定义远程 MCP 工具示例
+# 取消注释并修改 url 即可使用
+#
+# name: "tool-custom-api"
+# url: "http://localhost:8080/mcp"
+# transport: "streamable-http"
+# headers:
+#   Authorization: "Bearer ${oc.env:CUSTOM_API_TOKEN}"
+#
+# 也可以使用 stdio 方式：
+# name: "tool-custom-script"
+# tool_command: "python"
+# args:
+#   - "path/to/your/mcp_server.py"
+# env:
+#   MY_ENV_VAR: "${oc.env:MY_ENV_VAR}"

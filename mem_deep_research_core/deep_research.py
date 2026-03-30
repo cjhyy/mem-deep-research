@@ -17,7 +17,7 @@ Usage:
     # 方式 3: 代码内配置
     dr = DeepResearch(
         llm_provider="anthropic",
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-20250514",
         api_key="your-api-key",
     )
     result = await dr.run("你的任务")
@@ -40,6 +40,37 @@ from mem_deep_research_core.utils.external_loader import load_env_file, load_yam
 logger = logging.getLogger("mem_deep_research")
 
 
+def _classify_error(error_str: str | None) -> str | None:
+    """Classify error string into error type."""
+    if not error_str:
+        return None
+    e = error_str.lower()
+    if "timeout" in e or "timed out" in e:
+        return "timeout"
+    if "context limit" in e or "context length" in e:
+        return "context_limit"
+    if "tool" in e and ("failed" in e or "error" in e):
+        return "tool_error"
+    if "config" in e or "validation" in e or "not found" in e:
+        return "config_error"
+    if "api" in e or "llm" in e or "authentication" in e or "rate limit" in e:
+        return "llm_error"
+    return "unknown"
+
+
+# Provider registry — maps short names to (client_class, env_key, default_base_url)
+PROVIDER_REGISTRY: dict[str, tuple[str, str, str]] = {
+    "anthropic": ("ClaudeAnthropicClient", "ANTHROPIC_API_KEY", "https://api.anthropic.com"),
+    "openai": ("GPTOpenAIClient", "OPENAI_API_KEY", "https://api.openai.com/v1"),
+    "openrouter": (
+        "ClaudeOpenRouterClient",
+        "OPENROUTER_API_KEY",
+        "https://openrouter.ai/api/v1",
+    ),
+    "deepseek": ("DeepSeekOpenRouterClient", "DEEPSEEK_API_KEY", "https://api.deepseek.com"),
+}
+
+
 @dataclass
 class ResearchResult:
     """研究结果"""
@@ -51,6 +82,13 @@ class ResearchResult:
     duration_seconds: float = 0.0
     log_path: pathlib.Path | None = None
     error: str | None = None
+
+    # v0.3: Execution details
+    turns: int = 0
+    tool_calls: int = 0
+    error_type: str | None = None  # "llm_error", "tool_error", "config_error", "timeout"
+    perf_metrics: dict | None = None
+    checkpoints: list | None = None  # Turn-level progress checkpoints
 
     @property
     def success(self) -> bool:
@@ -68,8 +106,8 @@ class DeepResearch:
     def __init__(
         self,
         # LLM 配置
-        llm_provider: str = "anthropic",
-        model: str = "claude-3-5-sonnet-20241022",
+        llm_provider: str | None = None,
+        model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
         # Agent 配置
@@ -81,6 +119,7 @@ class DeepResearch:
         tool_blacklist: list | None = None,
         # 输出配置
         logs_dir: str | pathlib.Path = "logs",
+        response_language: str = "auto",
         chinese_context: bool = False,
         # 拦截器
         interceptor_preset: str = "default",
@@ -94,8 +133,9 @@ class DeepResearch:
         初始化 DeepResearch
 
         Args:
-            llm_provider: LLM 提供商 ("anthropic", "openai", "openrouter", "deepseek")
-            model: 模型名称
+            llm_provider: LLM 提供商 ("anthropic", "openai", "openrouter", "deepseek")。
+                为 None 时根据 api_key 前缀自动检测，无 key 时默认 "openrouter"
+            model: 模型名称。为 None 时根据 provider 自动选择默认模型
             api_key: API 密钥 (也可通过环境变量设置)
             base_url: API 基础 URL (可选)
             max_turns: 最大对话轮数
@@ -104,7 +144,8 @@ class DeepResearch:
             tools: 工具列表，如 ["tool-searching-serper", "tool-scraping"]
             tool_blacklist: 工具黑名单
             logs_dir: 日志目录
-            chinese_context: 是否使用中文上下文
+            response_language: 响应语言 ("auto" 自动检测, 或 "Chinese", "English", "Japanese" 等)
+            chinese_context: [已废弃] 使用 response_language 代替。设为 True 等同 response_language='Chinese'
             interceptor_preset: 消息拦截器预设 ("default", "verbose", "minimal", "debug")
             hint_generation: 是否启用输入提示生成
             final_answer_extraction: 是否启用最终答案提取
@@ -112,6 +153,13 @@ class DeepResearch:
         """
         self.logs_dir = pathlib.Path(logs_dir)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Auto-detect provider from API key prefix when not explicitly set
+        if config is None and llm_provider is None:
+            if api_key:
+                llm_provider = self._detect_provider(api_key)
+            else:
+                llm_provider = "openrouter"  # default when no key given
 
         # 如果提供了完整配置，直接使用
         if config is not None:
@@ -126,8 +174,9 @@ class DeepResearch:
                 max_turns=max_turns,
                 max_tool_calls_per_turn=max_tool_calls_per_turn,
                 temperature=temperature,
-                tools=tools or ["tool-searching-serper"],
+                tools=tools or [],
                 tool_blacklist=tool_blacklist or [],
+                response_language=response_language,
                 chinese_context=chinese_context,
                 interceptor_preset=interceptor_preset,
                 hint_generation=hint_generation,
@@ -221,6 +270,18 @@ class DeepResearch:
 
         return cls.from_config_dir(config_dir, config_name, logs_dir)
 
+    @staticmethod
+    def _detect_provider(api_key: str) -> str:
+        """Auto-detect LLM provider from API key prefix."""
+        if api_key.startswith("sk-ant-"):
+            return "anthropic"
+        elif api_key.startswith("sk-or-"):
+            return "openrouter"
+        elif api_key.startswith("sk-"):
+            return "openai"
+        else:
+            return "openrouter"  # default fallback
+
     def _validate_config(self) -> None:
         """验证配置是否符合 schema，仅警告不阻断"""
         try:
@@ -242,31 +303,25 @@ class DeepResearch:
         temperature: float,
         tools: list[str],
         tool_blacklist: list,
+        response_language: str,
         chinese_context: bool,
         interceptor_preset: str,
         hint_generation: bool,
         final_answer_extraction: bool,
     ) -> DictConfig:
         """构建配置"""
+        # Default model per provider
+        if model is None:
+            default_models = {
+                "anthropic": "claude-sonnet-4-20250514",
+                "openrouter": "anthropic/claude-sonnet-4",
+                "openai": "gpt-4o",
+                "deepseek": "deepseek-chat",
+            }
+            model = default_models.get(llm_provider, "claude-sonnet-4-20250514")
+
         # 映射 provider 到 client class
-        provider_map = {
-            "anthropic": (
-                "ClaudeAnthropicClient",
-                "ANTHROPIC_API_KEY",
-                "https://api.anthropic.com",
-            ),
-            "openai": ("GPTOpenAIClient", "OPENAI_API_KEY", "https://api.openai.com/v1"),
-            "openrouter": (
-                "ClaudeOpenRouterClient",
-                "OPENROUTER_API_KEY",
-                "https://openrouter.ai/api/v1",
-            ),
-            "deepseek": (
-                "DeepSeekOpenRouterClient",
-                "DEEPSEEK_API_KEY",
-                "https://api.deepseek.com",
-            ),
-        }
+        provider_map = PROVIDER_REGISTRY
 
         if llm_provider not in provider_map:
             raise ValueError(
@@ -280,13 +335,13 @@ class DeepResearch:
             "provider_class": provider_class,
             "model_name": model,
             "temperature": temperature,
-            "top_p": 0.95,
+            "top_p": 1.0,
             "max_tokens": 32000,
-            "timeout": 1800,
-            "retry_max_attempts": 5,
+            "timeout": 300,
+            "retry_max_attempts": 3,
             "retry_strategy": "exponential",
-            "retry_multiplier": 5,
-            "retry_wait_seconds": 10,
+            "retry_multiplier": 2,
+            "retry_wait_seconds": 5,
             "enable_streaming": True,
             "disable_cache_control": False,
             "keep_tool_result": -1,
@@ -333,6 +388,7 @@ class DeepResearch:
                     "reflection_interval": 3,
                     "require_explicit_planning": True,
                 },
+                "response_language": response_language,
                 "add_message_id": True,
                 "chinese_context": chinese_context,
                 "interceptor": {
@@ -376,6 +432,7 @@ class DeepResearch:
         task: str,
         context: dict[str, Any] | None = None,
         on_progress: Callable[[str, Any], None] | None = None,
+        stream_queue: Any | None = None,
     ) -> ResearchResult:
         """
         运行研究任务
@@ -384,6 +441,7 @@ class DeepResearch:
             task: 任务描述
             context: 用户上下文 (可选)
             on_progress: 进度回调 (可选)
+            stream_queue: 流式输出队列 (可选，asyncio.Queue)
 
         Returns:
             ResearchResult: 研究结果
@@ -394,7 +452,25 @@ class DeepResearch:
             task=task,
             context=context,
             on_progress=on_progress,
+            stream_queue=stream_queue,
         )
+
+        # Read perf metrics from log if available
+        _perf = {}
+        _turns = 0
+        _tool_calls = 0
+        _checkpoints = []
+        if result.log_path and result.log_path.exists():
+            try:
+                import json
+
+                _log_data = json.loads(result.log_path.read_text())
+                _perf = _log_data.get("perf_metrics", {})
+                _turns = _perf.get("main_loop_turns", {}).get("value", 0)
+                _tool_calls = _perf.get("main_loop_tool_calls", {}).get("value", 0)
+                _checkpoints = _log_data.get("checkpoints", [])
+            except Exception:
+                pass
 
         return ResearchResult(
             task_id=result.task_id,
@@ -404,6 +480,11 @@ class DeepResearch:
             duration_seconds=result.duration_seconds,
             log_path=result.log_path,
             error=result.error,
+            turns=_turns,
+            tool_calls=_tool_calls,
+            error_type=_classify_error(result.error) if result.error else None,
+            perf_metrics=_perf if _perf else None,
+            checkpoints=_checkpoints if _checkpoints else None,
         )
 
     def run_sync(
@@ -421,7 +502,15 @@ class DeepResearch:
         Returns:
             ResearchResult: 研究结果
         """
-        return asyncio.run(self.run(task, context))
+
+        async def _run_and_close():
+            try:
+                return await self.run(task, context)
+            finally:
+                await self.close()
+
+        self._initialized = False  # asyncio.run() 创建新循环，旧资源失效
+        return asyncio.run(_run_and_close())
 
     async def run_batch(
         self,
@@ -448,18 +537,122 @@ class DeepResearch:
             max_concurrent=max_concurrent,
         )
 
-        return [
-            ResearchResult(
-                task_id=r.task_id,
-                answer=r.final_answer,
-                boxed_answer=r.boxed_answer,
-                status=r.status,
-                duration_seconds=r.duration_seconds,
-                log_path=r.log_path,
-                error=r.error,
+        research_results = []
+        for r in results:
+            _perf = {}
+            _turns = 0
+            _tool_calls = 0
+            _checkpoints = []
+            if r.log_path and r.log_path.exists():
+                try:
+                    import json
+
+                    _log_data = json.loads(r.log_path.read_text())
+                    _perf = _log_data.get("perf_metrics", {})
+                    _turns = _perf.get("main_loop_turns", {}).get("value", 0)
+                    _tool_calls = _perf.get("main_loop_tool_calls", {}).get("value", 0)
+                    _checkpoints = _log_data.get("checkpoints", [])
+                except Exception:
+                    pass
+            research_results.append(
+                ResearchResult(
+                    task_id=r.task_id,
+                    answer=r.final_answer,
+                    boxed_answer=r.boxed_answer,
+                    status=r.status,
+                    duration_seconds=r.duration_seconds,
+                    log_path=r.log_path,
+                    error=r.error,
+                    turns=_turns,
+                    tool_calls=_tool_calls,
+                    error_type=_classify_error(r.error) if r.error else None,
+                    perf_metrics=_perf if _perf else None,
+                    checkpoints=_checkpoints if _checkpoints else None,
+                )
             )
-            for r in results
-        ]
+        return research_results
+
+    @staticmethod
+    def supported_providers() -> list[str]:
+        """Return list of supported LLM provider names."""
+        return list(PROVIDER_REGISTRY.keys())
+
+    async def list_tools(self) -> list[dict]:
+        """List all available tools and their descriptions.
+
+        Returns:
+            List of dicts with 'server', 'name', 'description' keys.
+        """
+        await self._ensure_initialized()
+        tools = []
+        if self._factory and self._factory._tool_definitions:
+            for server in self._factory._tool_definitions:
+                server_name = server.get("name", "")
+                for tool in server.get("tools", []):
+                    if "error" in tool:
+                        continue
+                    tools.append({
+                        "server": server_name,
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                    })
+        return tools
+
+    async def validate(self) -> dict:
+        """Validate configuration and connectivity.
+
+        Returns:
+            Dict with 'valid' (bool), 'errors' (list[str]), 'warnings' (list[str])
+        """
+        errors = []
+        warnings = []
+
+        # Validate config
+        try:
+            from mem_deep_research_core.config_schema import validate_agent_config
+
+            config_dict = OmegaConf.to_container(self._cfg, resolve=False)
+            validate_agent_config(config_dict)
+        except Exception as e:
+            warnings.append(f"Config validation: {str(e)[:200]}")
+
+        # Check initialization
+        try:
+            await self._ensure_initialized()
+        except Exception as e:
+            errors.append(f"Initialization failed: {str(e)[:200]}")
+            return {"valid": False, "errors": errors, "warnings": warnings}
+
+        # Check tools
+        tools = await self.list_tools()
+        if not tools:
+            warnings.append("No tools configured")
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+            "tools_count": len(tools),
+        }
+
+    async def close(self) -> None:
+        """Release all resources (MCP sessions, LLM clients)."""
+        if self._factory:
+            await self._factory.close()
+            self._initialized = False
+
+    def __del__(self):
+        if hasattr(self, '_factory') and self._factory is not None and self._initialized:
+            logger.debug("DeepResearch was garbage collected without calling close()")
+
+    async def __aenter__(self):
+        """Support async with DeepResearch(...) as dr: ..."""
+        await self._ensure_initialized()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+        return False
 
     @property
     def config(self) -> DictConfig:

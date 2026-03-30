@@ -1,0 +1,54 @@
+# Anthropic 直连配置
+# 需要设置 ANTHROPIC_API_KEY 环境变量
+
+main_agent:
+  prompt:
+    agent_type: main
+    tool_format: xml
+    presets: [research]
+
+  llm:
+    provider_class: "ClaudeAnthropicClient"
+    model_name: "claude-sonnet-4-20250514"
+    async_client: true
+    temperature: 0.3
+    max_tokens: 32000
+    timeout: 300
+    retry_max_attempts: 3
+    retry_strategy: "exponential"
+    retry_multiplier: 2
+    retry_wait_seconds: 5
+    anthropic_api_key: "${oc.env:ANTHROPIC_API_KEY}"
+    enable_streaming: true
+    disable_cache_control: false
+    keep_tool_result: 5
+
+  tool_config:
+    - tool-calculator
+    # - tool-searching-serper
+
+  max_turns: 15
+  max_tool_calls_per_turn: 5
+
+  deep_research:
+    enabled: true
+    reflection_interval: 5
+
+  skill_selection:
+    enabled: true
+    method: inline
+    max_skills: 3
+
+  context_manager:
+    enable_dedup: true
+    enable_compact: true
+    compact_at_ratio: 0.6
+    summarize_at_ratio: 0.8
+
+  add_message_id: true
+  response_language: auto        # auto | Chinese | English | Japanese | ...
+  chinese_context: false
+
+sub_agents: null
+
+output_dir: logs/

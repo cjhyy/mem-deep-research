@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import functools
 import os
 from collections.abc import Awaitable, Callable
@@ -31,8 +32,34 @@ logger = bootstrap_logger(level=LOGGER_LEVEL)
 R = TypeVar("R")
 
 
+class _InProcessSessionAdapter:
+    """Thin adapter making a FastMCP Client quack like an MCP ClientSession.
+
+    The ToolManager code calls ``session.list_tools()`` (expects ``.tools``
+    attribute on the return value) and ``session.call_tool(name, arguments=...)``.
+    FastMCP Client's ``list_tools()`` returns ``list[Tool]`` directly, and
+    ``call_tool()`` already accepts ``arguments`` as a keyword.  This adapter
+    bridges the difference for ``list_tools`` only.
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    class _ListToolsResult:
+        """Wrapper so that ``result.tools`` works like MCP ClientSession."""
+        def __init__(self, tools: list):
+            self.tools = tools
+
+    async def list_tools(self):
+        tools = await self._client.list_tools()
+        return self._ListToolsResult(tools)
+
+    async def call_tool(self, name: str, arguments: dict | None = None, **kwargs):
+        return await self._client.call_tool(name, arguments=arguments, **kwargs)
+
+
 def _default_env_inject(ctx) -> Any:
-    """默认的环境变量注入逻辑"""
+    """默认的环境变量注入逻辑 — 透传 context 中的所有字符串值为环境变量"""
     from mem_deep_research_core.mem_deep_research_logging.logger import TASK_CONTEXT_VAR
 
     server_params = ctx.server_params
@@ -42,12 +69,15 @@ def _default_env_inject(ctx) -> Any:
     if TASK_CONTEXT_VAR.get() is not None:
         server_params.env["TASK_ID"] = TASK_CONTEXT_VAR.get()
 
-    # Inject user context if provided（优先从 _secure 取真实值）
+    # Inject all string-valued context fields as env vars (skip internal fields)
     if context:
-        for key in ["user_id", "org_id", "room_id", "timezone", "trace_id"]:
-            val = get_real_value(context, key)
-            if val:
-                server_params.env[key.upper()] = val
+        skip_keys = {"_secure", "meta_chat_history", "mode", "role_purpose"}
+        for key, val in context.items():
+            if key in skip_keys or key.startswith("_"):
+                continue
+            real_val = get_real_value(context, key)
+            if real_val and isinstance(real_val, str):
+                server_params.env[key.upper()] = real_val
 
     return server_params
 
@@ -64,7 +94,7 @@ def update_server_params_with_context(
 
     Args:
         server_params: The server parameters to update
-        context: User context dict with user_id, org_id, room_id, timezone, trace_id
+        context: User context dict — all string-valued fields are injected as env vars
     """
     from mem_deep_research_core.core.hooks import HookContext, hooks
 
@@ -111,11 +141,8 @@ class ToolManagerProtocol(Protocol):
 
 
 class ToolManager(ToolManagerProtocol):
-    # Class-level cache for tool definitions (shared across instances)
-    _tool_definitions_cache: dict[
-        str, tuple[float, list]
-    ] = {}  # {server_name: (timestamp, definitions)}
     _CACHE_TTL_SECONDS: float = 300.0  # 5 minutes cache TTL
+    _TOOL_CALL_TIMEOUT: float = 900.0  # Tool call timeout in seconds
 
     def __init__(self, server_configs, tool_blacklist=None, cache_ttl: float = 300.0):
         """
@@ -125,9 +152,12 @@ class ToolManager(ToolManagerProtocol):
             - {"name": "xxx", "params": StdioServerParameters(...)}  # 本地 stdio
             - {"name": "xxx", "params": "http://...", "transport": "sse"}  # 远程 SSE
             - {"name": "xxx", "params": "http://...", "transport": "streamable-http"}  # 远程 HTTP
+            - {"name": "xxx", "params": "inprocess", "transport": "inprocess",
+               "module": "...", "object": "mcp"}  # 进程内，无子进程
         :param tool_blacklist: Set of (server_name, tool_name) tuples to blacklist
         :param cache_ttl: Tool definitions cache TTL in seconds (default: 300)
         """
+        self._tool_definitions_cache: dict[str, tuple[float, list]] = {}
         self.server_configs = server_configs
         # 存储完整配置，包括 transport 和 headers
         self.server_dict = {config["name"]: config["params"] for config in server_configs}
@@ -141,10 +171,23 @@ class ToolManager(ToolManagerProtocol):
         self.server_inject_context = {
             config["name"]: config.get("inject_context", True) for config in server_configs
         }
+        # In-process MCP server module references
+        self.server_module_info = {
+            config["name"]: {"module": config.get("module", ""), "object": config.get("object", "mcp")}
+            for config in server_configs
+            if config.get("transport") == "inprocess"
+        }
         self.browser_session = None
         self._context: dict[str, Any] = {}  # User context for MCP tool calls
         self.tool_blacklist = tool_blacklist if tool_blacklist else set()
         self._cache_ttl = cache_ttl
+
+        # Persistent MCP session pool
+        self._persistent_sessions: dict[str, ClientSession] = {}
+        self._session_transports: dict[str, tuple] = {}  # store (read, write) or similar
+        self._exit_stack = contextlib.AsyncExitStack()
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
 
         logger.info(f"ToolManager initialized, loaded servers: {list(self.server_dict.keys())}")
 
@@ -189,6 +232,123 @@ class ToolManager(ToolManagerProtocol):
             context: Dict containing user_id, org_id, room_id, timezone, trace_id
         """
         self._context = context or {}
+
+    async def _get_session_lock(self, server_name: str) -> asyncio.Lock:
+        """Get or create a per-server lock to prevent concurrent session creation."""
+        async with self._global_lock:
+            if server_name not in self._session_locks:
+                self._session_locks[server_name] = asyncio.Lock()
+            return self._session_locks[server_name]
+
+    async def _get_or_create_session(self, server_name: str) -> tuple[ClientSession, bool]:
+        """Get an existing persistent session or create a new one.
+
+        Supports stdio, streamable-http, and sse transports.
+        Uses per-server locks to prevent concurrent creation of the same session.
+
+        Returns:
+            (session, was_cached) — was_cached=True if the session was reused from pool.
+        """
+        # Fast path: session already exists
+        if server_name in self._persistent_sessions:
+            return self._persistent_sessions[server_name], True
+
+        lock = await self._get_session_lock(server_name)
+        async with lock:
+            # Double-check after acquiring lock
+            if server_name in self._persistent_sessions:
+                return self._persistent_sessions[server_name], True
+
+            server_params = self.server_dict.get(server_name)
+            if server_params is None:
+                raise ValueError(f"Server '{server_name}' not found in configuration")
+
+            transport = self.server_transport.get(server_name, "stdio")
+            headers = self.server_headers.get(server_name, {})
+
+            import time as _time
+            _sess_start = _time.perf_counter()
+
+            if transport == "inprocess":
+                # In-process: import the module and create a FastMCP Client session
+                module_info = self.server_module_info.get(server_name, {})
+                module_path = module_info.get("module", "")
+                object_name = module_info.get("object", "mcp")
+
+                if not module_path:
+                    raise ValueError(f"No module specified for in-process server '{server_name}'")
+
+                import importlib
+                mod = importlib.import_module(module_path)
+                mcp_app = getattr(mod, object_name)
+
+                # FastMCP Client wrapped in adapter for MCP ClientSession compatibility
+                from fastmcp import Client
+                client = Client(mcp_app)
+                await self._exit_stack.enter_async_context(client)
+                session = _InProcessSessionAdapter(client)
+
+                self._persistent_sessions[server_name] = session
+                _sess_elapsed = _time.perf_counter() - _sess_start
+                logger.info(f"[ToolManager] In-process session created for '{server_name}' in {_sess_elapsed:.3f}s")
+                return session, False
+
+            try:
+                if isinstance(server_params, StdioServerParameters):
+                    updated_params = update_server_params_with_context(server_params, self._context)
+                    transport_ctx = stdio_client(updated_params)
+                    read, write = await self._exit_stack.enter_async_context(transport_ctx)
+                elif isinstance(server_params, str) and server_params.startswith(("http://", "https://")):
+                    if transport == "streamable-http" and HAS_STREAMABLE_HTTP:
+                        transport_ctx = streamablehttp_client(server_params, headers=headers)
+                        read, write, _ = await self._exit_stack.enter_async_context(transport_ctx)
+                    else:
+                        transport_ctx = sse_client(server_params)
+                        read, write = await self._exit_stack.enter_async_context(transport_ctx)
+                else:
+                    raise TypeError(f"Unknown server params type for {server_name}: {type(server_params)}")
+
+                session = await self._exit_stack.enter_async_context(
+                    ClientSession(read, write, sampling_callback=None)
+                )
+                await session.initialize()
+
+                self._persistent_sessions[server_name] = session
+                _sess_elapsed = _time.perf_counter() - _sess_start
+                logger.info(f"[ToolManager] Persistent session created for '{server_name}' (transport={transport}) in {_sess_elapsed:.3f}s")
+                return session, False
+
+            except Exception as e:
+                logger.error(f"[ToolManager] Failed to create persistent session for '{server_name}': {e}")
+                raise
+
+    async def _invalidate_session(self, server_name: str) -> None:
+        """Remove a cached session (e.g., after a connection error).
+
+        Note: The actual transport cleanup happens when close_sessions() is called,
+        since AsyncExitStack manages all contexts together.
+        """
+        self._persistent_sessions.pop(server_name, None)
+        logger.info(f"[ToolManager] Invalidated session for '{server_name}'")
+
+    async def close_sessions(self) -> None:
+        """Close all persistent sessions and reset the exit stack."""
+        self._persistent_sessions.clear()
+        self._session_locks.clear()
+        try:
+            await self._exit_stack.aclose()
+        except Exception as e:
+            logger.warning(f"[ToolManager] Error closing sessions: {e}")
+        self._exit_stack = contextlib.AsyncExitStack()
+        logger.info("[ToolManager] All persistent sessions closed")
+
+    def __del__(self):
+        """Warn if sessions were not explicitly closed."""
+        if self._persistent_sessions:
+            logger.warning(
+                f"[ToolManager] {len(self._persistent_sessions)} MCP sessions were not "
+                "explicitly closed. Call close_sessions() before discarding ToolManager."
+            )
 
     def _extract_tool_result(self, tool_name: str, tool_result, arguments: dict) -> str:
         """
@@ -262,51 +422,18 @@ class ToolManager(ToolManagerProtocol):
 
         for config in self.server_configs:
             server_name = config["name"]
-            server_params = config["params"]
 
             try:
-                if isinstance(server_params, StdioServerParameters):
-                    async with (
-                        stdio_client(
-                            update_server_params_with_context(server_params, self._context)
-                        ) as (read, write),
-                        ClientSession(read, write, sampling_callback=None) as session,
-                    ):
-                        await session.initialize()
-                        tools_response = await session.list_tools()
-                        # Follow the same blacklist logic as get_all_tool_definitions
-                        for tool in tools_response.tools:
-                            if (server_name, tool.name) in self.tool_blacklist:
-                                continue
-                            if tool.name == tool_name:
-                                servers_with_tool.append(server_name)
-                                break
-                elif isinstance(server_params, str) and server_params.startswith(
-                    ("http://", "https://")
-                ):
-                    # SSE endpoint
-                    async with sse_client(server_params) as (read, write):
-                        async with ClientSession(read, write, sampling_callback=None) as session:
-                            await session.initialize()
-                            tools_response = await session.list_tools()
-                            for tool in tools_response.tools:
-                                # Consistent with get_all_tool_definitions: SSE part has no blacklist processing
-                                # Can add specific tool filtering logic here (if needed)
-                                # if server_name == "tool-excel" and tool.name not in ["get_workbook_metadata", "read_data_from_excel"]:
-                                #     continue
-                                if tool.name == tool_name:
-                                    servers_with_tool.append(server_name)
-                                    break
-                else:
-                    logger.error(
-                        f"Error: Unknown parameter type for server '{server_name}': {type(server_params)}"
-                    )
-                    # For unknown types, we skip rather than throw an exception, because this is a search function
-                    continue
+                session, _ = await self._get_or_create_session(server_name)
+                tools_response = await session.list_tools()
+                for tool in tools_response.tools:
+                    if (server_name, tool.name) in self.tool_blacklist:
+                        continue
+                    if tool.name == tool_name:
+                        servers_with_tool.append(server_name)
+                        break
             except Exception as e:
-                logger.error(
-                    f"Error: Cannot connect or get tools from server '{server_name}' to find '{tool_name}': {e}"
-                )
+                logger.error(f"Error finding tool '{tool_name}' in server '{server_name}': {e}")
                 continue
 
         return servers_with_tool
@@ -338,74 +465,20 @@ class ToolManager(ToolManagerProtocol):
         )
 
         try:
-            if isinstance(server_params, StdioServerParameters):
-                # 本地 stdio 模式
-                async with stdio_client(
-                    update_server_params_with_context(server_params, self._context)
-                ) as (read, write):
-                    async with ClientSession(read, write, sampling_callback=None) as session:
-                        await session.initialize()
-                        tools_response = await session.list_tools()
-                        # black list some tools
-                        for tool in tools_response.tools:
-                            if (server_name, tool.name) in self.tool_blacklist:
-                                logger.info(
-                                    f"Tool '{tool.name}' in server '{server_name}' is blacklisted, skipping."
-                                )
-                                continue
-                            one_server_for_prompt["tools"].append(
-                                {
-                                    "name": tool.name,
-                                    "description": tool.description,
-                                    "schema": tool.inputSchema,
-                                }
-                            )
-            elif isinstance(server_params, str) and server_params.startswith(
-                ("http://", "https://")
-            ):
-                # 远程模式
-                if transport == "streamable-http" and HAS_STREAMABLE_HTTP:
-                    # Streamable HTTP 模式 (推荐)
-                    async with streamablehttp_client(server_params, headers=headers) as (
-                        read,
-                        write,
-                        _,
-                    ):
-                        async with ClientSession(read, write, sampling_callback=None) as session:
-                            await session.initialize()
-                            tools_response = await session.list_tools()
-                            for tool in tools_response.tools:
-                                if (server_name, tool.name) in self.tool_blacklist:
-                                    continue
-                                one_server_for_prompt["tools"].append(
-                                    {
-                                        "name": tool.name,
-                                        "description": tool.description,
-                                        "schema": tool.inputSchema,
-                                    }
-                                )
-                else:
-                    # SSE 模式 (回退)
-                    async with sse_client(server_params) as (read, write):
-                        async with ClientSession(read, write, sampling_callback=None) as session:
-                            await session.initialize()
-                            tools_response = await session.list_tools()
-                            for tool in tools_response.tools:
-                                if (server_name, tool.name) in self.tool_blacklist:
-                                    continue
-                                one_server_for_prompt["tools"].append(
-                                    {
-                                        "name": tool.name,
-                                        "description": tool.description,
-                                        "schema": tool.inputSchema,
-                                    }
-                                )
-            else:
-                logger.error(
-                    f"Error: Unknown parameter type for server '{server_name}': {type(server_params)}"
-                )
-                raise TypeError(
-                    f"Unknown server params type for {server_name}: {type(server_params)}"
+            session, _ = await self._get_or_create_session(server_name)
+            tools_response = await session.list_tools()
+            for tool in tools_response.tools:
+                if (server_name, tool.name) in self.tool_blacklist:
+                    logger.info(
+                        f"Tool '{tool.name}' in server '{server_name}' is blacklisted, skipping."
+                    )
+                    continue
+                one_server_for_prompt["tools"].append(
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "schema": tool.inputSchema,
+                    }
                 )
 
             logger.info(
@@ -466,6 +539,7 @@ class ToolManager(ToolManagerProtocol):
                 all_servers_for_prompt.append(server_result)
             return all_servers_for_prompt
 
+    # Timeout configurable via _TOOL_CALL_TIMEOUT class variable
     @with_timeout(900)
     async def execute_tool_call(
         self, server_name, tool_name, arguments, context: dict = None
@@ -596,148 +670,43 @@ class ToolManager(ToolManagerProtocol):
                         "trace_id": get_real_value(effective_context, "trace_id"),
                     }
 
-                if isinstance(server_params, StdioServerParameters):
-                    # Note: User context is now passed via arguments["_mcp_context"] (primary)
-                    # Environment variables are still set for backwards compatibility
-                    # The MCP server (discovery_tools.py) reads _mcp_context first, then fallback to env vars
-
-                    async with stdio_client(
-                        update_server_params_with_context(server_params, effective_context)
-                    ) as (read, write):
-                        async with ClientSession(read, write, sampling_callback=None) as session:
-                            await session.initialize()
-                            try:
-                                tool_result = await session.call_tool(
-                                    tool_name, arguments=enriched_arguments
-                                )
-                                # Safely extract result content without changing original format
-                                if tool_result.content and len(tool_result.content) > 0:
-                                    text_content = tool_result.content[-1].text
-                                    if text_content is not None and text_content.strip():
-                                        result_content = text_content  # Preserve original format!
-                                    else:
-                                        result_content = f"Tool '{tool_name}' completed but returned empty text - this may be expected or indicate an issue"
-                                else:
-                                    result_content = f"Tool '{tool_name}' completed but returned no content - this may be expected or indicate an issue"
-
-                                # If result is empty, log warning
-                                if not tool_result.content:
-                                    logger.error(
-                                        f"Tool '{tool_name}' returned empty content, tool_result.content: {tool_result.content}"
-                                    )
-
-                                # post hoc check for browsing agent reading answers from hf datsets
-                                if self._should_block_hf_scraping(tool_name, arguments):
-                                    result_content = "You are trying to scrape a Hugging Face dataset for answers, please do not use the scrape tool for this purpose."
-                            except TimeoutError as tool_error:
-                                logger.error(f"Tool execution timeout: {tool_error}")
-                                return {
-                                    "server_name": server_name,
-                                    "tool_name": tool_name,
-                                    "error": f"Tool execution timed out: {str(tool_error)}",
-                                }
-                            except (ConnectionError, OSError) as tool_error:
-                                logger.error(f"Tool connection error: {tool_error}")
-                                return {
-                                    "server_name": server_name,
-                                    "tool_name": tool_name,
-                                    "error": f"Tool connection failed: {str(tool_error)}",
-                                }
-                            except (ValueError, TypeError, RuntimeError) as tool_error:
-                                logger.error(f"Tool execution error: {tool_error}")
-                                return {
-                                    "server_name": server_name,
-                                    "tool_name": tool_name,
-                                    "error": f"Tool execution failed: {str(tool_error)}",
-                                }
-                elif isinstance(server_params, str) and server_params.startswith(
-                    ("http://", "https://")
-                ):
-                    # 获取传输模式和 headers
-                    transport = self.server_transport.get(server_name, "sse")
-                    headers = self.server_headers.get(server_name, {})
-
-                    # 根据传输模式选择客户端
-                    if transport == "streamable-http" and HAS_STREAMABLE_HTTP:
-                        # Streamable HTTP 模式
-                        async with streamablehttp_client(server_params, headers=headers) as (
-                            read,
-                            write,
-                            _,
-                        ):
-                            async with ClientSession(
-                                read, write, sampling_callback=None
-                            ) as session:
-                                await session.initialize()
-                                try:
-                                    tool_result = await session.call_tool(
-                                        tool_name, arguments=enriched_arguments
-                                    )
-                                    result_content = self._extract_tool_result(
-                                        tool_name, tool_result, arguments
-                                    )
-                                except TimeoutError as tool_error:
-                                    logger.error(f"Tool execution timeout (HTTP): {tool_error}")
-                                    return {
-                                        "server_name": server_name,
-                                        "tool_name": tool_name,
-                                        "error": f"Tool execution timed out: {str(tool_error)}",
-                                    }
-                                except (ConnectionError, OSError) as tool_error:
-                                    logger.error(f"Tool connection error (HTTP): {tool_error}")
-                                    return {
-                                        "server_name": server_name,
-                                        "tool_name": tool_name,
-                                        "error": f"Tool connection failed: {str(tool_error)}",
-                                    }
-                                except (ValueError, TypeError, RuntimeError) as tool_error:
-                                    logger.error(f"Tool execution error (HTTP): {tool_error}")
-                                    return {
-                                        "server_name": server_name,
-                                        "tool_name": tool_name,
-                                        "error": f"Tool execution failed: {str(tool_error)}",
-                                    }
-                    else:
-                        # SSE 模式（回退）
-                        async with sse_client(server_params) as (read, write):
-                            async with ClientSession(
-                                read, write, sampling_callback=None
-                            ) as session:
-                                await session.initialize()
-                                try:
-                                    tool_result = await session.call_tool(
-                                        tool_name, arguments=enriched_arguments
-                                    )
-                                    result_content = self._extract_tool_result(
-                                        tool_name, tool_result, arguments
-                                    )
-                                except TimeoutError as tool_error:
-                                    logger.error(f"Tool execution timeout (SSE): {tool_error}")
-                                    return {
-                                        "server_name": server_name,
-                                        "tool_name": tool_name,
-                                        "error": f"Tool execution timed out: {str(tool_error)}",
-                                    }
-                                except (ConnectionError, OSError) as tool_error:
-                                    logger.error(f"Tool connection error (SSE): {tool_error}")
-                                    return {
-                                        "server_name": server_name,
-                                        "tool_name": tool_name,
-                                        "error": f"Tool connection failed: {str(tool_error)}",
-                                    }
-                                except (ValueError, TypeError, RuntimeError) as tool_error:
-                                    logger.error(f"Tool execution error (SSE): {tool_error}")
-                                    return {
-                                        "server_name": server_name,
-                                        "tool_name": tool_name,
-                                        "error": f"Tool execution failed: {str(tool_error)}",
-                                    }
-                else:
-                    raise TypeError(
-                        f"Unknown server params type for {server_name}: {type(server_params)}"
+                # Use persistent session pool
+                import time as _time
+                try:
+                    _perf_sess_start = _time.perf_counter()
+                    session, was_cached = await self._get_or_create_session(server_name)
+                    _perf_sess_elapsed = _time.perf_counter() - _perf_sess_start
+                    logger.info(
+                        f"[Perf] Session for '{server_name}': "
+                        f"{'reused' if was_cached else 'created'} in {_perf_sess_elapsed:.3f}s"
                     )
+                    _perf_call_start = _time.perf_counter()
+                    try:
+                        tool_result = await session.call_tool(tool_name, arguments=enriched_arguments)
+                        result_content = self._extract_tool_result(tool_name, tool_result, arguments)
+                    except (ConnectionError, OSError, BrokenPipeError, EOFError) as conn_err:
+                        # Session may be stale, invalidate and retry once
+                        logger.warning(f"Connection error for '{server_name}', retrying with new session: {conn_err}")
+                        await self._invalidate_session(server_name)
+                        session, _ = await self._get_or_create_session(server_name)
+                        tool_result = await session.call_tool(tool_name, arguments=enriched_arguments)
+                        result_content = self._extract_tool_result(tool_name, tool_result, arguments)
+                    except TimeoutError as tool_error:
+                        logger.error(f"Tool execution timeout: {tool_error}")
+                        return {"server_name": server_name, "tool_name": tool_name, "error": f"Tool execution timed out: {str(tool_error)}"}
+                    except (ValueError, TypeError, RuntimeError) as tool_error:
+                        logger.error(f"Tool execution error: {tool_error}")
+                        return {"server_name": server_name, "tool_name": tool_name, "error": f"Tool execution failed: {str(tool_error)}"}
+                except Exception as e:
+                    # Session creation failed
+                    logger.error(f"Failed to get session for '{server_name}': {e}")
+                    return {"server_name": server_name, "tool_name": tool_name, "error": f"Session creation failed: {str(e)}"}
 
-                logger.info(f"Tool '{tool_name}' (server: '{server_name}') called successfully.")
+                _perf_call_elapsed = _time.perf_counter() - _perf_call_start
+                logger.info(
+                    f"Tool '{tool_name}' (server: '{server_name}') called successfully. "
+                    f"[Perf] call={_perf_call_elapsed:.3f}s, session={'reused' if was_cached else 'new'}"
+                )
 
                 if isinstance(result_content, str) and "Unknown tool:" in result_content:
                     suggested_servers = await self._find_servers_with_tool(tool_name)
@@ -759,8 +728,6 @@ class ToolManager(ToolManagerProtocol):
                 logger.error(
                     f"Error: Failed to call tool '{tool_name}' (server: '{server_name}'): {outer_e}"
                 )
-                # import traceback
-                # traceback.print_exc() # Print detailed stack trace for debugging
 
                 # Store the original error message for later use
                 error_message = str(outer_e)
@@ -786,7 +753,6 @@ class ToolManager(ToolManagerProtocol):
                     except Exception as inner_e:  # Use a different name to avoid shadowing
                         # Log the inner exception if needed
                         logger.error(f"Fallback also failed: {inner_e}")
-                        # No need for pass here as we'll continue to the return statement
 
                 # Always use the outer exception for the final error response
                 return {

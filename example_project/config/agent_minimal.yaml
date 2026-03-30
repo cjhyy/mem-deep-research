@@ -1,0 +1,19 @@
+# 最小配置 — 快速测试用
+# 仅需 OPENROUTER_API_KEY
+
+main_agent:
+  llm:
+    provider_class: "ClaudeOpenRouterClient"
+    model_name: "anthropic/claude-sonnet-4"
+    temperature: 0.3
+    max_tokens: 16000
+    openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
+    keep_tool_result: 3
+
+  tool_config:
+    - tool-calculator
+
+  max_turns: 5
+  max_tool_calls_per_turn: 3
+
+output_dir: logs/

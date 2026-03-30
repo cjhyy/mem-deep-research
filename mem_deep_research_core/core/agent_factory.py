@@ -56,6 +56,7 @@ class TaskResult:
     status: str  # "completed", "failed", "interrupted"
     duration_seconds: float
     error: str | None = None
+    error_type: str | None = None  # v0.3: "llm_error", "tool_error", "config_error", "timeout"
 
 
 class AgentFactory:
@@ -310,21 +311,45 @@ class AgentFactory:
 
         except Exception as e:
             duration = (datetime.now() - start_time).total_seconds()
+            error_str = str(e)
+
+            # Classify error type
+            error_type = "unknown"
+            e_lower = error_str.lower()
+            if "timeout" in e_lower:
+                error_type = "timeout"
+            elif "context limit" in e_lower or "context length" in e_lower:
+                error_type = "context_limit"
+            elif isinstance(e, ValueError) or "config" in e_lower:
+                error_type = "config_error"
+            else:
+                error_type = "llm_error"
 
             result = TaskResult(
                 task_id=task_id,
-                final_answer=f"Error: {str(e)}",
+                final_answer=f"Error: {error_str}",
                 boxed_answer="",
                 log_path=log_path,
                 status="failed",
                 duration_seconds=duration,
-                error=str(e),
+                error=error_str,
+                error_type=error_type,
             )
 
             if on_progress:
                 on_progress("failed", result)
 
             return result
+
+    async def close(self) -> None:
+        """Clean up all resources — call on shutdown."""
+        if self._main_agent_tool_manager:
+            await self._main_agent_tool_manager.close_sessions()
+        if self._sub_agent_tool_managers:
+            for tm in self._sub_agent_tool_managers.values():
+                await tm.close_sessions()
+        self._initialized = False
+        logger.info("AgentFactory resources closed")
 
     async def run_batch(
         self,

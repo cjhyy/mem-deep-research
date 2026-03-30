@@ -37,6 +37,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from mem_deep_research_core.core.constants import COMPACT_MIN_CHARS, RESULT_BRIEF_LENGTH, SYSTEM_MESSAGE_KEYWORDS, TAG_RESEARCH_CONTEXT_SUMMARY
+
 logger = logging.getLogger("mem_deep_research")
 
 
@@ -107,9 +109,9 @@ class WindowStrategy(ABC):
         """
         ...
 
-    @property
-    def name(self) -> str:
-        return self.__class__.__name__
+    # Attributes for polymorphic dispatch (override in subclasses)
+    supports_async: bool = False
+    strategy_type: str = ""
 
 
 # ============================================================
@@ -117,9 +119,6 @@ class WindowStrategy(ABC):
 # ============================================================
 
 # --- 结果摘要辅助函数 ---
-
-COMPACT_MIN_CHARS = 200
-RESULT_BRIEF_LENGTH = 200
 
 
 def _get_message_char_count(msg: dict) -> int:
@@ -140,22 +139,13 @@ def _get_message_char_count(msg: dict) -> int:
 
 def _is_system_message(content) -> bool:
     """判断是否是系统注入的消息（反思提示、hint 等），不应被压缩"""
-    keywords = [
-        "[REFLECTION",
-        "REFLECTION CHECKPOINT",
-        "MANDATORY DIRECTIVE",
-        "[SYSTEM",
-        "[RESEARCH CONTEXT SUMMARY",
-        "[COLLECTED SOURCES",
-        "[RESEARCH PLAN",
-    ]
     if isinstance(content, str):
-        return any(kw in content for kw in keywords)
+        return any(kw in content for kw in SYSTEM_MESSAGE_KEYWORDS)
     if isinstance(content, list):
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
                 text = item.get("text", "")
-                if any(kw in text for kw in keywords):
+                if any(kw in text for kw in SYSTEM_MESSAGE_KEYWORDS):
                     return True
     return False
 
@@ -236,6 +226,8 @@ class ObservationMaskingStrategy(WindowStrategy):
         keep_recent: 保留最近 N 轮完整结果
         chars_per_token: 无 tiktoken 时的估算比例
     """
+
+    strategy_type = "observation_masking"
 
     def __init__(
         self,
@@ -409,6 +401,9 @@ class LLMSummarizeStrategy(WindowStrategy):
         llm_call_fn: 异步 LLM 调用函数，签名: async (system_prompt, messages, purpose) -> str
     """
 
+    supports_async = True
+    strategy_type = "llm_summarize"
+
     def __init__(
         self,
         trigger_ratio: float = 0.8,
@@ -475,7 +470,7 @@ class LLMSummarizeStrategy(WindowStrategy):
                     text = content[0].get("text", "") if isinstance(content[0], dict) else ""
                 else:
                     text = str(content)
-                if text.startswith("[RESEARCH CONTEXT SUMMARY"):
+                if text.startswith(TAG_RESEARCH_CONTEXT_SUMMARY):
                     messages.pop(1)
 
             # 插入新 summary
@@ -485,7 +480,7 @@ class LLMSummarizeStrategy(WindowStrategy):
                     {
                         "type": "text",
                         "text": (
-                            f"[RESEARCH CONTEXT SUMMARY — turns 1-{cutoff_turn}]\n\n"
+                            f"{TAG_RESEARCH_CONTEXT_SUMMARY} — turns 1-{cutoff_turn}]\n\n"
                             f"{summary}\n\n"
                             f"[End of summary. The detailed conversation continues below.]"
                         ),
@@ -529,7 +524,7 @@ class LLMSummarizeStrategy(WindowStrategy):
                 text = content
             else:
                 text = ""
-            if text.startswith("[RESEARCH CONTEXT SUMMARY"):
+            if text.startswith(TAG_RESEARCH_CONTEXT_SUMMARY):
                 start_idx = 2
 
         old_messages = []
@@ -618,6 +613,8 @@ class BinaryReductionStrategy(WindowStrategy):
         trigger_ratio: token 占比超过此值时触发（通常 0.95）
         keep_tail: 保留最后 N 条消息
     """
+
+    strategy_type = "binary_reduction"
 
     def __init__(
         self,
@@ -733,7 +730,7 @@ class WindowStrategyPipeline:
     ) -> bool:
         """执行异步 LLM 压缩（找到 LLMSummarizeStrategy 并调用）"""
         for strategy in self.strategies:
-            if isinstance(strategy, LLMSummarizeStrategy):
+            if hasattr(strategy, 'apply_async') and strategy.supports_async:
                 result = await strategy.apply_async(messages, ctx, llm_call_fn)
                 return result.messages_affected > 0
         return False
@@ -748,7 +745,7 @@ class WindowStrategyPipeline:
 
         # 先找 ObservationMasking 策略，用 keep_recent=1 执行
         for strategy in self.strategies:
-            if isinstance(strategy, ObservationMaskingStrategy):
+            if strategy.strategy_type == "observation_masking":
                 original_keep = strategy.keep_recent
                 strategy.keep_recent = 1
                 result = strategy.apply(messages, ctx)
@@ -772,7 +769,7 @@ class WindowStrategyPipeline:
 
         # 再用 BinaryReduction
         for strategy in self.strategies:
-            if isinstance(strategy, BinaryReductionStrategy):
+            if strategy.strategy_type == "binary_reduction":
                 result = strategy.apply(messages, ctx)
                 total_affected += result.messages_affected
                 break

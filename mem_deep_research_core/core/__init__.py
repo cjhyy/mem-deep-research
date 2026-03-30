@@ -21,10 +21,10 @@ from mem_deep_research_core.core.agent_factory import (
     run_agent,
     run_agent_from_project,
 )
+from mem_deep_research_core.core.constants import generate_message_id
 from mem_deep_research_core.core.llm_call_handler import (
     LLMCallHandler,
     SummaryHandler,
-    generate_message_id,
     generate_reflection_prompt,
 )
 from mem_deep_research_core.core.message_interceptor import MessageInterceptorHandler

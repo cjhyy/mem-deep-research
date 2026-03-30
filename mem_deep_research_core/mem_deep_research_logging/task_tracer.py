@@ -54,6 +54,12 @@ class TaskTracer(BaseModel):
     sub_agent_message_history_sessions: dict[str, dict[str, Any]] = Field(default_factory=dict)
     step_logs: list[StepRecord] = Field(default_factory=list)
 
+    # Performance metrics for optimization tracking
+    perf_metrics: dict[str, Any] = Field(default_factory=dict)
+
+    # Turn-level checkpoints for progress tracking and potential resume
+    checkpoints: list[dict[str, Any]] = Field(default_factory=list)
+
     def start_sub_agent_session(self, sub_agent_name: str, subtask_description: str) -> str:
         """Start a new sub-agent session"""
         self.sub_agent_counter += 1
@@ -100,6 +106,73 @@ class TaskTracer(BaseModel):
         # Also print to console
         logger.debug(f"{step_name}: {message}")
 
+    def record_perf(self, key: str, value: float, unit: str = "s") -> None:
+        """Record a performance metric.
+
+        Args:
+            key: Metric name (e.g., "main_loop_duration", "tool_call.search.session_create")
+            value: Metric value
+            unit: Unit of measurement (default: "s" for seconds)
+        """
+        self.perf_metrics[key] = {"value": round(value, 4), "unit": unit}
+
+    def append_perf(self, key: str, value: float, unit: str = "s") -> None:
+        """Append a value to a list-type performance metric (e.g., per-tool-call timings).
+
+        Args:
+            key: Metric name
+            value: Value to append
+            unit: Unit of measurement
+        """
+        if key not in self.perf_metrics:
+            self.perf_metrics[key] = {"values": [], "unit": unit}
+        entry = self.perf_metrics[key]
+        if "values" not in entry:
+            # Convert scalar to list
+            existing = entry.get("value")
+            entry.pop("value", None)
+            entry["values"] = [existing] if existing is not None else []
+        entry["values"].append(round(value, 4))
+
+    def get_perf_summary(self) -> str:
+        """Return a human-readable summary of all recorded perf metrics."""
+        if not self.perf_metrics:
+            return "No performance metrics recorded."
+        lines = []
+        for key, data in sorted(self.perf_metrics.items()):
+            if "values" in data:
+                vals = data["values"]
+                total = sum(vals)
+                avg = total / len(vals) if vals else 0
+                lines.append(
+                    f"  {key}: count={len(vals)}, total={total:.3f}{data['unit']}, avg={avg:.3f}{data['unit']}"
+                )
+            else:
+                lines.append(f"  {key}: {data['value']}{data['unit']}")
+        return "Performance Metrics:\n" + "\n".join(lines)
+
+    def save_checkpoint(
+        self,
+        turn: int,
+        message_count: int,
+        tool_calls_executed: int,
+        last_assistant_text: str = "",
+        task_failed: bool = False,
+    ) -> None:
+        """Save a turn-level checkpoint for progress tracking.
+
+        Enables callers to see what was accomplished before a failure.
+        Each checkpoint captures the state at the end of a turn.
+        """
+        self.checkpoints.append({
+            "turn": turn,
+            "timestamp": datetime.now().isoformat(),
+            "message_count": message_count,
+            "tool_calls_executed": tool_calls_executed,
+            "last_assistant_preview": last_assistant_text[:200] if last_assistant_text else "",
+            "task_failed": task_failed,
+        })
+
     def save(self):
         """Persist TaskTracer to disk. used in a finally block, thus never raise Exception."""
         try:
@@ -122,6 +195,9 @@ class TaskTracer(BaseModel):
 
             # Clear step logs (can accumulate many entries)
             self.step_logs.clear()
+
+            # Clear checkpoints
+            self.checkpoints.clear()
 
             # Clear input data
             self.input = None

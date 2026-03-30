@@ -216,6 +216,14 @@ class MaxTurnsExceededError(PipelineError):
         self.task_id = task_id
 
 
+class GuardrailError(PipelineError):
+    """Guardrail validation failed — blocks LLM call or rejects output."""
+
+    def __init__(self, guardrail_name: str, message: str):
+        self.guardrail_name = guardrail_name
+        super().__init__(f"[Guardrail:{guardrail_name}] {message}")
+
+
 class TaskCancelledError(PipelineError):
     """任务被取消"""
 

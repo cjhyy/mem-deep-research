@@ -7,6 +7,7 @@ from mcp import StdioServerParameters
 from omegaconf import DictConfig, OmegaConf
 
 from mem_deep_research_core.mem_deep_research_logging.logger import bootstrap_logger
+from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX
 from mem_deep_research_core.prompts import AgentPrompt
 from mem_deep_research_core.utils.external_loader import external_loader
 
@@ -20,10 +21,11 @@ def create_mcp_server_parameters(
 ):
     """Define and return MCP server configuration list
 
-    支持三种工具配置模式：
+    支持四种工具配置模式：
     1. stdio 模式（本地）: 启动本地子进程
     2. http 模式（远程）: 连接远程 MCP 服务器 URL
     3. sse 模式（远程）: 连接远程 SSE 端点
+    4. inprocess 模式（进程内）: 直接导入 Python 模块，无需子进程
 
     配置示例：
     ```yaml
@@ -40,6 +42,12 @@ def create_mcp_server_parameters(
     name: "tool-remote-sse"
     url: "http://localhost:8080/sse"
     transport: "sse"
+
+    # inprocess 模式（进程内，无子进程开销）
+    name: "tool-calculator"
+    transport: "inprocess"
+    module: "mem_deep_research_core.tool.mcp_servers.calculator_server"
+    object: "mcp"
     ```
     """
     configs = []
@@ -86,6 +94,19 @@ def create_mcp_server_parameters(
                     )
                     logger.info(
                         f"[ToolUtils] Configured remote MCP server '{tool_name}': {url} (transport={transport})"
+                    )
+                elif tool_cfg_resolved.get("transport") == "inprocess":
+                    # In-process MCP tool — no subprocess, direct Python import
+                    configs.append({
+                        "name": tool_name,
+                        "params": "inprocess",  # Sentinel: truthy, distinguishes from None
+                        "transport": "inprocess",
+                        "module": tool_cfg_resolved.get("module", ""),
+                        "object": tool_cfg_resolved.get("object", "mcp"),
+                    })
+                    logger.info(
+                        f"[ToolUtils] Configured in-process MCP tool '{tool_name}': "
+                        f"module={tool_cfg_resolved.get('module')}"
                     )
                 else:
                     # 本地 stdio 模式
@@ -139,6 +160,7 @@ def _load_agent_prompt(prompt_cfg: dict = None) -> AgentPrompt:
         templates_dir=prompt_cfg.get("templates_dir"),
         custom_system_template=prompt_cfg.get("custom_system_template"),
         custom_summarize_template=prompt_cfg.get("custom_summarize_template"),
+        minimal=prompt_cfg.get("minimal", False),
     )
 
 
@@ -146,9 +168,9 @@ def expose_sub_agents_as_tools(sub_agents_cfg: DictConfig):
     """Expose sub-agents as tools"""
     sub_agents_server_params = []
     for sub_agent in sub_agents_cfg:
-        if not sub_agent.startswith("agent-"):
+        if not sub_agent.startswith(SUB_AGENT_PREFIX):
             raise ValueError(
-                f"Sub-agent name must start with 'agent-': {sub_agent}. Please check the sub-agent name in the agent's config file."
+                f"Sub-agent name must start with '{SUB_AGENT_PREFIX}': {sub_agent}. Please check the sub-agent name in the agent's config file."
             )
         try:
             sub_agent_cfg = sub_agents_cfg[sub_agent]

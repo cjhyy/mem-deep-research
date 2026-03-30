@@ -6,21 +6,27 @@ LLM 调用处理模块
 
 import asyncio
 import logging
-import uuid
 from collections.abc import Callable
 from typing import Any
 
-from mem_deep_research_core.exceptions import ContextLimitError
+from mem_deep_research_core.core.constants import (
+    EMERGENCY_SUMMARY_MIN_CHARS,
+    FALLBACK_EMERGENCY_SUMMARY,
+    FALLBACK_SUMMARY_ERROR,
+    MAX_SUMMARY_CONTEXT_RETRIES,
+    SUMMARY_GENERATION_TIMEOUT,
+    SUMMARY_NETWORK_MAX_RETRIES,
+    TAG_CONTENT_REMOVED,
+    TASK_PREVIEW_LENGTH,
+    generate_message_id,
+)
+from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.exceptions import ContextLimitError, GuardrailError
 from mem_deep_research_core.llm.provider_client_base import LLMProviderClientBase
 from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
 from mem_deep_research_core.prompts.template_loader import PromptTemplateLoader
 
 logger = logging.getLogger("mem_deep_research")
-
-
-def generate_message_id() -> str:
-    """Generate random message ID using common LLM format"""
-    return f"msg_{uuid.uuid4().hex[:8]}"
 
 
 class LLMCallHandler:
@@ -142,6 +148,23 @@ class LLMCallHandler:
         self._save_message_history(system_prompt, message_history, agent_type)
 
         try:
+            # Guardrail: pre-LLM validation
+            if hooks.has_hooks("on_before_llm_call"):
+                try:
+                    hooks.call(
+                        "on_before_llm_call",
+                        HookContext(
+                            hook_name="on_before_llm_call",
+                            query=system_prompt[:200],
+                            context={"message_count": len(message_history), "turn": step_id},
+                            extra={"agent_type": agent_type},
+                        ),
+                    )
+                except GuardrailError as e:
+                    logger.warning(f"[Guardrail] Pre-LLM blocked: {e}")
+                    self._log_step(purpose, "guardrail_blocked", str(e))
+                    return None, True, None
+
             response = await current_llm_client.create_message(
                 system_prompt=system_prompt,
                 message_history=message_history,
@@ -168,6 +191,23 @@ class LLMCallHandler:
                 )
 
                 if assistant_response_text:
+                    # Guardrail: post-LLM validation
+                    if hooks.has_hooks("on_after_llm_call"):
+                        try:
+                            hooks.call(
+                                "on_after_llm_call",
+                                HookContext(
+                                    hook_name="on_after_llm_call",
+                                    result=assistant_response_text,
+                                    context={"turn": step_id},
+                                    extra={"agent_type": agent_type},
+                                ),
+                            )
+                        except GuardrailError as e:
+                            logger.warning(f"[Guardrail] Post-LLM rejected: {e}")
+                            self._log_step(purpose, "guardrail_rejected", str(e))
+                            return None, True, None
+
                     self._log_step(purpose, "success", f"{purpose} completed successfully")
                     return assistant_response_text, should_break, tool_calls_info
                 else:
@@ -192,54 +232,20 @@ class LLMCallHandler:
             return None, True, "context_limit"
 
         except Exception as e:
-            # Check if this is a RetryError wrapping a context limit error
+            # Check if this is a RetryError wrapping a ContextLimitError
             # tenacity.RetryError wraps the last exception in its chain
-            error_str = str(e)
-            is_context_limit = False
-
-            # Check RetryError's wrapped exception
             if hasattr(e, "last_attempt"):
                 try:
-                    inner_exception = e.last_attempt.exception()
-                    if inner_exception:
-                        inner_str = str(inner_exception)
-                        if isinstance(inner_exception, ContextLimitError) or any(
-                            pattern in inner_str
-                            for pattern in [
-                                "maximum context length",
-                                "context limit",
-                                "too long",
-                                "exceeds the maximum",
-                                "prompt is too long",
-                                "Input tokens exceed",
-                            ]
-                        ):
-                            is_context_limit = True
+                    inner = e.last_attempt.exception()
+                    if isinstance(inner, ContextLimitError):
+                        logger.debug(f"⚠️ {purpose} context limit exceeded (from RetryError): {e}")
+                        self._log_step(
+                            purpose, "context_limit",
+                            f"{purpose} context limit exceeded (RetryError): {inner}",
+                        )
+                        return None, True, "context_limit"
                 except Exception:
                     pass
-
-            # Also check the outer error string for context limit patterns
-            if not is_context_limit and any(
-                pattern in error_str
-                for pattern in [
-                    "maximum context length",
-                    "context limit",
-                    "too long",
-                    "exceeds the maximum",
-                    "prompt is too long",
-                    "Input tokens exceed",
-                ]
-            ):
-                is_context_limit = True
-
-            if is_context_limit:
-                logger.debug(f"⚠️ {purpose} context limit exceeded (from RetryError): {e}")
-                self._log_step(
-                    purpose,
-                    "context_limit",
-                    f"{purpose} context limit exceeded (RetryError): {str(e)}",
-                )
-                return None, True, "context_limit"
 
             logger.debug(f"⚠️ {purpose} call failed: {e}")
             if self.stream_error_callback:
@@ -257,6 +263,7 @@ class SummaryHandler:
         self,
         llm_call_handler: LLMCallHandler,
         chinese_context: bool = False,
+        response_language: str = "English",
     ):
         """
         初始化摘要处理器
@@ -264,11 +271,12 @@ class SummaryHandler:
         Args:
             llm_call_handler: LLM 调用处理器
             chinese_context: 是否使用中文上下文
+            response_language: 响应语言
         """
         self.llm_call_handler = llm_call_handler
         self.chinese_context = chinese_context
-        self.target_language: str | None = None
-        self.target_language_task: asyncio.Task | None = None
+        self.response_language = response_language
+        self.context: dict[str, Any] | None = None
 
     async def handle_summary_with_retry(
         self,
@@ -282,7 +290,6 @@ class SummaryHandler:
         agent_type: str = "main",
         task_guidance: str = "",
         stream_message_callback: Callable | None = None,
-        detect_language_func: Callable | None = None,
     ) -> str:
         """
         处理摘要生成，包含 context limit 重试逻辑
@@ -298,28 +305,21 @@ class SummaryHandler:
             agent_type: Agent 类型
             task_guidance: 任务指导
             stream_message_callback: 流式消息回调
-            detect_language_func: 语言检测函数
 
         Returns:
             str: 摘要文本，失败时返回错误消息
         """
+        import time as _time
+        _summary_deadline = _time.perf_counter() + SUMMARY_GENERATION_TIMEOUT
+
         retry_count = 0
-        max_context_retries = 10  # Hard limit to prevent infinite loops
+        max_context_retries = MAX_SUMMARY_CONTEXT_RETRIES
 
         while retry_count < max_context_retries:
-            # 检测目标语言
-            if not self.target_language and self.target_language_task:
-                try:
-                    await self.target_language_task
-                except Exception as e:
-                    logger.warning(f"Language detection background task failed: {e}")
-
-            if self.target_language:
-                target_language = self.target_language
-            elif detect_language_func:
-                target_language = await detect_language_func(task_description)
-            else:
-                target_language = "English"
+            if _time.perf_counter() > _summary_deadline:
+                logger.warning(f"[SummaryHandler] Summary generation deadline exceeded ({SUMMARY_GENERATION_TIMEOUT}s)")
+                break
+            target_language = self.response_language
 
             # 生成摘要提示词
             summary_prompt = agent_prompt_instance.generate_summarize_prompt(
@@ -328,6 +328,15 @@ class SummaryHandler:
                 chinese_context=self.chinese_context,
                 target_language=target_language,
             )
+
+            # Hook: on_summarize_prompt_build
+            hook_result = hooks.call("on_summarize_prompt_build", HookContext(
+                hook_name="on_summarize_prompt_build",
+                result=summary_prompt,
+                context=self.context,
+            ))
+            if isinstance(hook_result, str):
+                summary_prompt = hook_result
 
             # 处理消息历史合并
             current_llm_client = self.llm_call_handler.get_client(agent_type)
@@ -341,7 +350,7 @@ class SummaryHandler:
             )
 
             # 网络重试循环
-            network_max_retries = 3
+            network_max_retries = SUMMARY_NETWORK_MAX_RETRIES
             for network_retry_count in range(network_max_retries):
                 history_len_before = len(message_history)
 
@@ -380,7 +389,7 @@ class SummaryHandler:
                                 logger.debug("Removed empty assistant response before retry")
 
                     # 递减重试等待
-                    retry_wait = max(2, 10 - network_retry_count * 2)
+                    retry_wait = max(1, 5 - network_retry_count)
                     logger.warning(
                         f"LLM summary returned empty response, attempt {network_retry_count + 1}/{network_max_retries}, retrying after {retry_wait}s..."
                     )
@@ -428,7 +437,7 @@ class SummaryHandler:
             if len(message_history) <= keep_tail + 1:
                 # Too few messages, replace content of middle messages
                 for i in range(1, len(message_history)):
-                    message_history[i]["content"] = "[Content removed to reduce context]"
+                    message_history[i]["content"] = TAG_CONTENT_REMOVED
             else:
                 # Token-aware reduction: if client supports it, calculate target
                 target_count = None
@@ -480,12 +489,12 @@ class SummaryHandler:
         # --- Emergency fallback: extract last assistant response ---
         emergency_summary = self._extract_emergency_summary(message_history)
         if emergency_summary:
-            fallback_text = f"[Emergency Summary - context limit reached]\n\n{emergency_summary}"
+            fallback_text = f"{FALLBACK_EMERGENCY_SUMMARY}\n\n{emergency_summary}"
             logger.warning(
                 f"[CONTEXT] Using emergency summary from last assistant response (len={len(emergency_summary)})"
             )
         else:
-            fallback_text = "[ERROR] Unable to generate final summary due to context limit or network issues. You should try again."
+            fallback_text = FALLBACK_SUMMARY_ERROR
             logger.error(f"Summary failed after {retry_count} context reduction attempts")
 
         # 将 fallback 文本通过流式回调发送给客户端，防止客户端收到 content_length=0
@@ -504,7 +513,7 @@ class SummaryHandler:
         for msg in reversed(message_history):
             if msg.get("role") == "assistant":
                 content = msg.get("content", "")
-                if isinstance(content, str) and len(content.strip()) > 50:
+                if isinstance(content, str) and len(content.strip()) > EMERGENCY_SUMMARY_MIN_CHARS:
                     return content.strip()
                 elif isinstance(content, list):
                     texts = [
@@ -513,7 +522,7 @@ class SummaryHandler:
                         if isinstance(item, dict) and item.get("type") == "text"
                     ]
                     combined = "\n".join(t for t in texts if t.strip())
-                    if len(combined) > 50:
+                    if len(combined) > EMERGENCY_SUMMARY_MIN_CHARS:
                         return combined
         return None
 
@@ -536,7 +545,7 @@ def generate_reflection_prompt(
         反思提示词
     """
     task_preview = (
-        task_description[:500] + "..." if len(task_description) > 500 else task_description
+        task_description[:TASK_PREVIEW_LENGTH] + "..." if len(task_description) > TASK_PREVIEW_LENGTH else task_description
     )
 
     template_name = "reflection/reflection_chinese" if chinese_context else "reflection/reflection"

@@ -274,16 +274,10 @@ class TestObservationMaskingCompat:
             )
         return history
 
-    def test_compat_masks_old_turns(self, cm):
-        """兼容接口 apply_observation_masking 仍然工作"""
+    def test_apply_compact_masks_old_turns(self, cm):
+        """apply_compact masks old turns"""
         history = self._build_history(6)
-        masked = cm.apply_observation_masking(history, current_turn=6)
-        assert masked > 0
-
-    def test_compat_with_override_keep_turns(self, cm):
-        """兼容接口支持 override_keep_turns"""
-        history = self._build_history(6)
-        masked = cm.apply_observation_masking(history, current_turn=6, override_keep_turns=2)
+        masked = cm.apply_compact(history, current_turn=6)
         assert masked > 0
 
 

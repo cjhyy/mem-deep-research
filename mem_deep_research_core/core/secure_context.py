@@ -119,8 +119,6 @@ def build_secure_usage_prompt(
     if not secure:
         return ""
 
-    [make_placeholder(k) for k in secure]
-
     if chinese:
         lines = [
             "\n## 安全占位符（必须遵守）\n",

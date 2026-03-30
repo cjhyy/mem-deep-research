@@ -1,27 +1,22 @@
 # Mem Deep Research
 
-An extensible AI Agent framework focused on deep research tasks. Built on the MCP tool protocol with multi-LLM provider support.
+可扩展的 AI Agent 框架，专注于深度研究任务。基于 MCP 工具协议，支持多 LLM 提供商。
 
-## Features
+## 特性
 
-- **MCP Tool System**: Local (stdio), remote HTTP (streamable-http), and SSE transport modes
-- **Three-tier Context Management**: Observation Masking → LLM Summarization → Binary Reduction
-- **Tool Call Deduplication**: Cross-turn dedup with hit-count tracking and progressive escalation
-- **Execution Monitoring**: 3-tier escalation (WARN → INJECT_HINT → TERMINATE) with loop detection
-- **Skill System**: Rules-based, LLM-based, and inline selection modes
-- **Hook System**: Lifecycle hooks for custom logic injection
-- **SecureContext**: Automatic sensitive data isolation with placeholder substitution
-- **Prompt Templates**: Flexible template system with preset combinations
-- **Multi-LLM Support**: Anthropic, OpenAI, OpenRouter, DeepSeek, etc.
-- **Deep Research Mode**: Reflection checkpoints and automatic task planning
+- **MCP 工具系统** — 本地 (stdio)、远程 HTTP (streamable-http)、SSE 三种传输模式
+- **三级上下文管理** — Observation Masking → LLM 摘要压缩 → 二分裁剪，自动防爆
+- **执行监控** — 三级升级策略 (WARN → INJECT_HINT → TERMINATE)，循环检测 + 超时控制
+- **Hook 系统** — 17 个生命周期钩子，所有行为可自定义
+- **多语言支持** — `response_language: auto` 自动检测回答语言
+- **子 Agent** — 复杂任务自动分解，子 Agent 复用主循环，上下文隔离
+- **Skill 系统** — 规则匹配 / LLM 选择 / Inline 三种模式
+- **隐私保护** — `_secure` 字段自动占位符替换
+- **多 LLM 支持** — Anthropic、OpenAI、OpenRouter、DeepSeek 等
 
-## Installation
+## 快速开始
 
-```bash
-pip install mem-deep-research
-```
-
-Or install from source:
+### 1. 安装
 
 ```bash
 git clone https://github.com/cjhyy/mem-deep-research.git
@@ -29,262 +24,260 @@ cd mem-deep-research
 pip install -e .
 ```
 
-## Quick Start
+### 2. 创建项目
 
-### Option 1: Python API
-
-```python
-from mem_deep_research import DeepResearch
-
-# Load from a project directory
-dr = DeepResearch.from_project("./my_project")
-result = await dr.run("Research the latest developments in AI agents")
-print(result.answer)
-
-# Or use synchronous API
-result = dr.run_sync("Your research task")
-```
-
-### Option 2: CLI
+最快的方式：复制 `example_project`。
 
 ```bash
-# Create a new project
-mem-deep-research init my_project
-
-# Run research (from your project directory)
-python run.py "Your research task"
+cp -r example_project my_project
+cd my_project
 ```
 
-### Option 3: Programmatic Configuration
+编辑 `.env`，填入你的 API Key：
+
+```bash
+OPENROUTER_API_KEY=your-key-here
+```
+
+### 3. 运行
+
+```bash
+python run.py "量子计算的基本原理是什么？"
+```
+
+搞定。框架会自动检测语言，用中文回答。
+
+### 4. 代码调用
 
 ```python
 from mem_deep_research import DeepResearch
 
+# 方式 1: 从项目目录加载（推荐）
+dr = DeepResearch.from_project("./my_project")
+result = await dr.run("你的研究任务")
+print(result.answer)
+
+# 方式 2: 纯代码配置
 dr = DeepResearch(
-    llm_provider="anthropic",
-    model="claude-sonnet-4-20250514",
-    api_key="your-api-key",
+    llm_provider="openrouter",
+    model="anthropic/claude-sonnet-4",
+    api_key="your-key",
+    tools=["tool-calculator"],
 )
-result = await dr.run("Your task")
+result = await dr.run("123 * 456 + 789")
+
+# 同步调用
+result = dr.run_sync("你的任务")
 ```
 
-## Project Structure
-
-A user project loaded via `DeepResearch.from_project()`:
+## 项目结构
 
 ```
 my_project/
 ├── config/
-│   ├── agent.yaml              # Agent configuration (LLM, tools, parameters)
-│   ├── tool/                   # Tool configs (override framework defaults)
-│   ├── skills/definitions/     # Custom skill definitions
-│   └── prompts/                # Custom prompt templates
-├── hooks.py                    # Lifecycle hooks (auto-loaded)
-├── .env                        # API keys
-└── run.py                      # Entry script
+│   ├── agent.yaml              # Agent 配置（LLM、工具、参数）
+│   ├── tool/                   # 自定义工具配置（MCP YAML）
+│   ├── skills/definitions/     # 自定义 Skill（Markdown）
+│   └── prompts/                # 自定义 Prompt 模板
+├── hooks.py                    # 生命周期钩子（自动加载）
+├── .env                        # API 密钥
+└── run.py                      # 入口脚本
 ```
 
-### Minimal `config/agent.yaml`
+## 配置
+
+### 最小配置
 
 ```yaml
+# config/agent.yaml
 main_agent:
   llm:
     provider_class: "ClaudeOpenRouterClient"
     model_name: "anthropic/claude-sonnet-4"
-    temperature: 0.3
-    max_tokens: 32000
     openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
-
   tool_config:
-    - tool-searching-serper
-
-  max_turns: 20
+    - tool-calculator
+  max_turns: 10
 ```
 
-### Full Configuration Reference
+### 完整配置
 
 ```yaml
 main_agent:
   prompt:
-    agent_type: main              # main | worker
-    tool_format: xml              # xml | native
-    presets: []                   # e.g. [research, time_sensitive]
+    agent_type: main             # main | worker
+    tool_format: xml             # xml | native
+    presets: [research]          # 可选: research, time_sensitive, research_planning
 
   llm:
     provider_class: "ClaudeOpenRouterClient"
     model_name: "anthropic/claude-sonnet-4"
     temperature: 0.3
     max_tokens: 32000
-    max_context_length: 128000    # -1 = unlimited
-    keep_tool_result: 5           # -1 = keep all, N = keep last N
+    max_context_length: -1       # -1 = 不限制
+    openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
 
-  tool_config: [tool-searching-serper]
+  tool_config:
+    - tool-calculator
+    - tool-searching-serper      # 需要 SERPER_API_KEY
+
   max_turns: 20
   max_tool_calls_per_turn: 10
-  chinese_context: false
+  keep_tool_result: -1           # -1 全部保留
 
-  skill_selection:
+  response_language: auto        # auto | Chinese | English | Japanese | ...
+
+  deep_research:
     enabled: true
-    method: inline                # rules | llm | inline
-    max_skills: 3
+    reflection_interval: 5
 
   context_manager:
     enable_dedup: true
-    enable_compact: true
     compact_at_ratio: 0.6
     summarize_at_ratio: 0.8
-    compact_keep_recent: 3
 
   monitoring:
-    stall_detection_threshold: 120.0
-    max_total_time: 600.0
     enable_loop_detection: true
-    loop_escalation_terminate_threshold: 3
+    max_total_time: 600.0
 
-  deep_research:
-    enabled: false
-    reflection_interval: 5
-    auto_planning: false
+  skill_selection:
+    enabled: true
+    method: inline               # rules | llm | inline
+
+  interceptor:
+    preset: default              # default | verbose | minimal | debug
+
+# 子 Agent（可选）
+sub_agents:
+  agent-researcher:
+    llm:
+      provider_class: "ClaudeOpenRouterClient"
+      model_name: "anthropic/claude-sonnet-4"
+      openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
+    tool_config: [tool-searching-serper]
+    max_turns: 10
 ```
 
-## Tool Configuration
+## 自定义工具
 
-### Local Tool (stdio)
+在 `config/tool/` 下添加 YAML 文件：
 
 ```yaml
-# config/tool/tool-my-custom.yaml
-name: "tool-my-custom"
+# 本地工具（stdio）
+name: "tool-my-script"
 tool_command: "python"
-args:
-  - "tools/my_tool_server.py"
+args: ["tools/my_server.py"]
 env:
   MY_API_KEY: "${oc.env:MY_API_KEY}"
 ```
 
-### Remote Tool (streamable-http)
-
 ```yaml
-# config/tool/tool-remote.yaml
-name: "tool-remote"
+# 远程工具（HTTP）
+name: "tool-remote-api"
 url: "https://api.example.com/mcp"
 transport: "streamable-http"
 headers:
   Authorization: "Bearer ${oc.env:API_TOKEN}"
 ```
 
-## Hook System
+然后在 `agent.yaml` 中引用：
+
+```yaml
+tool_config:
+  - tool-calculator
+  - tool-my-script
+  - tool-remote-api
+```
+
+## Hook 系统
+
+`hooks.py` 放在项目根目录，`from_project()` 自动加载。
 
 ```python
-# hooks.py (in your project directory, auto-loaded)
 from mem_deep_research_core.core.hooks import hooks, HookContext
 
-@hooks.register("on_env_inject", priority=10)
-def inject_env(ctx: HookContext, original_fn):
-    params = original_fn(ctx)
-    params.env["MY_KEY"] = os.environ.get("MY_KEY", "")
-    return params
+# 记录每次工具调用
+@hooks.register("on_tool_end", priority=10)
+def log_tool(ctx: HookContext, original_fn):
+    print(f"Tool {ctx.tool_name} finished in {ctx.duration_ms}ms")
+    return original_fn(ctx)
 
-@hooks.register("on_tool_result_format")
-def format_result(ctx: HookContext, original_fn):
-    if ctx.tool_name == "my_tool":
-        return "Custom format"
+# 修改 system prompt
+@hooks.register("on_system_prompt_build", priority=50)
+def customize_prompt(ctx: HookContext, original_fn):
+    prompt = original_fn(ctx)
+    return prompt + "\n\nAlways cite sources."
+
+# Guardrail — 阻止危险操作
+@hooks.register("on_before_llm_call", priority=10)
+def guardrail(ctx: HookContext, original_fn):
+    from mem_deep_research_core.exceptions import GuardrailError
+    if "DELETE" in str(ctx.extra.get("messages", [])):
+        raise GuardrailError("Blocked: SQL DELETE detected")
     return original_fn(ctx)
 ```
 
-| Hook | Timing | Modifiable |
-|------|--------|------------|
-| `on_agent_start` | Agent starts | — |
-| `on_agent_end` | Agent completes | — |
-| `on_turn_start` | Each turn starts | — |
-| `on_turn_end` | Each turn ends | — |
-| `on_tool_start` | Before tool call | arguments |
-| `on_tool_end` | After tool call | tool_result |
-| `on_tool_result_format` | Result formatting | return value |
-| `on_thinking_generate` | Thinking description | return value |
-| `on_env_inject` | MCP env vars | server_params |
-| `on_message_intercept` | Message interception | — |
+### 全部可用 Hook
 
-## SecureContext
+| Hook | 时机 | 可修改 |
+|------|------|--------|
+| `on_agent_start` / `on_agent_end` | Agent 生命周期 | — |
+| `on_turn_start` / `on_turn_end` | 每轮开始/结束 | — |
+| `on_tool_start` / `on_tool_end` | 工具调用前/后 | arguments / tool_result |
+| `on_tool_filter` | 去重后、执行前 | tool_calls_batch |
+| `on_system_prompt_build` | system prompt 生成后 | 返回值 |
+| `on_summarize_prompt_build` | 摘要 prompt 生成后 | 返回值 |
+| `on_tool_result_format` | 工具结果格式化 | 返回值 |
+| `on_before_llm_call` / `on_after_llm_call` | LLM 调用前后 | raise GuardrailError |
+| `on_env_inject` | MCP 环境变量注入 | server_params |
+| `on_context_compact` | 上下文压缩 | — |
+| `on_reflection_build` | 反思 prompt 生成 | 返回值 |
 
-Sensitive fields in the context dict are automatically masked in the system prompt and restored before tool execution:
+## 隐私保护 (SecureContext)
+
+`context` 中的 `_secure` 字段在 system prompt 中自动显示为占位符，工具调用时自动还原：
 
 ```python
-context = {
-    "user_name": "Alice",             # Visible to LLM
+result = await dr.run("查询用户信息", context={
+    "user_name": "Alice",           # LLM 可见
     "_secure": {
-        "user_id": "real-123",        # LLM sees [SECURE:user_id]
-        "api_token": "secret-456",    # LLM sees [SECURE:api_token]
+        "user_id": "real-123",      # LLM 看到 [SECURE:user_id]
+        "api_token": "secret",      # 工具调用时自动替换回真实值
     }
-}
-# Tool calls with [SECURE:user_id] are auto-replaced with "real-123"
+})
 ```
 
-## LLM Providers
+## LLM Provider
 
-| Provider | Class | Base |
-|----------|-------|------|
-| Anthropic (native) | `ClaudeAnthropicClient` | `LLMProviderClientBase` |
-| OpenAI (native) | `GPTOpenAIClient` | `LLMProviderClientBase` |
-| OpenRouter Claude | `ClaudeOpenRouterClient` | `OpenAICompatibleClient` |
-| OpenRouter GPT-5 | `GPT5OpenRouterClient` | `OpenAICompatibleClient` |
-| OpenAI GPT-5 | `GPT5OpenAIClient` | `GPT5OpenRouterClient` |
-| DeepSeek | `DeepSeekOpenRouterClient` | `OpenAICompatibleClient` |
+| Provider | 类名 | API Key 环境变量 |
+|----------|------|----------------|
+| OpenRouter (Claude) | `ClaudeOpenRouterClient` | `OPENROUTER_API_KEY` |
+| Anthropic 直连 | `ClaudeAnthropicClient` | `ANTHROPIC_API_KEY` |
+| OpenAI | `GPTOpenAIClient` | `OPENAI_API_KEY` |
+| DeepSeek | `DeepSeekOpenRouterClient` | `DEEPSEEK_API_KEY` |
 
-## Environment Variables
-
-```bash
-# .env
-OPENROUTER_API_KEY=your_key
-ANTHROPIC_API_KEY=your_key
-OPENAI_API_KEY=your_key
-DEEPSEEK_API_KEY=your_key
-SERPER_API_KEY=your_key
-```
-
-## Framework Directory Structure
+## 架构概览
 
 ```
-mem_deep_research_core/              # Core framework code
-├── deep_research.py                 # Main entry (DeepResearch API)
-├── config_schema.py                 # Pydantic config validation
-├── config/                          # Framework default configs
-│   ├── tool/                        # Built-in tool configs (YAML)
-│   └── skills/definitions/          # Built-in skill definitions (Markdown)
-├── core/                            # Core modules
-│   ├── orchestrator.py              # Agent orchestrator
-│   ├── main_loop.py                 # Main loop runner
-│   ├── monitoring.py                # Execution monitor + loop detection
-│   ├── context_manager.py           # Context management (masking + dedup)
-│   ├── secure_context.py            # Sensitive data isolation
-│   ├── hooks.py                     # Hook system
-│   ├── task_planner.py              # LLM task decomposition
-│   └── ...
-├── llm/                             # LLM clients
-│   ├── provider_client_base.py      # Base class
-│   └── providers/                   # Provider implementations
-├── prompts/                         # Prompt system
-│   ├── agent_prompt.py              # Unified AgentPrompt class
-│   └── templates/                   # Markdown templates
-├── tool/                            # MCP tool module
-├── skills/                          # Skill selection system
-└── utils/                           # Utilities
-tests/                               # Unit tests
-docs/                                # Documentation
+DeepResearch.run(query)
+  → Pipeline → AgentFactory → Orchestrator
+    → PromptBuilder 构建 system prompt
+    → MainLoopRunner 执行主循环:
+        LLM 调用 → 工具执行 → Context 管理 → 监控检查
+        (子 Agent 复用同一 MainLoopRunner，隔离上下文)
+    → SummaryHandler 生成最终摘要
+  → ResearchResult
 ```
 
-## Architecture
+详细文档见 [`docs/`](docs/) 目录。
 
-See [`docs/00-architecture.md`](docs/00-architecture.md) for the full architecture overview, or browse [`docs/`](docs/) for detailed documentation on each subsystem.
-
-## Development
+## 开发
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -v
-ruff check .
-ruff format .
+python -m pytest tests/ -v     # 248 tests
 ```
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) for details.
+Apache License 2.0

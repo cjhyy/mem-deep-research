@@ -26,6 +26,9 @@ class StreamHandler:
         """
         self.stream_queue = stream_queue
         self.current_agent_id: str | None = None
+        self._dropped_events = 0
+        if not self.stream_queue:
+            logger.debug("[StreamHandler] No stream queue — streaming events will be discarded")
 
     async def _stream_update(self, event_type: str, data: dict):
         """Send streaming update in new SSE protocol format"""
@@ -37,7 +40,11 @@ class StreamHandler:
                 }
                 await self.stream_queue.put(stream_message)
             except Exception as e:
-                logger.warning(f"Failed to send stream update: {e}")
+                self._dropped_events += 1
+                if self._dropped_events <= 5 or self._dropped_events % 100 == 0:
+                    logger.warning(
+                        f"Failed to send stream update ({self._dropped_events} total dropped): {e}"
+                    )
 
     async def stream_start_workflow(self, user_input: str, workflow_id: str = None) -> str:
         """Send start_of_workflow event"""

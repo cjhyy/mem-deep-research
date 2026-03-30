@@ -47,6 +47,7 @@ class AgentPrompt:
         templates_dir: Path | None = None,
         custom_system_template: str | None = None,
         custom_summarize_template: str | None = None,
+        minimal: bool = False,
     ):
         """
         初始化 Agent Prompt
@@ -58,11 +59,13 @@ class AgentPrompt:
             templates_dir: 自定义模板目录（会优先于内置模板）
             custom_system_template: 自定义系统 prompt 模板名
             custom_summarize_template: 自定义总结 prompt 模板名
+            minimal: 最小化 system prompt — 跳过 intro/objective，只保留日期+工具定义(如有)
         """
         self.agent_type = agent_type
         self.tool_format = tool_format
         self.presets = presets or []
         self.is_main_agent = agent_type == "main"
+        self.minimal = minimal
 
         # 自定义模板名
         self.custom_system_template = custom_system_template
@@ -148,6 +151,16 @@ class AgentPrompt:
         # 构建系统 prompt
         parts = []
 
+        # 0. minimal 模式：只保留工具定义（如有），不加 intro/objective/presets
+        if self.minimal:
+            if extra_context:
+                parts.append(extra_context.strip())
+            if mcp_tools:
+                if default_tool_format:
+                    parts.append(default_tool_format)
+                parts.append(f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}")
+            return "\n\n".join(parts)
+
         # 1. 自定义模板覆盖整个主体，通过占位符按需引用默认模块
         if self.custom_system_template:
             try:
@@ -168,15 +181,22 @@ class AgentPrompt:
 
         # 2. 默认构建（无 custom 模板或加载失败时）
         if not parts:
-            intro = default_intro
-            if extra_context:
-                intro = extra_context.strip() + "\n\n" + intro
-            parts.append(intro)
+            if mcp_tools:
+                # 有工具：完整 intro + 工具格式 + 工具列表
+                intro = default_intro
+                if extra_context:
+                    intro = extra_context.strip() + "\n\n" + intro
+                parts.append(intro)
 
-            if default_tool_format:
-                parts.append(default_tool_format)
-
-            parts.append(f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}")
+                if default_tool_format:
+                    parts.append(default_tool_format)
+                parts.append(f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}")
+            else:
+                # 无工具：只保留日期时间，不注入工具相关描述
+                date_line = f"Today is: {formatted_date}. Current time: {formatted_time}."
+                if extra_context:
+                    date_line = extra_context.strip() + "\n\n" + date_line
+                parts.append(date_line)
 
             parts.append(default_objective)
 

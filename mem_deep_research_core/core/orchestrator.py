@@ -9,8 +9,10 @@ Orchestrator 模块
 """
 
 import asyncio
+import logging
 import os
 import re
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -26,6 +28,7 @@ from mem_deep_research_core.core.llm_call_handler import (
     SummaryHandler,
 )
 from mem_deep_research_core.core.main_loop import MainLoopRunner
+from mem_deep_research_core.core.prompt_builder import PromptBuilder
 from mem_deep_research_core.core.message_interceptor import MessageInterceptorHandler
 from mem_deep_research_core.core.monitoring import (
     ExecutionMonitor,
@@ -38,22 +41,24 @@ from mem_deep_research_core.core.sub_agent_runner import SubAgentRunner
 from mem_deep_research_core.core.task_planner import TaskPlanner
 from mem_deep_research_core.core.tool_executor import ToolExecutor
 from mem_deep_research_core.core.tool_result_formatter import ToolResultFormatter
-from mem_deep_research_core.core.user_context import UserContextBuilder, detect_language_by_chars
 from mem_deep_research_core.llm.provider_client_base import LLMProviderClientBase
-from mem_deep_research_core.mem_deep_research_logging.logger import (
-    bootstrap_logger,
-)
 from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
-from mem_deep_research_core.prompts.template_loader import PromptTemplateLoader
 from mem_deep_research_core.tool.manager import ToolManager
 from mem_deep_research_core.utils.external_loader import external_loader
 from mem_deep_research_core.utils.io_utils import OutputFormatter, process_input
 from mem_deep_research_core.utils.stream_parsing_utils import TextInterceptor
-from mem_deep_research_core.utils.summary_utils import (
-    detect_response_language,
-    extract_hints,
+from mem_deep_research_core.utils.tool_utils import expose_sub_agents_as_tools
+
+from mem_deep_research_core.core.constants import (
+    DEFAULT_SCRAPE_MAX_LENGTH,
+    FALLBACK_LOOP_TERMINATED,
+    RECENT_TOOL_LOOKBACK,
+    SYSTEM_MESSAGE_KEYWORDS,
+    ensure_dict,
+    generate_message_id,
+    parse_bool_config,
 )
-from mem_deep_research_core.utils.tool_utils import _load_agent_prompt, expose_sub_agents_as_tools
+
 
 # ========== 默认钩子实现 ==========
 
@@ -91,8 +96,7 @@ hooks.set_default("on_agent_end", _default_on_agent_end)
 hooks.set_default("on_turn_start", _default_on_turn_start)
 hooks.set_default("on_turn_end", _default_on_turn_end)
 
-LOGGER_LEVEL = os.getenv("LOGGER_LEVEL", "INFO")
-logger = bootstrap_logger(level=LOGGER_LEVEL)
+logger = logging.getLogger("mem_deep_research")
 
 
 def _list_tools(sub_agent_tool_managers: dict[str, ToolManager]):
@@ -113,11 +117,6 @@ def _list_tools(sub_agent_tool_managers: dict[str, ToolManager]):
         return cache
 
     return wrapped
-
-
-def _generate_message_id() -> str:
-    """生成随机消息 ID"""
-    return f"msg_{uuid.uuid4().hex[:8]}"
 
 
 class Orchestrator:
@@ -150,29 +149,20 @@ class Orchestrator:
         self.sub_agent_tool_definitions = sub_agent_tool_definitions
         self.context = context or {}
 
-        # 模板加载器
-        self._template_loader = PromptTemplateLoader()
-
         # 缓存函数
         self._list_sub_agent_tools = _list_tools(sub_agent_tool_managers)
 
-        # 配置解析
-        chinese_context_val = self.cfg.main_agent.get("chinese_context", False)
-        if isinstance(chinese_context_val, str):
-            self.chinese_context = chinese_context_val.lower().strip() == "true"
-        else:
-            self.chinese_context = bool(chinese_context_val)
+        # 语言配置：response_language 优先，chinese_context 向后兼容
+        self.response_language = self.cfg.main_agent.get("response_language", "auto")
+        chinese_context_val = parse_bool_config(self.cfg.main_agent.get("chinese_context", False))
+        if chinese_context_val and self.response_language == "auto":
+            # 旧配置 chinese_context=true → 等同 response_language="Chinese"
+            self.response_language = "Chinese"
+        # chinese_context 内部标志：当 response_language 明确为 Chinese 时为 True
+        self.chinese_context = self.response_language == "Chinese"
 
-        add_message_id_val = self.cfg.main_agent.get("add_message_id", False)
-        if isinstance(add_message_id_val, str):
-            self.add_message_id: bool = add_message_id_val.lower().strip() == "true"
-        else:
-            self.add_message_id: bool = bool(add_message_id_val)
+        self.add_message_id = parse_bool_config(self.cfg.main_agent.get("add_message_id", False))
         logger.info(f"add_message_id: {self.add_message_id}")
-
-        # 目标语言
-        self.target_language: str | None = None
-        self.target_language_task: asyncio.Task | None = None
 
         # 传递 task_log 给 LLM 客户端
         if self.llm_client and task_log:
@@ -191,14 +181,20 @@ class Orchestrator:
 
     def _init_modules(self):
         """初始化各个组合模块"""
+        self._init_stream_and_interceptor()
+        self._init_monitoring_and_tools()
+        self._init_llm_and_summary()
+        self._init_skills_and_prompt()
+        self._init_context_manager()
+        self.current_agent_id: str | None = None
+
+    def _init_stream_and_interceptor(self):
+        """初始化流式处理器和消息拦截器"""
         # 流式处理器
         self.stream_handler = StreamHandler(self.stream_queue)
 
         # 工具结果格式化器
         self.tool_formatter = ToolResultFormatter(self.context)
-
-        # 用户上下文构建器
-        self.context_builder = UserContextBuilder(self.context, self.chinese_context)
 
         # 消息拦截处理器
         interceptor_config = self._load_interceptor_config()
@@ -214,20 +210,23 @@ class Orchestrator:
             context=self.context,
         )
 
-        # 执行监控器（从配置读取）
-        monitoring_cfg_dict = self.cfg.main_agent.get("monitoring", {})
-        if monitoring_cfg_dict and not isinstance(monitoring_cfg_dict, dict):
-            monitoring_cfg_dict = (
-                dict(monitoring_cfg_dict) if hasattr(monitoring_cfg_dict, "__iter__") else {}
-            )
-        if monitoring_cfg_dict:
-            from mem_deep_research_core.config_schema import MonitoringConfigSchema
+        # 最终消息拦截器
+        self._final_message_interceptor = TextInterceptor(["<use_mcp_tool>"])
 
-            monitoring_schema = MonitoringConfigSchema(**monitoring_cfg_dict)
-            monitoring_config = MonitoringConfig.from_schema(monitoring_schema)
+    def _init_monitoring_and_tools(self):
+        """初始化执行监控器、工具执行器和子 Agent 运行器"""
+        # 执行监控器（从配置读取）
+        monitoring_cfg_dict = ensure_dict(self.cfg.main_agent.get("monitoring", {}))
+        if monitoring_cfg_dict:
+            try:
+                from mem_deep_research_core.config_schema import MonitoringConfigSchema
+                monitoring_schema = MonitoringConfigSchema(**monitoring_cfg_dict)
+                monitoring_config = MonitoringConfig.from_schema(monitoring_schema)
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Invalid monitoring config, using defaults: {e}")
+                monitoring_config = MonitoringConfig()
         else:
             monitoring_config = MonitoringConfig()
-        self._monitoring_schema_dict = monitoring_cfg_dict or {}
         self.monitor = ExecutionMonitor(
             config=monitoring_config,
             stream_reasoning_callback=self._stream_tool_reasoning,  # 保留：有自定义逻辑
@@ -244,12 +243,12 @@ class Orchestrator:
             stream_usage_info=self.stream_handler.stream_usage_info,
         )
         # scrape_max_length: 优先从配置读，fallback 环境变量，最后默认 20000
-        scrape_max_length = self._monitoring_schema_dict.get("scrape_max_length", None)
+        scrape_max_length = monitoring_cfg_dict.get("scrape_max_length", None)
         if scrape_max_length is None:
             try:
-                scrape_max_length = int(os.getenv("SCRAPE_MAX_LENGTH", "20000"))
+                scrape_max_length = int(os.getenv("SCRAPE_MAX_LENGTH", str(DEFAULT_SCRAPE_MAX_LENGTH)))
             except (ValueError, TypeError):
-                scrape_max_length = 20000
+                scrape_max_length = DEFAULT_SCRAPE_MAX_LENGTH
         self.tool_executor.set_scrape_max_length(scrape_max_length)
 
         # 子 Agent 运行器
@@ -261,20 +260,19 @@ class Orchestrator:
             task_log=self.task_log,
             context=self.context,
             chinese_context=self.chinese_context,
-            stream_start_agent=self.stream_handler.stream_start_agent,
-            stream_end_agent=self.stream_handler.stream_end_agent,
-            stream_start_llm=self.stream_handler.stream_start_llm,
-            stream_end_llm=self.stream_handler.stream_end_llm,
-            stream_tool_call=self.stream_handler.stream_tool_call,
-            stream_tool_reasoning=self._stream_tool_reasoning,  # 保留：有自定义逻辑
-            stream_usage_info=self.stream_handler.stream_usage_info,
+            response_language=self.response_language,
+            stream_handler=self.stream_handler,
+            stream_tool_reasoning=self._stream_tool_reasoning,
             handle_llm_call=self._handle_llm_call_with_logging,
             handle_summary=self._handle_summary_with_context_limit_retry,
             intercept_key_message=self._intercept_key_message,
+            streaming_final_message=self._streaming_final_message,
         )
         if self.sub_agent_tool_definitions:
             self.sub_agent_runner.set_cached_tool_definitions(self.sub_agent_tool_definitions)
 
+    def _init_llm_and_summary(self):
+        """初始化 LLM 调用处理器和摘要处理器"""
         # LLM 调用处理器
         self.llm_handler = LLMCallHandler(
             main_llm_client=self.llm_client,
@@ -289,8 +287,12 @@ class Orchestrator:
         self.summary_handler = SummaryHandler(
             llm_call_handler=self.llm_handler,
             chinese_context=self.chinese_context,
+            response_language=self.response_language,
         )
+        self.summary_handler.context = self.context
 
+    def _init_skills_and_prompt(self):
+        """初始化 Task Planner、Inline Skill Selector 和 Prompt Builder"""
         # Task Planner — 仅在 deep_research.enabled AND auto_planning 时启用
         dr_cfg = self.cfg.main_agent.get("deep_research", {})
         planning_enabled = (
@@ -311,21 +313,25 @@ class Orchestrator:
                 current_tags.append(InlineSkillSelector.TAG_NAME)
                 self.key_message_interceptor.set_reasoning_tags(current_tags)
 
-        # Context Manager (三级 context 管理 + dedup + source registry)
-        cm_cfg_dict = self.cfg.main_agent.get("context_manager", {})
-        if cm_cfg_dict and not isinstance(cm_cfg_dict, dict):
-            cm_cfg_dict = dict(cm_cfg_dict) if hasattr(cm_cfg_dict, "__iter__") else {}
+        # Prompt Builder
+        self.prompt_builder = PromptBuilder(
+            cfg=self.cfg,
+            context=self.context,
+            chinese_context=self.chinese_context,
+            inline_skill_selector=self.inline_skill_selector,
+        )
+
+    def _init_context_manager(self):
+        """初始化 Context Manager（三级 context 管理 + dedup + source registry）"""
+        cm_cfg_dict = ensure_dict(self.cfg.main_agent.get("context_manager", {}))
         cm_config = ContextManagerConfig(**cm_cfg_dict) if cm_cfg_dict else ContextManagerConfig()
         self.context_manager = ContextManager(config=cm_config)
         # 注入 token 估算函数
         if hasattr(self.llm_client, "_estimate_tokens"):
             self.context_manager.set_token_estimator(self.llm_client._estimate_tokens)
 
-        # 当前 Agent ID（用于流式输出）
-        self.current_agent_id: str | None = None
-
     @staticmethod
-    def _extract_recent_tool_names(message_history: list, lookback: int = 6) -> list:
+    def _extract_recent_tool_names(message_history: list, lookback: int = RECENT_TOOL_LOOKBACK) -> list:
         """从最近消息中提取 tool_use 的 name 列表"""
         names = []
         for msg in message_history[-lookback:]:
@@ -377,7 +383,7 @@ class Orchestrator:
             # 跳过中间的 user 消息（如 INJECT_HINT）
             if i >= 0 and message_history[i].get("role") == "user":
                 content_str = str(message_history[i].get("content", ""))
-                if "MANDATORY DIRECTIVE" in content_str or "SYSTEM WARNING" in content_str:
+                if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
                     i -= 1
 
         if len(tail_hashes) < 2:
@@ -404,7 +410,7 @@ class Orchestrator:
                     msg = message_history[neighbor]
                     if msg.get("role") == "user":
                         content_str = str(msg.get("content", ""))
-                        if "MANDATORY DIRECTIVE" in content_str or "SYSTEM WARNING" in content_str:
+                        if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
                             all_remove.add(neighbor)
 
         # 按索引从大到小移除
@@ -421,12 +427,7 @@ class Orchestrator:
                     "content": [
                         {
                             "type": "text",
-                            "text": (
-                                "[SYSTEM] The research process was terminated due to a repeated response loop. "
-                                "Please synthesize a final answer based on all the information gathered so far. "
-                                "If insufficient information was collected, acknowledge the limitation and provide "
-                                "the best possible answer with what is available."
-                            ),
+                            "text": FALLBACK_LOOP_TERMINATED,
                         }
                     ],
                 }
@@ -497,11 +498,6 @@ class Orchestrator:
             status="SUCCESS",
         )
 
-    # ========== 用户上下文方法 ==========
-
-    def _build_user_identity_context(self) -> str:
-        return self.context_builder.build_user_identity_context()
-
     # ========== 消息拦截方法 ==========
 
     async def _intercept_key_message(self, message_id: str, message: str, is_last: bool):
@@ -549,9 +545,6 @@ class Orchestrator:
     async def _streaming_final_message(self, message_id: str, message: str, is_last: bool):
         """最终消息的流式输出"""
         try:
-            if not hasattr(self, "_final_message_interceptor"):
-                self._final_message_interceptor = TextInterceptor(["<use_mcp_tool>"])
-
             result, reasoning_blocks = self._final_message_interceptor.process(message, is_last)
 
             for block in reasoning_blocks:
@@ -588,44 +581,6 @@ class Orchestrator:
                 pass
             return True
 
-    # ========== 语言检测 ==========
-
-    async def _detect_language(self, text: str) -> str:
-        """检测响应语言"""
-        try:
-            api_key = self.cfg.main_agent.get("openai_api_key")
-            base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-            if not api_key:
-                return detect_language_by_chars(text)
-
-            return await detect_response_language(
-                query=text,
-                api_key=api_key,
-                base_url=base_url,
-            )
-        except Exception as e:
-            logger.warning(f"Language detection failed: {e}")
-            return detect_language_by_chars(text)
-
-    # ========== Context 压缩 LLM 调用 ==========
-
-    async def _context_summarize_call(
-        self,
-        summarize_system_prompt: str,
-        summarize_messages: list,
-        purpose: str,
-    ) -> str:
-        """Level 2 context 压缩的 LLM 调用"""
-        response_text, _, _ = await self.llm_call_handler.handle_llm_call(
-            summarize_system_prompt,
-            summarize_messages,
-            [],  # 不需要工具
-            999,
-            purpose,
-            agent_type="main",
-        )
-        return response_text or ""
-
     # ========== LLM 调用处理 ==========
 
     async def _handle_llm_call_with_logging(
@@ -660,14 +615,11 @@ class Orchestrator:
         task_description,
         task_failed,
         agent_type="main",
-        task_guidence="",
+        task_guidance="",
         stream_message_callback: Callable = None,
-        deep_research_cfg: dict = None,
+        **kwargs,
     ):
         """处理摘要生成，委托给 SummaryHandler"""
-        self.summary_handler.target_language = self.target_language
-        self.summary_handler.target_language_task = self.target_language_task
-
         return await self.summary_handler.handle_summary_with_retry(
             system_prompt=system_prompt,
             agent_prompt_instance=agent_prompt_instance,
@@ -677,9 +629,8 @@ class Orchestrator:
             task_description=task_description,
             task_failed=task_failed,
             agent_type=agent_type,
-            task_guidance=task_guidence,
+            task_guidance=task_guidance,
             stream_message_callback=stream_message_callback,
-            detect_language_func=self._detect_language,
         )
 
     # ========== 子 Agent 运行 ==========
@@ -706,11 +657,11 @@ class Orchestrator:
 
         # 1. 处理输入
         initial_user_content, task_description = process_input(task_description, task_file_name)
-        task_guidence = self._build_task_guidance()
-        initial_user_content[0]["text"] = initial_user_content[0]["text"] + task_guidence
+        task_guidance = self.prompt_builder.build_task_guidance()
+        initial_user_content[0]["text"] = initial_user_content[0]["text"] + task_guidance
 
         # 2. 生成提示词（如果启用）
-        hint_notes = await self._generate_hints(task_description)
+        hint_notes = await self.prompt_builder.generate_hints(task_description)
         if hint_notes:
             initial_user_content[0]["text"] = initial_user_content[0]["text"] + hint_notes
 
@@ -721,30 +672,37 @@ class Orchestrator:
         message_history.append({"role": "user", "content": initial_user_content})
 
         # 4. 获取工具定义
+        _perf_t0 = time.perf_counter()
         tool_definitions = await self._get_tool_definitions()
+        self.task_log.record_perf("tool_definitions_fetch", time.perf_counter() - _perf_t0)
         self.task_log.log_step("get_main_tool_definitions", f"{tool_definitions}")
 
         # 4.5. LLM Skill 选择
-        selected_skill_names = await self._select_skills(initial_user_content, tool_definitions)
+        _perf_t0 = time.perf_counter()
+        selected_skill_names = await self.prompt_builder.select_skills(initial_user_content, tool_definitions)
+        self.task_log.record_perf("skill_selection", time.perf_counter() - _perf_t0)
 
         # 5. 生成系统提示词
-        system_prompt, main_agent_prompt_instance, deep_research_cfg = self._build_system_prompt(
+        _perf_t0 = time.perf_counter()
+        system_prompt, main_agent_prompt_instance, deep_research_cfg = self.prompt_builder.build_system_prompt(
             tool_definitions, initial_user_content, selected_skill_names
         )
+        self.task_log.record_perf("system_prompt_build", time.perf_counter() - _perf_t0)
 
         # 6. 主循环
-        final_answer_text = await self._run_main_loop(
+        final_answer_text, is_simple_response = await self._run_main_loop(
             system_prompt=system_prompt,
             message_history=message_history,
             tool_definitions=tool_definitions,
             main_agent_prompt_instance=main_agent_prompt_instance,
             deep_research_cfg=deep_research_cfg,
             task_description=task_description,
-            task_guidence=task_guidence,
+            task_guidance=task_guidance,
             keep_tool_result=keep_tool_result,
         )
 
         # 7. 后处理
+        _perf_t0 = time.perf_counter()
         final_summary, final_boxed_answer = await post_process_final_answer(
             cfg=self.cfg,
             final_answer_text=final_answer_text,
@@ -755,7 +713,9 @@ class Orchestrator:
             task_log=self.task_log,
             output_formatter=self.output_formatter,
             llm_client=self.llm_client,
+            is_simple_response=is_simple_response,
         )
+        self.task_log.record_perf("post_process_duration", time.perf_counter() - _perf_t0)
 
         # 结束流式输出
         await self.stream_handler.stream_end_llm("reporter")
@@ -775,42 +735,7 @@ class Orchestrator:
         logger.debug(f"\n{'=' * 20} Task {task_id} Finished {'=' * 20}")
         self.task_log.log_step("task_completed", f"Task {task_id} completed successfully")
 
-        if "browsecomp-zh" in self.cfg.benchmark.name:
-            return final_summary, final_summary
-        else:
-            return final_summary, final_boxed_answer
-
-    def _build_task_guidance(self) -> str:
-        """构建任务指导"""
-        if self.chinese_context:
-            return self._template_loader.load_template("guidance/task_guidance_chinese")
-        return ""
-
-    async def _generate_hints(self, task_description: str) -> str:
-        """生成任务提示"""
-        if not self.cfg.main_agent.input_process.hint_generation:
-            return ""
-
-        try:
-            hint_content = await extract_hints(
-                task_description,
-                self.cfg.main_agent.openai_api_key,
-                self.chinese_context,
-                self.add_message_id,
-                self.cfg.main_agent.input_process.get(
-                    "hint_llm_base_url", "https://api.openai.com/v1"
-                ),
-            )
-            return self._template_loader.load_and_render(
-                "hints/hint_prefix",
-                hint_content=hint_content,
-            )
-        except Exception as e:
-            logger.error(f"Hint generation failed: {str(e)}")
-            self.task_log.log_step(
-                "hint_generation", f"[ERROR] Hint generation failed: {str(e)}", "failed"
-            )
-            return ""
+        return final_summary, final_boxed_answer
 
     def _build_initial_history(self, history) -> list:
         """构建初始消息历史"""
@@ -839,103 +764,11 @@ class Orchestrator:
             logger.debug("Warning: No tool definitions found.")
         return tool_definitions
 
-    async def _select_skills(
-        self,
-        query,
-        tool_definitions: list,
-    ) -> list[str] | None:
-        """使用 LLM 选择相关 Skills
-
-        inline 模式下跳过此步骤（第一轮用规则匹配，后续轮次从回复中解析）。
-
-        Args:
-            query: 用户查询（str 或 list）
-            tool_definitions: 工具定义列表
-
-        Returns:
-            选中的 skill 名称列表，如果 LLM selector 不可用则返回 None
-        """
-        # inline 模式：不做额外 LLM 调用，第一轮用规则匹配 fallback
-        if self.inline_skill_selector:
-            return None
-
-        try:
-            selector = external_loader.get_llm_skill_selector(self.cfg)
-            if not selector:
-                return None
-
-            tool_names = [t.get("name", "") for t in tool_definitions if isinstance(t, dict)]
-            selected = await selector.select(
-                query=query,
-                tool_names=tool_names,
-                context=self.context,
-            )
-            logger.info(f"LLM selected skills: {selected}")
-            return selected
-        except Exception as e:
-            logger.warning(f"Skill selection failed: {e}")
-            return None
-
-    def _build_system_prompt(
-        self, tool_definitions, initial_user_content, selected_skill_names=None
-    ):
-        """构建系统提示词"""
-        # 获取 prompt 配置
-        prompt_cfg = {}
-        if hasattr(self.cfg.main_agent, "prompt") and self.cfg.main_agent.prompt:
-            prompt_cfg = dict(self.cfg.main_agent.prompt)
-
-        # deep_research 配置转换为 presets
-        deep_research_cfg = getattr(self.cfg.main_agent, "deep_research", None)
-        if deep_research_cfg is not None:
-            deep_research_cfg = dict(deep_research_cfg)
-
-        main_agent_prompt_instance = _load_agent_prompt(prompt_cfg)
-
-        extra_context = self._build_user_identity_context()
-
-        system_prompt = main_agent_prompt_instance.generate_system_prompt_with_mcp_tools(
-            mcp_servers=tool_definitions,
-            chinese_context=self.chinese_context,
-            extra_context=extra_context,
-            deep_research_cfg=deep_research_cfg,
-        )
-
-        # 注入 Skills
-        if self.inline_skill_selector:
-            # Inline 模式：追加 skill catalog 到 system prompt（告诉 LLM 可用 skill 列表）
-            catalog_prompt = self.inline_skill_selector.build_skill_catalog_prompt()
-            if catalog_prompt:
-                system_prompt += catalog_prompt
-                logger.debug("Inline skill catalog appended to system prompt")
-        else:
-            skill_injector = external_loader.get_skill_injector()
-            if skill_injector and initial_user_content:
-                if selected_skill_names is not None:
-                    # LLM 选择路径：按名称直接注入
-                    system_prompt = skill_injector.inject_selected_skills(
-                        base_prompt=system_prompt,
-                        skill_names=selected_skill_names,
-                    )
-                    logger.debug(f"LLM-selected skills injected: {selected_skill_names}")
-                else:
-                    # Fallback 路径：规则匹配注入
-                    tools_to_use = [
-                        t.get("name", "") for t in tool_definitions if isinstance(t, dict)
-                    ]
-                    system_prompt = skill_injector.inject_skills(
-                        base_prompt=system_prompt,
-                        query=initial_user_content,
-                        context=self.context,
-                        tools_to_use=tools_to_use,
-                    )
-                    logger.debug("Rule-matched skills injected into system prompt")
-
-        return system_prompt, main_agent_prompt_instance, deep_research_cfg
-
     def _create_main_loop_runner(self) -> MainLoopRunner:
         """创建主循环运行器"""
-        return MainLoopRunner(
+        from mem_deep_research_core.core.main_loop import MainLoopContext
+
+        ctx = MainLoopContext(
             cfg=self.cfg,
             monitor=self.monitor,
             context_manager=self.context_manager,
@@ -951,7 +784,7 @@ class Orchestrator:
             task_log=self.task_log,
             context=self.context,
             chinese_context=self.chinese_context,
-            monitoring_schema_dict=self._monitoring_schema_dict,
+            response_language=self.response_language,
             handle_llm_call=self._handle_llm_call_with_logging,
             handle_summary=self._handle_summary_with_context_limit_retry,
             intercept_key_message=self._intercept_key_message,
@@ -959,9 +792,8 @@ class Orchestrator:
             stream_tool_reasoning=self._stream_tool_reasoning,
             extract_recent_tool_names=self._extract_recent_tool_names,
             deduplicate_trailing_messages=self._deduplicate_trailing_messages,
-            build_user_identity_context=self._build_user_identity_context,
-            detect_language=self._detect_language,
         )
+        return MainLoopRunner(ctx)
 
     async def _run_main_loop(
         self,
@@ -971,21 +803,21 @@ class Orchestrator:
         main_agent_prompt_instance,
         deep_research_cfg,
         task_description,
-        task_guidence,
+        task_guidance,
         keep_tool_result,
     ):
         """运行主执行循环（委托给 MainLoopRunner）"""
         runner = self._create_main_loop_runner()
-        result = await runner.run(
+        final_answer_text, is_simple_response = await runner.run(
             system_prompt=system_prompt,
             message_history=message_history,
             tool_definitions=tool_definitions,
             main_agent_prompt_instance=main_agent_prompt_instance,
             deep_research_cfg=deep_research_cfg,
             task_description=task_description,
-            task_guidence=task_guidence,
+            task_guidance=task_guidance,
             keep_tool_result=keep_tool_result,
         )
         # 同步 current_agent_id（runner 内部会更新）
         self.current_agent_id = runner.current_agent_id
-        return result
+        return final_answer_text, is_simple_response

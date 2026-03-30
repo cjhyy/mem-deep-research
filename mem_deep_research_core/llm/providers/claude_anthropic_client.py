@@ -10,7 +10,7 @@ from anthropic import (
 )
 from omegaconf import DictConfig
 
-# tenacity imports removed - using configurable retry from base class
+from mem_deep_research_core.exceptions import ContextLimitError
 from mem_deep_research_core.llm.provider_client_base import LLMProviderClientBase
 from mem_deep_research_core.llm.util import collect_anthropic_stream
 from mem_deep_research_core.mem_deep_research_logging.logger import (
@@ -66,7 +66,7 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
 
         try:
             # Apply configurable retry decorator to the API call
-            retry_decorator = self.get_retry_decorator()
+            retry_decorator = self.get_retry_decorator(exception_to_skip=ContextLimitError)
             create_completion_with_retry = retry_decorator(self._create_completion)
             response = await create_completion_with_retry(system_prompt, processed_messages)
 
@@ -78,10 +78,26 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
             return response
         except asyncio.CancelledError:
             logger.exception("[WARNING] LLM API call was cancelled during execution")
-            raise  # Re-raise to allow decorator to log it
+            raise
+        except ContextLimitError:
+            raise
         except Exception as e:
+            error_str = str(e)
+            # Anthropic raises BadRequestError with specific messages for context limit
+            if any(
+                pattern in error_str
+                for pattern in [
+                    "prompt is too long",
+                    "maximum context length",
+                    "exceeds the maximum",
+                    "context_length_exceeded",
+                    "Input is too long",
+                ]
+            ):
+                logger.debug(f"Anthropic context limit exceeded: {error_str}")
+                raise ContextLimitError(f"Context limit exceeded: {error_str}") from e
             logger.exception("Anthropic LLM endpoint failed")
-            raise e
+            raise
 
     async def _create_completion(self, system_prompt, processed_messages):
         """Helper to create a completion, handling async and sync calls."""

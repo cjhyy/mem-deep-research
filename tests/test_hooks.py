@@ -166,3 +166,83 @@ class TestHookContext:
         assert ctx.tool_name is None
         assert ctx.turn_number is None
         assert ctx.extra == {}
+
+    def test_new_context_fields(self):
+        """验证新增 HookContext 字段"""
+        ctx = HookContext(
+            hook_name="on_tool_filter",
+            tool_calls_batch=[{"tool_name": "search"}],
+            compact_action="masking",
+        )
+        assert ctx.tool_calls_batch == [{"tool_name": "search"}]
+        assert ctx.compact_action == "masking"
+
+    def test_new_context_fields_default_none(self):
+        """新增字段默认为 None"""
+        ctx = HookContext(hook_name="test")
+        assert ctx.tool_calls_batch is None
+        assert ctx.compact_action is None
+
+
+class TestNewHooks:
+    """新增 hook 测试"""
+
+    def test_on_tool_filter(self, registry):
+        """on_tool_filter 可修改工具调用列表"""
+        def filter_hook(ctx, original_fn):
+            # 过滤掉 tool_name == "blocked"
+            return [c for c in ctx.tool_calls_batch if c.get("tool_name") != "blocked"]
+
+        registry.register_fn("on_tool_filter", filter_hook)
+
+        batch = [
+            {"tool_name": "search", "arguments": {}},
+            {"tool_name": "blocked", "arguments": {}},
+            {"tool_name": "read", "arguments": {}},
+        ]
+        result = registry.call(
+            "on_tool_filter",
+            HookContext(hook_name="on_tool_filter", tool_calls_batch=batch),
+        )
+        assert len(result) == 2
+        assert result[0]["tool_name"] == "search"
+        assert result[1]["tool_name"] == "read"
+
+    def test_on_context_compact(self, registry):
+        """on_context_compact 通知压缩行为"""
+        events = []
+
+        def compact_hook(ctx, original_fn):
+            events.append(ctx.compact_action)
+            return original_fn(ctx)
+
+        registry.register_fn("on_context_compact", compact_hook)
+        registry.call(
+            "on_context_compact",
+            HookContext(hook_name="on_context_compact", compact_action="masking"),
+        )
+        registry.call(
+            "on_context_compact",
+            HookContext(hook_name="on_context_compact", compact_action="emergency"),
+        )
+        assert events == ["masking", "emergency"]
+
+    def test_on_reflection_build(self, registry):
+        """on_reflection_build 可修改反思 prompt"""
+        def reflection_hook(ctx, original_fn):
+            return ctx.result + "\n\nFocus on data quality."
+
+        registry.register_fn("on_reflection_build", reflection_hook)
+        result = registry.call(
+            "on_reflection_build",
+            HookContext(hook_name="on_reflection_build", result="Original reflection"),
+        )
+        assert result == "Original reflection\n\nFocus on data quality."
+
+    def test_on_tool_filter_not_registered_returns_default(self, registry):
+        """on_tool_filter 未注册时返回 None (默认行为)"""
+        result = registry.call(
+            "on_tool_filter",
+            HookContext(hook_name="on_tool_filter", tool_calls_batch=[{"tool_name": "a"}]),
+        )
+        assert result is None

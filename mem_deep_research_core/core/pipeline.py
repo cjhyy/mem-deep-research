@@ -1,5 +1,6 @@
 import os
 import pathlib
+import time
 import traceback
 from datetime import datetime
 from typing import Any
@@ -35,6 +36,8 @@ async def execute_task_pipeline(
     sub_agent_tool_definitions: dict[str, list[dict[str, Any]]] | None = None,
     history: list[dict[str, Any]] | None = None,
     context: dict[str, Any] | None = None,
+    main_agent_llm_client: Any | None = None,
+    sub_agent_llm_client: Any | None = None,
 ) -> tuple[str, str, pathlib.Path]:
     """
     Executes the full pipeline for a single task.
@@ -48,9 +51,14 @@ async def execute_task_pipeline(
         sub_agent_tool_managers: A dictionary of initialized sub-agent ToolManager instances.
         output_formatter: An initialized OutputFormatter instance.
         ground_truth: The ground truth for the task (optional).
-        log_dir: The directory to save the task log (default: "logs").
+        log_path: The path to save the task log.
         context: Optional user context dict with user_id, org_id, room_id, timezone, trace_id
             for passing to MCP tools.
+        main_agent_llm_client: Optional pre-created LLM client. If None, a new client
+            is created internally and closed after the task. If provided, the caller
+            is responsible for its lifecycle (pipeline will NOT close it).
+        sub_agent_llm_client: Optional pre-created sub-agent LLM client. Same
+            lifecycle semantics as main_agent_llm_client.
 
     Returns:
         A tuple containing:
@@ -59,6 +67,7 @@ async def execute_task_pipeline(
         - The path to the log file.
     """
     logger.debug(f"Starting Task Execution: {task_id}")
+    _perf_pipeline_start = time.perf_counter()
 
     # Create task log
     task_log = TaskTracer(
@@ -74,34 +83,35 @@ async def execute_task_pipeline(
         },
     )
 
-    main_agent_llm_client = None
-    sub_agent_llm_client = None
+    # Track whether we created the LLM clients (and must close them)
+    _owns_main_client = main_agent_llm_client is None
+    _owns_sub_client = sub_agent_llm_client is None
     final_answer, final_boxed_answer = "", ""
     try:
         # Initialize main agent LLM client
-        # Require agent-specific LLM configuration
-        if hasattr(cfg.main_agent, "llm") and cfg.main_agent.llm is not None:
-            main_agent_llm_client = LLMClient(task_id=task_id, llm_config=cfg.main_agent.llm)
-        else:
-            raise ValueError(
-                "No LLM configuration found in main_agent. Please ensure the agent configuration includes an LLM section."
-            )
-
-        # Initialize sub agent LLM client
-        # Require agent-specific LLM configuration for sub-agents
-        if cfg.sub_agents is not None and cfg.sub_agents:
-            first_sub_agent = next(iter(cfg.sub_agents.values()))
-            if hasattr(first_sub_agent, "llm") and first_sub_agent.llm is not None:
-                sub_agent_llm_client = LLMClient(
-                    task_id=f"{task_id}_sub", llm_config=first_sub_agent.llm
-                )
+        if main_agent_llm_client is None:
+            if hasattr(cfg.main_agent, "llm") and cfg.main_agent.llm is not None:
+                main_agent_llm_client = LLMClient(task_id=task_id, llm_config=cfg.main_agent.llm)
             else:
                 raise ValueError(
-                    "No LLM configuration found in sub-agent. Please ensure the agent configuration includes an LLM section."
+                    "No LLM configuration found in main_agent. Please ensure the agent configuration includes an LLM section."
                 )
-        else:
-            sub_agent_llm_client = None
-            logger.info("No sub agents defined, using main agent only for the task")
+
+        # Initialize sub agent LLM client
+        if sub_agent_llm_client is None:
+            if cfg.sub_agents is not None and cfg.sub_agents:
+                first_sub_agent = next(iter(cfg.sub_agents.values()))
+                if hasattr(first_sub_agent, "llm") and first_sub_agent.llm is not None:
+                    sub_agent_llm_client = LLMClient(
+                        task_id=f"{task_id}_sub", llm_config=first_sub_agent.llm
+                    )
+                else:
+                    raise ValueError(
+                        "No LLM configuration found in sub-agent. Please ensure the agent configuration includes an LLM section."
+                    )
+            else:
+                sub_agent_llm_client = None
+                logger.info("No sub agents defined, using main agent only for the task")
 
         # Initialize orchestrator
         orchestrator = Orchestrator(
@@ -145,33 +155,33 @@ async def execute_task_pipeline(
         task_log.error = error_details
 
     finally:
-        # Close LLM clients to release HTTP connection pools
-        if main_agent_llm_client is not None:
-            try:
-                if hasattr(main_agent_llm_client, "close_async"):
-                    await main_agent_llm_client.close_async()
-                else:
-                    main_agent_llm_client.close()
-            except Exception as e:
-                logger.warning(f"Error closing main_agent LLM client: {e}")
-
-        if sub_agent_llm_client != main_agent_llm_client and sub_agent_llm_client is not None:
-            try:
-                if hasattr(sub_agent_llm_client, "close_async"):
-                    await sub_agent_llm_client.close_async()
-                else:
-                    sub_agent_llm_client.close()
-            except Exception as e:
-                logger.warning(f"Error closing sub_agent LLM client: {e}")
+        # Close LLM clients only if we created them (caller manages externally provided ones)
+        for _owns, _client, _label in [
+            (_owns_main_client, main_agent_llm_client, "main_agent"),
+            (_owns_sub_client, sub_agent_llm_client, "sub_agent"),
+        ]:
+            if _owns and _client is not None:
+                try:
+                    if hasattr(_client, "close_async"):
+                        await _client.close_async()
+                    else:
+                        _client.close()
+                except Exception as e:
+                    logger.warning(f"Error closing {_label} LLM client: {e}")
 
         task_log.end_time = datetime.now()
+        task_log.record_perf("total_pipeline_duration", time.perf_counter() - _perf_pipeline_start)
+
+        # Log performance summary
+        perf_summary = task_log.get_perf_summary()
+        logger.info(f"[Task {task_id}] {perf_summary}")
 
         # Record task summary to structured log
         task_log.log_step(
             "task_execution_finished",
             f"Task {task_id} execution completed with status: {task_log.status}",
         )
-        task_log.log_step("console_summary_display", "Displaying task summary to console")
+        task_log.log_step("perf_metrics", perf_summary)
         task_log.save()
 
         # Cleanup TaskTracer to release memory

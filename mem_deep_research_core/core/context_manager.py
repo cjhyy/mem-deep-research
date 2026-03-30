@@ -25,6 +25,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from mem_deep_research_core.core.constants import RESULT_BRIEF_LENGTH
 from mem_deep_research_core.core.window_strategy import (
     BinaryReductionStrategy,
     LLMSummarizeStrategy,
@@ -34,9 +35,6 @@ from mem_deep_research_core.core.window_strategy import (
 )
 
 logger = logging.getLogger("mem_deep_research")
-
-# 结果摘要截断长度（日志/brief 用）
-RESULT_BRIEF_LENGTH = 200
 
 
 @dataclass
@@ -179,12 +177,11 @@ class ContextManagerConfig:
     # Level 2: LLM 压缩
     summarize_at_ratio: float = 0.8  # token 占比超过此值时触发 LLM 压缩
 
+    # Dedup cache
+    max_dedup_cache_size: int = 200  # Maximum entries in dedup cache
+
     # Token 估算
     chars_per_token: float = 3.5  # 无 tiktoken 时的 fallback 估算
-
-    # 兼容旧配置
-    mask_after_n_turns: int = 5  # 旧配置，被 compact_keep_recent 取代
-    enable_masking: bool = True  # 旧配置，被 enable_compact 取代
 
 
 # ============================================================
@@ -207,6 +204,7 @@ class ContextManager:
         pipeline: WindowStrategyPipeline | None = None,
     ):
         self.config = config or ContextManagerConfig()
+        self._max_dedup_cache_size = self.config.max_dedup_cache_size
         self._current_turn: int = 0
 
         # Dedup cache: arguments_hash -> ToolCallRecord
@@ -363,6 +361,12 @@ class ContextManager:
             else:
                 to_execute.append(call)
 
+        # Evict oldest entries if cache exceeds limit
+        if len(self._dedup_cache) > self._max_dedup_cache_size:
+            excess = len(self._dedup_cache) - self._max_dedup_cache_size
+            for k in list(self._dedup_cache.keys())[:excess]:
+                del self._dedup_cache[k]
+
         return to_execute, cached_results
 
     # ============================================================
@@ -445,7 +449,7 @@ class ContextManager:
         )
 
         for strategy in self._pipeline.strategies:
-            if isinstance(strategy, ObservationMaskingStrategy):
+            if strategy.strategy_type == "observation_masking":
                 if strategy.should_trigger(ctx):
                     result = strategy.apply(message_history, ctx)
                     return result.messages_affected
@@ -562,25 +566,6 @@ class ContextManager:
         return self._pipeline.manage(message_history, ctx)
 
     # ============================================================
-    # 兼容旧接口
-    # ============================================================
-
-    def apply_observation_masking(
-        self,
-        message_history: list,
-        current_turn: int,
-        override_keep_turns: int | None = None,
-    ) -> int:
-        """兼容旧接口，内部转发到 apply_compact"""
-        if override_keep_turns is not None:
-            original = self.config.compact_keep_recent
-            self.config.compact_keep_recent = override_keep_turns
-            result = self.apply_compact(message_history, current_turn)
-            self.config.compact_keep_recent = original
-            return result
-        return self.apply_compact(message_history, current_turn)
-
-    # ============================================================
     # 工具方法
     # ============================================================
 
@@ -592,10 +577,6 @@ class ContextManager:
         self.source_registry.reset()
         self._compacted_turns.clear()
         self._pipeline.reset()
-
-    def cancel(self) -> None:
-        """兼容旧接口"""
-        pass
 
     @property
     def dedup_cache_size(self) -> int:

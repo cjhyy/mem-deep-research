@@ -31,6 +31,7 @@
         return original_fn(ctx)  # 其他工具用原逻辑
 """
 
+import bisect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -70,7 +71,13 @@ class HookContext:
     # 格式化相关
     formatted_result: str | None = None
 
-    # 额外数据
+    # 工具批次 (on_tool_filter: 去重后待执行的工具调用列表)
+    tool_calls_batch: list | None = None
+
+    # Context 压缩 (on_context_compact: "masking" | "summarize" | "emergency")
+    compact_action: str | None = None
+
+    # 额外数据 (观测性数据如 assistant_text, message_count, total_tool_calls 等通过此字段传递)
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -96,6 +103,10 @@ class HookRegistry:
         # 工具生命周期
         "on_tool_start",  # 工具调用开始 (可修改参数)
         "on_tool_end",  # 工具调用完成 (可修改结果)
+        "on_tool_filter",  # 工具去重后、执行前 (可修改/重排/拦截工具调用列表)
+        # Prompt 钩子
+        "on_system_prompt_build",  # system prompt 生成后 (可修改 prompt)
+        "on_summarize_prompt_build",  # summarize prompt 生成后 (可修改 prompt)
         # 格式化钩子
         "on_tool_result_format",  # 工具结果格式化
         "on_thinking_generate",  # thinking 描述生成
@@ -103,6 +114,13 @@ class HookRegistry:
         "on_env_inject",  # MCP 子进程环境变量注入
         # 消息处理钩子
         "on_message_intercept",  # 消息拦截处理
+        # Guardrails (fail-fast validation)
+        "on_before_llm_call",  # 验证 LLM 输入，可 raise GuardrailError 阻止调用
+        "on_after_llm_call",  # 验证 LLM 输出，可 raise GuardrailError 拒绝结果
+        # Context 管理
+        "on_context_compact",  # context 压缩时 (可标记保护消息、观察压缩行为)
+        # 反思
+        "on_reflection_build",  # 反思 prompt 生成 (可修改反思内容)
     ]
 
     def __init__(self):
@@ -127,9 +145,7 @@ class HookRegistry:
             raise ValueError(f"Unknown hook: {hook_name}. Supported: {self.SUPPORTED_HOOKS}")
 
         def decorator(fn: HookFn) -> HookFn:
-            self._hooks[hook_name].append((priority, fn))
-            # 按优先级排序 (高优先级在前)
-            self._hooks[hook_name].sort(key=lambda x: -x[0])
+            bisect.insort(self._hooks[hook_name], (priority, fn), key=lambda x: -x[0])
             logger.debug(f"[Hooks] Registered hook '{hook_name}' with priority {priority}")
             return fn
 
@@ -147,8 +163,7 @@ class HookRegistry:
         if hook_name not in self.SUPPORTED_HOOKS:
             raise ValueError(f"Unknown hook: {hook_name}. Supported: {self.SUPPORTED_HOOKS}")
 
-        self._hooks[hook_name].append((priority, fn))
-        self._hooks[hook_name].sort(key=lambda x: -x[0])
+        bisect.insort(self._hooks[hook_name], (priority, fn), key=lambda x: -x[0])
         logger.debug(f"[Hooks] Registered hook '{hook_name}' with priority {priority}")
 
     def set_default(self, hook_name: str, default_fn: Callable[[HookContext], Any]) -> None:
@@ -221,9 +236,14 @@ class HookRegistry:
             for name in self._hooks:
                 self._hooks[name] = []
 
+    def clear_all(self) -> None:
+        """Clear all hooks AND defaults — full reset for new project/task."""
+        self.clear()
+        self._default_fns.clear()
+
     def list_hooks(self) -> dict[str, int]:
         """列出所有钩子及其注册数量"""
-        return {name: len(hooks) for name, hooks in self._hooks.items()}
+        return {name: len(hook_list) for name, hook_list in self._hooks.items()}
 
 
 # 全局钩子注册表
@@ -280,6 +300,31 @@ def on_env_inject(priority: int = 0):
     return hooks.register("on_env_inject", priority)
 
 
+def on_before_llm_call(priority: int = 0):
+    """LLM 调用前验证钩子 — raise GuardrailError 可阻止调用"""
+    return hooks.register("on_before_llm_call", priority)
+
+
+def on_after_llm_call(priority: int = 0):
+    """LLM 调用后验证钩子 — raise GuardrailError 可拒绝结果"""
+    return hooks.register("on_after_llm_call", priority)
+
+
+def on_tool_filter(priority: int = 0):
+    """工具去重后、执行前钩子 — 可修改/重排/拦截工具调用列表"""
+    return hooks.register("on_tool_filter", priority)
+
+
+def on_context_compact(priority: int = 0):
+    """Context 压缩钩子 — 观察或干预压缩行为"""
+    return hooks.register("on_context_compact", priority)
+
+
+def on_reflection_build(priority: int = 0):
+    """反思 prompt 生成钩子 — 可修改反思内容"""
+    return hooks.register("on_reflection_build", priority)
+
+
 # ============================================================
 # 项目钩子加载
 # ============================================================
@@ -298,6 +343,9 @@ def load_project_hooks(project_dir: str) -> None:
     import importlib.util
     import sys
     from pathlib import Path
+
+    # Clear previously registered project hooks to avoid cross-project pollution
+    hooks.clear()
 
     hooks_file = Path(project_dir) / "hooks.py"
     if not hooks_file.exists():

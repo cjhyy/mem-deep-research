@@ -1,24 +1,21 @@
 import json
 import os
 import re
-import uuid
 
 from openai import AsyncOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from mem_deep_research_core.core.constants import generate_message_id as _generate_message_id
 from mem_deep_research_core.mem_deep_research_logging.logger import bootstrap_logger
 from mem_deep_research_core.prompts.template_loader import PromptTemplateLoader
 
 LOGGER_LEVEL = os.getenv("LOGGER_LEVEL", "INFO")
 logger = bootstrap_logger(level=LOGGER_LEVEL)
 
+_DEFAULT_UTIL_TIMEOUT = 600  # seconds
+
 # 模块级模板加载器
 _loader = PromptTemplateLoader()
-
-
-def _generate_message_id() -> str:
-    """Generate random message ID using common LLM format"""
-    return f"msg_{uuid.uuid4().hex[:8]}"
 
 
 @retry(
@@ -32,6 +29,7 @@ async def detect_response_language(
     query: str,
     api_key: str,
     base_url: str | None = None,
+    model: str = "gpt-4o-mini",
 ) -> str:
     """
     Detect the preferred response language based on user's query using LLM.
@@ -57,7 +55,7 @@ async def detect_response_language(
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=model,
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {
@@ -97,9 +95,10 @@ async def extract_hints(
     chinese_context: bool,
     add_message_id: bool,
     base_url: str = "https://api.openai.com/v1",
+    model: str = "o3",
 ) -> str:
     """Use LLM to extract task hints"""
-    client = AsyncOpenAI(api_key=api_key, timeout=600, base_url=base_url)
+    client = AsyncOpenAI(api_key=api_key, timeout=_DEFAULT_UTIL_TIMEOUT, base_url=base_url)
 
     instruction = _loader.load_template("hints/hint_instruction")
 
@@ -114,7 +113,7 @@ async def extract_hints(
         content = f"[{message_id}] {content}"
 
     response = await client.chat.completions.create(
-        model="o3",
+        model=model,
         messages=[{"role": "user", "content": content}],
         reasoning_effort="high",
     )
@@ -136,9 +135,10 @@ async def extract_hints(
     ),
 )
 async def get_gaia_answer_type(
-    task_description: str, api_key: str, base_url: str = "https://api.openai.com/v1"
+    task_description: str, api_key: str, base_url: str = "https://api.openai.com/v1",
+    model: str = "gpt-4.1",
 ) -> str:
-    client = AsyncOpenAI(api_key=api_key, timeout=600, base_url=base_url)
+    client = AsyncOpenAI(api_key=api_key, timeout=_DEFAULT_UTIL_TIMEOUT, base_url=base_url)
 
     instruction = _loader.load_and_render(
         "extraction/gaia_answer_type",
@@ -148,7 +148,7 @@ async def get_gaia_answer_type(
 
     message_id = _generate_message_id()
     response = await client.chat.completions.create(
-        model="gpt-4.1",
+        model=model,
         messages=[{"role": "user", "content": f"[{message_id}] {instruction}"}],
     )
     answer_type = response.choices[0].message.content
@@ -174,17 +174,17 @@ async def extract_gaia_final_answer(
     api_key: str,
     chinese_context: bool,
     base_url: str = "https://api.openai.com/v1",
-    model: str = "anthropic/claude-sonnet-4.5",
+    model: str = "anthropic/claude-sonnet-4-20250514",
 ) -> str:
     """Use LLM to extract final answer from summary
 
     Args:
-        model: LLM model to use for extraction. Default is claude-sonnet-4.5 which is
+        model: LLM model to use for extraction. Default is claude-sonnet-4-20250514 which is
                more cost-effective than opus while still providing good quality.
     """
     answer_type = await get_gaia_answer_type(task_description_detail, api_key, base_url)
 
-    client = AsyncOpenAI(api_key=api_key, timeout=600, base_url=base_url)
+    client = AsyncOpenAI(api_key=api_key, timeout=_DEFAULT_UTIL_TIMEOUT, base_url=base_url)
 
     # Build confidence section from templates
     if chinese_context:
@@ -248,14 +248,14 @@ async def extract_browsecomp_zh_final_answer(
     summary: str,
     api_key: str,
     base_url: str = "https://api.openai.com/v1",
-    model: str = "anthropic/claude-sonnet-4.5",
+    model: str = "anthropic/claude-sonnet-4-20250514",
 ) -> str:
     """Use LLM to extract final answer from summary
 
     Args:
-        model: LLM model to use for extraction. Default is claude-sonnet-4.5.
+        model: LLM model to use for extraction. Default is claude-sonnet-4-20250514.
     """
-    client = AsyncOpenAI(api_key=api_key, timeout=600, base_url=base_url)
+    client = AsyncOpenAI(api_key=api_key, timeout=_DEFAULT_UTIL_TIMEOUT, base_url=base_url)
 
     full_prompt = _loader.load_and_render(
         "extraction/browsecomp_zh",

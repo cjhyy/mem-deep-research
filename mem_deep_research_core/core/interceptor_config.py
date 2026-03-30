@@ -11,6 +11,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from mem_deep_research_core.core.constants import DEFAULT_FILTER_TAGS, DEFAULT_REASONING_TAGS
+
 logger = logging.getLogger("mem_deep_research")
 
 
@@ -44,18 +46,10 @@ class InterceptorConfig:
     """
 
     # 需要过滤的标签（这些标签及其内容不会输出）
-    filter_tags: list[str] = field(default_factory=lambda: ["use_mcp_tool"])
+    filter_tags: list[str] = field(default_factory=lambda: list(DEFAULT_FILTER_TAGS))
 
     # 需要提取为 reasoning 的标签
-    reasoning_tags: list[str] = field(
-        default_factory=lambda: [
-            "thinking",
-            "think",
-            "research_plan",
-            "findings_update",
-            "reflection_checkpoint",
-        ]
-    )
+    reasoning_tags: list[str] = field(default_factory=lambda: list(DEFAULT_REASONING_TAGS))
 
     # 输出控制
     show_reasoning: bool = True
@@ -73,10 +67,10 @@ class InterceptorConfig:
             return cls()
 
         return cls(
-            filter_tags=config_dict.get("filter_tags", ["use_mcp_tool"]),
+            filter_tags=config_dict.get("filter_tags", list(DEFAULT_FILTER_TAGS)),
             reasoning_tags=config_dict.get(
                 "reasoning_tags",
-                ["thinking", "think", "research_plan", "findings_update", "reflection_checkpoint"],
+                list(DEFAULT_REASONING_TAGS),
             ),
             show_reasoning=config_dict.get("show_reasoning", True),
             show_tool_calls=config_dict.get("show_tool_calls", True),
@@ -128,17 +122,6 @@ class InterceptorPresets:
     def verbose() -> InterceptorConfig:
         """详细模式：显示所有内容，包括 reasoning"""
         return InterceptorConfig(
-            filter_tags=["use_mcp_tool"],
-            reasoning_tags=[
-                "thinking",
-                "think",
-                "research_plan",
-                "findings_update",
-                "reflection_checkpoint",
-            ],
-            show_reasoning=True,
-            show_tool_calls=True,
-            show_text_output=True,
             strip_reasoning_from_output=False,  # reasoning 也显示在主输出中
         )
 
@@ -146,18 +129,8 @@ class InterceptorPresets:
     def minimal() -> InterceptorConfig:
         """精简模式：只显示最终文本，不显示 reasoning"""
         return InterceptorConfig(
-            filter_tags=["use_mcp_tool"],
-            reasoning_tags=[
-                "thinking",
-                "think",
-                "research_plan",
-                "findings_update",
-                "reflection_checkpoint",
-            ],
             show_reasoning=False,  # 不发送 reasoning 事件
             show_tool_calls=False,  # 不显示工具调用
-            show_text_output=True,
-            strip_reasoning_from_output=True,
         )
 
     @staticmethod
@@ -165,16 +138,6 @@ class InterceptorPresets:
         """调试模式：显示所有内容，不过滤任何标签"""
         return InterceptorConfig(
             filter_tags=[],  # 不过滤任何标签
-            reasoning_tags=[
-                "thinking",
-                "think",
-                "research_plan",
-                "findings_update",
-                "reflection_checkpoint",
-            ],
-            show_reasoning=True,
-            show_tool_calls=True,
-            show_text_output=True,
             strip_reasoning_from_output=False,
         )
 

@@ -9,21 +9,11 @@ import json
 import logging
 from dataclasses import dataclass, field
 
+from mem_deep_research_core.prompts.template_loader import PromptTemplateLoader
+
 logger = logging.getLogger("mem_deep_research")
 
-PLANNING_PROMPT = """You are a research planning assistant. Break down the following research task into 3-7 focused sub-questions that, when answered, will fully address the main question.
-
-Return ONLY a JSON object in this exact format (no markdown, no extra text):
-{
-  "sub_questions": [
-    {"id": 1, "question": "...", "priority": "high"},
-    {"id": 2, "question": "...", "priority": "medium"}
-  ]
-}
-
-Priority levels: "high", "medium", "low"
-
-Research task: """
+_template_loader = PromptTemplateLoader()
 
 
 @dataclass
@@ -46,19 +36,17 @@ class ResearchPlan:
 
     def to_context_string(self) -> str:
         """生成可注入 prompt 的计划文本"""
-        lines = [
-            f"Main Research Question: {self.main_question}",
-            "",
-            "Sub-questions to investigate:",
-        ]
+        lines = []
         for sq in self.sub_questions:
             priority_marker = {"high": "!!!", "medium": "!!", "low": "!"}.get(sq.priority, "!!")
             lines.append(f"  {sq.id}. [{priority_marker}] {sq.question}")
-        lines.append("")
-        lines.append(
-            "Instructions: Address each sub-question systematically. Start with high-priority questions."
+        sub_questions_list = "\n".join(lines)
+
+        return _template_loader.load_and_render(
+            "planning/plan_context",
+            main_question=self.main_question,
+            sub_questions_list=sub_questions_list,
         )
-        return "\n".join(lines)
 
     def get_progress(self) -> float:
         """获取完成进度 (0.0 ~ 1.0)"""
@@ -97,11 +85,15 @@ class TaskPlanner:
             return None
 
         try:
-            planning_system = "You are a research planning assistant. Output valid JSON only."
+            planning_system = _template_loader.load_template("planning/planning_system")
+            planning_user = _template_loader.load_and_render(
+                "planning/planning_prompt",
+                task_description=task_description,
+            )
             planning_messages = [
                 {
                     "role": "user",
-                    "content": [{"type": "text", "text": PLANNING_PROMPT + task_description}],
+                    "content": [{"type": "text", "text": planning_user}],
                 }
             ]
 
