@@ -35,7 +35,7 @@ _URL_PATTERN = re.compile(
 
 # 文件引用正则：@path/to/file 或 @"path with spaces"
 _FILE_REF_PATTERN = re.compile(
-    r'@"([^"]+)"|@(\S+\.\w{1,10})',
+    r'@"([^"]+)"|@(\S+\.\w+)',
 )
 
 
@@ -115,11 +115,13 @@ class InputCompiler:
                 for ref in file_refs:
                     content = self._read_file(ref)
                     if content is not None:
-                        result.attachments.append({
-                            "type": "file",
-                            "path": ref,
-                            "content": content,
-                        })
+                        result.attachments.append(
+                            {
+                                "type": "file",
+                                "path": ref,
+                                "content": content,
+                            }
+                        )
                         # 替换 query 中的文件引用为简短标记
                         pattern = f'@"{ref}"' if " " in ref else f"@{ref}"
                         replacement = f"[attached: {ref}]"

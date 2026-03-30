@@ -144,7 +144,7 @@ def inject_memory(ctx: HookContext, original_fn):
 
 ### 线程安全
 
-`store()`、`forget()`、`clear()`、`deduplicate()` 使用 `threading.Lock` 保护。`recall()` 和 `list_all()` 为只读操作，不持锁。
+`store()`、`forget()`、`clear()`、`deduplicate()`、`recall()` 使用 `threading.Lock` 保护。`recall()` 的读取和 access_count 更新均在锁内完成。
 
 ---
 
@@ -159,7 +159,7 @@ def inject_memory(ctx: HookContext, original_fn):
 ```yaml
 main_agent:
   todo_tracker:
-    enabled: true      # 也会随 deep_research.enabled 自动启用
+    enabled: true      # 也会随 task_engine.enabled 自动启用
 ```
 
 ### 工作流程
@@ -251,10 +251,10 @@ tracker.reset()
 main_agent:
   # TodoTracker
   todo_tracker:
-    enabled: false                 # 也会随 deep_research.enabled 自动启用
+    enabled: false                 # 也会随 task_engine.enabled 自动启用
 
-  # Deep Research (自动启用 todo_tracker + session memory)
-  deep_research:
+  # Task Engine (自动启用 todo_tracker + session memory)
+  task_engine:
     enabled: false
     reflection_interval: 5
     auto_planning: false

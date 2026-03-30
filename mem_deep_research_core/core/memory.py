@@ -297,11 +297,12 @@ class LongTermMemory:
             candidates_sorted = sorted(candidates, key=lambda e: -e.timestamp)
             results = candidates_sorted[:top_k]
 
-        # Update access count and persist
+        # Update access count and persist (under lock to avoid race condition)
         if results:
-            for entry in results:
-                entry.access_count += 1
-            self._save()
+            with self._lock:
+                for entry in results:
+                    entry.access_count += 1
+                self._save()
 
         return results
 

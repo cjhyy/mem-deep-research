@@ -53,9 +53,9 @@ main_agent:
 
   # ─── Agent 参数 ───
   max_turns: 20                   # 最大执行轮数
-  execution_mode: auto            # auto | flash | standard | deep
+  execution_mode: auto            # auto | quick | standard | deep
                                   # auto: 框架根据任务复杂度自动选择
-                                  # flash: 简单问答，不调用工具
+                                  # quick: 简单问答，少轮执行
                                   # standard: 需要工具的常规任务
                                   # deep: 深度研究模式
   max_concurrent_subagents: 3     # 并发子 Agent 数量上限（asyncio.Semaphore）
@@ -98,12 +98,11 @@ main_agent:
     response_hash_window_size: 8       # 滑动窗口大小
     response_hash_repeat_threshold: 3  # 重复阈值
 
-  # ─── 深度研究 ───
-  deep_research:
+  # ─── 任务引擎（深度研究） ───
+  task_engine:
     enabled: false                # 启用深度研究模式
     reflection_interval: 5        # 反思检查点间隔（轮数）
     auto_planning: false          # 自动任务分解
-    require_explicit_planning: false  # 要求显式规划
 
 # ─── 子 Agent 配置 ───
 sub_agents:
@@ -145,7 +144,7 @@ validated = validate_agent_config(config_dict)  # 抛出 ValidationError
 | `SkillSelectionConfig` | Skill 选择策略配置 |
 | `ContextManagerConfig` | 上下文管理配置 |
 | `MonitoringConfigSchema` | 执行监控配置 |
-| `DeepResearchConfig` | 深度研究协议配置 |
+| `TaskEngineConfig` | 任务引擎配置（深度研究 + 反思） |
 
 ## 环境变量引用
 

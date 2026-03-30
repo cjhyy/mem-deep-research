@@ -135,7 +135,7 @@ class Transcript:
         """
         event = TranscriptEvent(
             event_id=f"evt_{uuid.uuid4().hex[:12]}",
-            event_type=event_type.value,
+            event_type=event_type.value if hasattr(event_type, "value") else str(event_type),
             timestamp=time.time(),
             turn=turn,
             agent_name=agent_name or self.agent_name,
@@ -169,7 +169,9 @@ class Transcript:
                 return e
         return None
 
-    def get_tool_pairs(self, turn: int | None = None) -> list[tuple[TranscriptEvent, TranscriptEvent | None]]:
+    def get_tool_pairs(
+        self, turn: int | None = None
+    ) -> list[tuple[TranscriptEvent, TranscriptEvent | None]]:
         """获取 tool_use → tool_result 配对"""
         uses = self.filter(EventType.TOOL_USE, turn=turn)
         pairs = []
@@ -226,13 +228,16 @@ class Transcript:
         transcript = cls()
         path = Path(path)
         with open(path, encoding="utf-8") as f:
-            for line in f:
+            for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
-                data = json.loads(line)
-                event = TranscriptEvent(**data)
-                transcript._events.append(event)
+                try:
+                    data = json.loads(line)
+                    event = TranscriptEvent(**data)
+                    transcript._events.append(event)
+                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                    logger.warning(f"[Transcript] Skipping malformed line {line_num}: {e}")
         logger.info(f"[Transcript] Loaded {len(transcript._events)} events from {path}")
         return transcript
 

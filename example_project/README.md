@@ -19,9 +19,9 @@ python run.py "你好"
 ## 使用示例
 
 ```bash
-# 快速回答（flash 模式 — 不调工具，直接回答）
+# 快速回答（quick 模式 — 不调工具，直接回答）
 python run.py "你好"
-python run.py "什么是机器学习？" --flash
+python run.py "什么是机器学习？" --quick
 
 # 计算（standard 模式 — 调用工具）
 python run.py "123 * 456 + 789"
@@ -37,7 +37,7 @@ python run.py "分析 2024 年 AI Agent 领域的关键技术突破"
 
 | 能力 | 说明 |
 |------|------|
-| **执行模式自动选择** | 简单问答 → flash，需要工具 → standard，deep_research → deep |
+| **执行模式自动选择** | 简单问答 → quick，需要工具 → standard，task_engine → deep |
 | **语言自动检测** | 中文问题中文答，英文问题英文答 |
 | **任务追踪** | 复杂任务自动维护 todo list，context 压缩不丢 |
 | **子 Agent** | LLM 自主决定是否 spawn 子 agent 处理子任务 |

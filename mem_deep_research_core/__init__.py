@@ -37,7 +37,7 @@ from mem_deep_research_core.exceptions import (
     ToolTimeoutError,
 )
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 __author__ = "maki maki"
 
 __all__ = [

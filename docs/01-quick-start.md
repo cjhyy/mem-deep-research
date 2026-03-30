@@ -73,7 +73,7 @@ result = dr.run_sync("你的任务")
 ```bash
 python run.py "你的任务"
 python run.py "任务" --deep      # 强制深度研究模式
-python run.py "任务" --flash     # 强制快速回答模式
+python run.py "任务" --quick     # 强制快速回答模式
 python run.py "任务" --config agent_anthropic  # 切换配置
 ```
 
@@ -106,7 +106,7 @@ main_agent:
     - tool-calculator
     - tool-searching-serper
 
-  execution_mode: auto              # auto | flash | standard | deep
+  execution_mode: auto              # auto | quick | standard | deep
   max_turns: 30
   max_concurrent_subagents: 3
   response_language: auto           # auto | Chinese | English | ...
@@ -114,7 +114,7 @@ main_agent:
   todo_tracker:
     enabled: true                   # 任务追踪
 
-  deep_research:
+  task_engine:
     enabled: true
     reflection_interval: 5
 
@@ -138,7 +138,7 @@ main_agent:
 
 无需额外配置，框架自动处理：
 
-- **执行模式自动选择** — 简单问答 → flash，需要工具 → standard，deep_research → deep
+- **执行模式自动选择** — 简单问答 → quick，需要工具 → standard，task_engine → deep
 - **语言自动检测** — 中文问题中文答，英文问题英文答
 - **内置 spawn_agent 工具** — LLM 可自主 spawn 子 agent 处理子任务
 - **内置 update_todo 工具** — LLM 可管理任务列表追踪进度
@@ -161,16 +161,25 @@ my_project/
 └── run.py                      # 入口脚本
 ```
 
-## ResearchResult
+## TaskResult
 
 ```python
 @dataclass
-class ResearchResult:
+class TaskResult:
     task_id: str                    # 唯一任务 ID
     answer: str                     # 最终答案
-    boxed_answer: str               # 格式化答案
-    status: str                     # "completed" | "failed"
-    duration_seconds: float         # 执行时长
-    log_path: Optional[Path]        # 日志路径
-    error: Optional[str]            # 错误信息
+    boxed_answer: str = ""          # 格式化答案
+    status: str = "completed"       # "completed" | "failed"
+    duration_seconds: float = 0.0   # 执行时长
+    log_path: Path | None = None    # 日志路径
+    error: str | None = None        # 错误信息
+    turns: int = 0                  # 实际执行轮数
+    tool_calls: int = 0             # 工具调用总次数
+    error_type: str | None = None   # 错误分类 ("llm_error" | "tool_error" | "config_error" | "timeout")
+    perf_metrics: dict | None = None  # 性能指标
+    checkpoints: list | None = None   # 轮次级检查点
+
+    @property
+    def success(self) -> bool:
+        return self.status == "completed" and self.error is None
 ```

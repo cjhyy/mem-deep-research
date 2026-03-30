@@ -215,6 +215,10 @@ class AgentFactory:
         from mem_deep_research_core.core.pipeline import create_pipeline_components
 
         cfg = self.agent_config.cfg
+        if cfg is None:
+            raise ValueError(
+                "Configuration not loaded. Ensure agent_config.cfg is set before calling initialize()."
+            )
         logs_dir = str(self.agent_config.logs_dir)
 
         # 创建 pipeline 组件

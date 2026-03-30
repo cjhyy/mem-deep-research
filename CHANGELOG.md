@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.0.5 (2026-03-31)
+
+### Documentation Fixes (CRITICAL)
+- 全文修正 `flash` → `quick`（执行模式名称）：docs/01-quick-start.md, docs/02-configuration.md, example_project/README.md
+- 全文修正 `deep_research:` → `task_engine:`（配置字段名）：docs/01-quick-start.md, docs/02-configuration.md, docs/12-memory-and-todo.md
+- `ResearchResult` → `TaskResult`（类名）：docs/01-quick-start.md，补充 v0.3 新增字段（turns, tool_calls, error_type, perf_metrics, checkpoints）
+- CLI 示例修正 `--flash` → `--quick`
+
+### Bug Fixes
+- **memory.py**: `recall()` 的 `access_count` 更新和 `_save()` 移入 `threading.Lock` 内，修复竞态条件
+- **transcript.py**: `record()` 兼容 enum 和字符串类型的 event_type；`load()` 捕获损坏 JSONL 行，跳过而非崩溃
+- **input_compiler.py**: 文件引用正则 `\w{1,10}` → `\w+`，不再截断超长扩展名
+- **agent_factory.py**: `initialize()` 开头校验 `cfg is not None`，防止空配置 AttributeError
+
 ## v1.0.4 (2026-03-30)
 
 ### Documentation
