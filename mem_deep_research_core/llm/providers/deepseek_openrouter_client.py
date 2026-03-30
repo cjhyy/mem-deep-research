@@ -108,7 +108,9 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
         """Extract tool call information - from response object for tool_calls finish_reason."""
         from mem_deep_research_core.utils.parsing_utils import parse_llm_response_for_tool_calls
 
-        name_map = _native_tool_name_map_var.get(None) or getattr(self, "_native_tool_name_map", None)
+        name_map = _native_tool_name_map_var.get(None) or getattr(
+            self, "_native_tool_name_map", None
+        )
 
         if llm_response.choices[0].finish_reason == "tool_calls":
             return parse_llm_response_for_tool_calls(
