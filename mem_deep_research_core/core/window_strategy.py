@@ -41,6 +41,7 @@ from mem_deep_research_core.core.constants import (
     COMPACT_MIN_CHARS,
     SYSTEM_MESSAGE_KEYWORDS,
     TAG_CONTEXT_SUMMARY,
+    TAG_OFFLOADED,
 )
 
 logger = logging.getLogger("mem_deep_research")
@@ -150,6 +151,18 @@ def _is_system_message(content) -> bool:
             if isinstance(item, dict) and item.get("type") == "text":
                 text = item.get("text", "")
                 if any(kw in text for kw in SYSTEM_MESSAGE_KEYWORDS):
+                    return True
+    return False
+
+
+def _is_offloaded(content) -> bool:
+    """判断消息是否是已卸载的内容（不应被二次压缩）"""
+    if isinstance(content, str):
+        return content.startswith(TAG_OFFLOADED)
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                if item.get("text", "").startswith(TAG_OFFLOADED):
                     return True
     return False
 
@@ -352,7 +365,8 @@ class ObservationMaskingStrategy(WindowStrategy):
             if role == "assistant":
                 estimated_turn += 1
             elif role == "user" and estimated_turn > 0 and estimated_turn <= cutoff_turn:
-                if not _is_system_message(msg.get("content")):
+                content = msg.get("content")
+                if not _is_system_message(content) and not _is_offloaded(content):
                     char_count = _get_message_char_count(msg)
                     if char_count > COMPACT_MIN_CHARS:
                         candidates.append((i, estimated_turn, char_count))
@@ -689,8 +703,13 @@ class WindowStrategyPipeline:
         await pipeline.apply_summarize(messages, ctx, llm_call_fn)
     """
 
+    # Circuit breaker: skip LLMSummarize after N consecutive failures
+    SUMMARIZE_FUSE_THRESHOLD = 3
+
     def __init__(self, strategies: list[WindowStrategy] | None = None):
         self.strategies = strategies or self.default_strategies()
+        self._summarize_consecutive_failures: int = 0
+        self._summarize_fused: bool = False
 
     @staticmethod
     def default_strategies() -> list[WindowStrategy]:
@@ -710,6 +729,16 @@ class WindowStrategyPipeline:
         last_action = "none"
 
         for strategy in self.strategies:
+            # Circuit breaker: skip LLMSummarize if fused
+            if (
+                strategy.strategy_type == "llm_summarize"
+                and self._summarize_fused
+            ):
+                logger.info(
+                    "[WINDOW] LLMSummarize fused (circuit breaker active), skipping"
+                )
+                continue
+
             if strategy.should_trigger(ctx):
                 result = strategy.apply(messages, ctx)
                 if result.action_label:
@@ -736,11 +765,33 @@ class WindowStrategyPipeline:
         ctx: WindowContext,
         llm_call_fn: Callable,
     ) -> bool:
-        """执行异步 LLM 压缩（找到 LLMSummarizeStrategy 并调用）"""
+        """执行异步 LLM 压缩（找到 LLMSummarizeStrategy 并调用）
+
+        Tracks consecutive failures and trips the circuit breaker after
+        SUMMARIZE_FUSE_THRESHOLD consecutive failures.
+        """
+        if self._summarize_fused:
+            logger.info("[WINDOW] LLMSummarize fused, skipping apply_summarize")
+            return False
+
         for strategy in self.strategies:
             if hasattr(strategy, "apply_async") and strategy.supports_async:
                 result = await strategy.apply_async(messages, ctx, llm_call_fn)
-                return result.messages_affected > 0
+                if result.messages_affected > 0:
+                    # Success: reset failure counter
+                    self._summarize_consecutive_failures = 0
+                    return True
+                else:
+                    # Failure: increment and check fuse
+                    self._summarize_consecutive_failures += 1
+                    if self._summarize_consecutive_failures >= self.SUMMARIZE_FUSE_THRESHOLD:
+                        self._summarize_fused = True
+                        logger.warning(
+                            f"[WINDOW] LLMSummarize circuit breaker tripped after "
+                            f"{self._summarize_consecutive_failures} consecutive failures. "
+                            f"Skipping L2 for remainder of session."
+                        )
+                    return False
         return False
 
     def apply_emergency(
@@ -792,6 +843,8 @@ class WindowStrategyPipeline:
 
     def reset(self):
         """重置所有策略状态"""
+        self._summarize_consecutive_failures = 0
+        self._summarize_fused = False
         for strategy in self.strategies:
             if hasattr(strategy, "reset"):
                 strategy.reset()

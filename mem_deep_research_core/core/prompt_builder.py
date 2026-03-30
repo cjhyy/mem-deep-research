@@ -21,7 +21,16 @@ logger = logging.getLogger("mem_deep_research")
 
 
 class PromptBuilder:
-    """Prompt 构建器 — 负责 system prompt、skill 注入、hint 生成"""
+    """Prompt 构建器 — 负责 system prompt、skill 注入、hint 生成
+
+    支持 section 级缓存：将 system prompt 拆为静态段（agent 角色、工具描述等）
+    和动态段（skill 注入、hook 修改等）。静态段在 session 内缓存不变，
+    动态段每次调用重算。这对 Anthropic API prompt caching 友好——
+    保持静态前缀不变可大幅提升 cache hit rate。
+    """
+
+    # Section 缓存边界标记（不出现在 prompt 中，仅内部使用）
+    _DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
     def __init__(
         self,
@@ -35,6 +44,14 @@ class PromptBuilder:
         self.chinese_context = chinese_context
         self.inline_skill_selector = inline_skill_selector
         self._template_loader = PromptTemplateLoader()
+
+        # Section cache: 静态段缓存
+        self._section_cache: dict[str, str] = {}
+        # 缓存的完整 system prompt（静态部分）
+        self._cached_static_prompt: str | None = None
+        # 上次使用的 prompt 实例和 task_engine_cfg
+        self._cached_prompt_instance = None
+        self._cached_task_engine_cfg = None
 
     def build_task_guidance(self) -> str:
         """构建任务指导"""
@@ -120,7 +137,13 @@ class PromptBuilder:
     def build_system_prompt(
         self, tool_definitions, initial_user_content, selected_skill_names=None
     ):
-        """构建系统提示词"""
+        """构建系统提示词
+
+        使用 section 级缓存：
+        - 静态段（agent 角色 + 工具描述）：session 内缓存
+        - 动态段（skill 注入、hook 修改）：每次重算
+        这样 Anthropic API 的 prompt caching 可以命中静态前缀。
+        """
         # 获取 prompt 配置
         prompt_cfg = {}
         if hasattr(self.cfg.main_agent, "prompt") and self.cfg.main_agent.prompt:
@@ -133,16 +156,28 @@ class PromptBuilder:
 
         main_agent_prompt_instance = _load_agent_prompt(prompt_cfg)
 
-        extra_context = ""
+        # === 静态段：agent 角色 + 工具描述（缓存） ===
+        if self._cached_static_prompt is None:
+            extra_context = ""
+            static_prompt = main_agent_prompt_instance.generate_system_prompt_with_mcp_tools(
+                mcp_servers=tool_definitions,
+                chinese_context=self.chinese_context,
+                extra_context=extra_context,
+                task_engine_cfg=task_engine_cfg,
+            )
+            self._cached_static_prompt = static_prompt
+            self._cached_prompt_instance = main_agent_prompt_instance
+            self._cached_task_engine_cfg = task_engine_cfg
+            self._section_cache["base"] = static_prompt
+            logger.debug("[PromptBuilder] Static section cached")
+        else:
+            static_prompt = self._cached_static_prompt
+            main_agent_prompt_instance = self._cached_prompt_instance
+            task_engine_cfg = self._cached_task_engine_cfg
 
-        system_prompt = main_agent_prompt_instance.generate_system_prompt_with_mcp_tools(
-            mcp_servers=tool_definitions,
-            chinese_context=self.chinese_context,
-            extra_context=extra_context,
-            task_engine_cfg=task_engine_cfg,
-        )
+        system_prompt = static_prompt
 
-        # 注入 Skills（仅在 skill_selection.enabled 时）
+        # === 动态段：skill 注入（每次重算） ===
         skill_cfg = self.cfg.main_agent.get("skill_selection", {})
         skill_enabled = skill_cfg.get("enabled", True) if skill_cfg is not None else True
         if not skill_enabled:
@@ -183,7 +218,7 @@ class PromptBuilder:
                     )
                     logger.debug("Rule-matched skills injected into system prompt")
 
-        # Hook: on_system_prompt_build — post-process system prompt
+        # Hook: on_system_prompt_build — post-process system prompt (dynamic)
         hook_result = hooks.call(
             "on_system_prompt_build",
             HookContext(
@@ -196,3 +231,9 @@ class PromptBuilder:
             system_prompt = hook_result
 
         return system_prompt, main_agent_prompt_instance, task_engine_cfg
+
+    def invalidate_cache(self):
+        """手动使缓存失效（工具定义变更等场景使用）"""
+        self._cached_static_prompt = None
+        self._section_cache.clear()
+        logger.debug("[PromptBuilder] Section cache invalidated")

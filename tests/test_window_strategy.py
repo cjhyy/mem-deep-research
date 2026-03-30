@@ -423,6 +423,87 @@ class TestCustomStrategy:
 # ========== ContextManager 集成测试（策略管道注入） ==========
 
 
+# ========== Circuit Breaker 测试 ==========
+
+
+class TestCircuitBreaker:
+    @pytest.mark.asyncio
+    async def test_trips_after_consecutive_failures(self):
+        """连续 3 次 apply_summarize 失败后熔断"""
+        pipeline = WindowStrategyPipeline()
+        history = _make_history(5, content_size=300)
+        ctx = _make_ctx(current_turn=5, max_tokens=5000, history=history)
+
+        async def failing_llm(system_prompt, messages, purpose):
+            return ""  # empty response = failure
+
+        for _ in range(3):
+            await pipeline.apply_summarize(list(history), ctx, failing_llm)
+
+        assert pipeline._summarize_fused is True
+        assert pipeline._summarize_consecutive_failures >= 3
+
+    def test_circuit_breaker_skips_summarize_in_manage(self):
+        """熔断后 manage() 跳过 LLMSummarize"""
+        pipeline = WindowStrategyPipeline([
+            LLMSummarizeStrategy(trigger_ratio=0.1),  # low threshold to ensure trigger
+        ])
+        pipeline._summarize_fused = True
+
+        history = _make_history(5, content_size=300)
+        ctx = _make_ctx(current_turn=5, max_tokens=500, history=history)
+
+        action = pipeline.manage(history, ctx)
+        # Should not return "need_summarize" because circuit breaker is active
+        assert action != "need_summarize"
+
+    @pytest.mark.asyncio
+    async def test_successful_summarize_resets_counter(self):
+        """成功的 summarize 重置失败计数器"""
+        pipeline = WindowStrategyPipeline()
+        pipeline._summarize_consecutive_failures = 2  # close to tripping
+
+        history = _make_history(5, content_size=300)
+        ctx = _make_ctx(current_turn=5, max_tokens=5000, history=history)
+
+        async def success_llm(system_prompt, messages, purpose):
+            return "Summary: key findings about A, B, C."
+
+        result = await pipeline.apply_summarize(history, ctx, success_llm)
+        assert result is True
+        assert pipeline._summarize_consecutive_failures == 0
+        assert pipeline._summarize_fused is False
+
+    def test_reset_clears_circuit_breaker(self):
+        """reset() 清除熔断状态"""
+        pipeline = WindowStrategyPipeline()
+        pipeline._summarize_consecutive_failures = 3
+        pipeline._summarize_fused = True
+
+        pipeline.reset()
+
+        assert pipeline._summarize_consecutive_failures == 0
+        assert pipeline._summarize_fused is False
+
+    @pytest.mark.asyncio
+    async def test_fused_apply_summarize_returns_false(self):
+        """熔断后 apply_summarize 直接返回 False"""
+        pipeline = WindowStrategyPipeline()
+        pipeline._summarize_fused = True
+
+        history = _make_history(3, content_size=100)
+        ctx = _make_ctx(current_turn=3, max_tokens=5000, history=history)
+
+        async def should_not_be_called(system_prompt, messages, purpose):
+            raise AssertionError("LLM should not be called when fused")
+
+        result = await pipeline.apply_summarize(history, ctx, should_not_be_called)
+        assert result is False
+
+
+# ========== ContextManager 集成测试（策略管道注入） ==========
+
+
 class TestContextManagerPipelineIntegration:
     def test_custom_pipeline_injection(self):
         """验证 ContextManager 接受自定义 pipeline"""

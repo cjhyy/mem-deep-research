@@ -25,6 +25,7 @@ from mem_deep_research_core.core.constants import (
     parse_bool_config,
 )
 from mem_deep_research_core.core.context_manager import ContextManager, ContextManagerConfig
+from mem_deep_research_core.core.deferred_tools import BUILTIN_TOOL_SEARCH, DeferredToolManager
 from mem_deep_research_core.core.hooks import HookContext, hooks
 from mem_deep_research_core.core.interceptor_config import InterceptorConfig, InterceptorPresets
 from mem_deep_research_core.core.llm_call_handler import (
@@ -185,7 +186,24 @@ class Orchestrator:
         self._init_monitoring_and_tools()
         self._init_skills_and_prompt()
         self._init_context_manager()
+        self._init_deferred_tools()
+        self._init_transcript()
         self.current_agent_id: str | None = None
+
+    def _init_deferred_tools(self):
+        """初始化延迟工具加载管理器"""
+        threshold = self.cfg.main_agent.get("deferred_tools_threshold", 20)
+        self.deferred_tool_manager = DeferredToolManager(threshold=threshold)
+
+    def _init_transcript(self):
+        """初始化 Transcript 事件日志"""
+        from mem_deep_research_core.core.transcript import Transcript
+
+        transcript_enabled = self.cfg.main_agent.get("transcript_enabled", True)
+        if transcript_enabled:
+            self.transcript = Transcript(agent_name="main")
+        else:
+            self.transcript = None
 
     def _init_stream_and_interceptor(self):
         """初始化流式处理器和消息拦截器"""
@@ -536,10 +554,37 @@ class Orchestrator:
         logger.debug(f"\n{'=' * 20} Starting Task: {task_id} {'=' * 20}")
         logger.debug(f"Task Description: {task_description}")
 
+        # 0.5. 输入编译链
+        from mem_deep_research_core.core.input_compiler import InputCompiler
+
+        input_compiler = InputCompiler(hooks=hooks)
+        compile_result = input_compiler.compile(task_description, context=self.context)
+        task_description = compile_result.query
+
+        # 将提取的附件信息记录到 task_log
+        if compile_result.extracted_urls:
+            self.task_log.log_step(
+                "input_compile",
+                f"Extracted {len(compile_result.extracted_urls)} URLs from query",
+            )
+        if compile_result.attachments:
+            self.task_log.log_step(
+                "input_compile",
+                f"Loaded {len(compile_result.attachments)} file attachments",
+            )
+
         # 1. 处理输入
         initial_user_content, task_description = process_input(task_description, task_file_name)
         task_guidance = self.prompt_builder.build_task_guidance()
         initial_user_content[0]["text"] = initial_user_content[0]["text"] + task_guidance
+
+        # 注入文件附件内容到 user content
+        for attachment in compile_result.attachments:
+            if attachment.get("type") == "file" and attachment.get("content"):
+                initial_user_content.append({
+                    "type": "text",
+                    "text": f"\n\n--- File: {attachment['path']} ---\n{attachment['content']}",
+                })
 
         # 2. 生成提示词（如果启用）
         hint_notes = await self.prompt_builder.generate_hints(task_description)
@@ -557,6 +602,14 @@ class Orchestrator:
         tool_definitions = await self._get_tool_definitions()
         self.task_log.record_perf("tool_definitions_fetch", time.perf_counter() - _perf_t0)
         self.task_log.log_step("get_main_tool_definitions", f"{tool_definitions}")
+
+        # 4.1. Deferred tools: 工具数量多时只暴露名称+描述
+        tool_definitions, deferred_active = self.deferred_tool_manager.apply(tool_definitions)
+        if deferred_active:
+            self.task_log.log_step(
+                "deferred_tools_active",
+                f"Deferred tool loading enabled, {len(self.deferred_tool_manager._full_registry)} tools deferred",
+            )
 
         # 4.5. LLM Skill 选择
         _perf_t0 = time.perf_counter()
@@ -617,6 +670,19 @@ class Orchestrator:
             )
 
         await self.stream_handler.stream_end_workflow(workflow_id)
+
+        # Save transcript (if enabled)
+        if self.transcript and self.transcript.event_count > 0:
+            output_dir = self.cfg.get("output_dir", "logs")
+            transcript_path = os.path.join(output_dir, f"transcript_{task_id}.jsonl")
+            try:
+                self.transcript.save(transcript_path)
+                self.task_log.log_step(
+                    "transcript_saved",
+                    f"Saved {self.transcript.event_count} events to {transcript_path}",
+                )
+            except Exception as e:
+                logger.warning(f"[Orchestrator] Failed to save transcript: {e}")
 
         logger.debug(f"\n{'=' * 20} Task {task_id} Finished {'=' * 20}")
         self.task_log.log_step("task_completed", f"Task {task_id} completed successfully")
@@ -695,6 +761,8 @@ class Orchestrator:
             deduplicate_trailing_messages=self._deduplicate_trailing_messages,
             long_term_memory=self.long_term_memory,
             hooks=hooks,
+            deferred_tool_manager=self.deferred_tool_manager,
+            transcript=self.transcript,
         )
         return MainLoopRunner(ctx)
 

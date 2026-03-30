@@ -25,7 +25,12 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from mem_deep_research_core.core.constants import RESULT_BRIEF_LENGTH
+from mem_deep_research_core.core.constants import (
+    MICROCOMPACT_MIN_CHARS,
+    RESULT_BRIEF_LENGTH,
+    SYSTEM_MESSAGE_KEYWORDS,
+    TAG_OFFLOADED,
+)
 from mem_deep_research_core.core.window_strategy import (
     BinaryReductionStrategy,
     LLMSummarizeStrategy,
@@ -310,17 +315,117 @@ class ContextManager:
             logger.warning(f"[Context] Failed to offload result: {e}")
             return result_text, None
 
-        # Create summary for context
+        # Create structured offload marker for context
+        # Format: [OFFLOADED:<file>|<chars>] — recognized by microcompact/compression
+        # to avoid double-compacting already-offloaded content.
         preview = result_text[:500].replace("\n", " ")
         summary = (
-            f"[Result offloaded to file: {file_name}]\n"
-            f"Total length: {len(result_text)} chars\n"
+            f"{TAG_OFFLOADED}{file_name}|{len(result_text)}]\n"
             f"Preview: {preview}...\n"
             f"Use file operations to read the full content if needed."
         )
 
         logger.info(f"[Context] Offloaded {len(result_text)} chars to {file_path}")
         return summary, file_path
+
+    # ============================================================
+    # Microcompact: 每轮自动清理旧 tool_result（零 LLM 成本）
+    # ============================================================
+
+    def microcompact(
+        self,
+        message_history: list,
+        current_turn: int,
+        keep_recent: int = 3,
+    ) -> int:
+        """每轮 LLM 调用前自动清理旧 tool_result 内容。
+
+        与 ObservationMasking 不同，microcompact 不等阈值触发，
+        每轮无条件清理 N 轮前的 tool_result 文本，只留简短占位符。
+        参考 Claude Code 的 microcompact 机制。
+
+        Args:
+            message_history: 消息历史（就地修改）
+            current_turn: 当前轮次
+            keep_recent: 保留最近 N 轮完整结果
+
+        Returns:
+            被清理的消息数
+        """
+        cutoff_turn = current_turn - keep_recent
+        if cutoff_turn <= 0:
+            return 0
+
+        cleaned = 0
+        estimated_turn = 0
+        for i in range(1, len(message_history)):
+            msg = message_history[i]
+            role = msg.get("role", "")
+
+            if role == "assistant":
+                estimated_turn += 1
+                continue
+
+            # 只清理 user 角色的 tool_result 消息（旧轮次 + 非系统消息）
+            if role != "user" or estimated_turn == 0 or estimated_turn > cutoff_turn:
+                continue
+
+            content = msg.get("content", "")
+            # 跳过系统注入消息
+            if isinstance(content, str):
+                if any(kw in content for kw in SYSTEM_MESSAGE_KEYWORDS):
+                    continue
+                char_count = len(content)
+            elif isinstance(content, list):
+                text_parts = []
+                is_system = False
+                for item in content:
+                    if isinstance(item, dict):
+                        t = item.get("text", "")
+                        text_parts.append(t)
+                        if any(kw in t for kw in SYSTEM_MESSAGE_KEYWORDS):
+                            is_system = True
+                    elif isinstance(item, str):
+                        text_parts.append(item)
+                if is_system:
+                    continue
+                char_count = sum(len(t) for t in text_parts)
+            else:
+                continue
+
+            # 跳过已经很短的消息（已被 compact 过或本身就短）
+            if char_count <= MICROCOMPACT_MIN_CHARS:
+                continue
+
+            # 跳过已卸载的内容（结构化卸载标记）
+            if isinstance(content, list) and content:
+                first_text = content[0].get("text", "") if isinstance(content[0], dict) else ""
+                if "[OFFLOADED:" in first_text:
+                    continue
+
+            # 替换为简短占位符
+            turn_records = [r for r in self._call_registry if r.turn == estimated_turn]
+            if turn_records:
+                placeholders = []
+                for r in turn_records:
+                    brief = r.result_brief[:60].replace("\n", " ") if r.result_brief else ""
+                    placeholders.append(
+                        f"[microcompact] {r.tool_name}: {r.result_chars} chars — {brief}"
+                    )
+                placeholder = "\n".join(placeholders)
+            else:
+                placeholder = f"[microcompact] turn {estimated_turn} tool result cleared ({char_count} chars)"
+
+            msg["content"] = [{"type": "text", "text": placeholder}]
+            cleaned += 1
+
+        if cleaned > 0:
+            logger.debug(
+                f"[CONTEXT] Microcompact: cleared {cleaned} old tool results "
+                f"(turns 1-{cutoff_turn})"
+            )
+
+        return cleaned
 
     # ============================================================
     # Token 估算

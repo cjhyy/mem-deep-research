@@ -17,7 +17,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import json as _json
+
 from mem_deep_research_core.core.constants import (
+    BUILTIN_TOOL_SEARCH,
     BUILTIN_TOOL_SPAWN_AGENT,
     CONTEXT_COMPRESSION_NOTICE,
     DEFAULT_MAX_CONCURRENT_SUBAGENTS,
@@ -97,6 +100,12 @@ class MainLoopContext:
     # HookRegistry instance (defaults to module-level singleton for backward compat)
     hooks: Any = None  # Set to _default_hooks in MainLoopRunner.__init__ if None
 
+    # DeferredToolManager instance (optional, for lazy tool schema loading)
+    deferred_tool_manager: Any = None
+
+    # Transcript instance (optional, for event logging)
+    transcript: Any = None
+
 
 def _get_spawn_agent_tool_definition() -> dict:
     """Built-in spawn_agent tool — MCP server format for system prompt rendering."""
@@ -166,12 +175,32 @@ class MainLoopRunner:
         self.long_term_memory = ctx.long_term_memory
         self.spawn_depth = ctx.spawn_depth
         self.hooks = ctx.hooks or _default_hooks
+        self.deferred_tool_manager = ctx.deferred_tool_manager
+        self.transcript = ctx.transcript
 
         # Session memory (within-run structured memory, survives context compression)
         self.session_memory = SessionMemory()
 
         # 当前 Agent ID
         self.current_agent_id: str | None = None
+
+    def _record_event(self, event_type, data=None, turn=0, ref_event_id=None, duration_ms=None):
+        """Record a transcript event (no-op if transcript not configured)."""
+        if self.transcript is None:
+            return None
+        from mem_deep_research_core.core.transcript import EventType as ET
+
+        # Convert string to EventType if needed
+        if isinstance(event_type, str):
+            event_type = ET(event_type)
+        return self.transcript.record(
+            event_type=event_type,
+            data=data or {},
+            turn=turn,
+            agent_name=self.agent_name,
+            ref_event_id=ref_event_id,
+            duration_ms=duration_ms,
+        )
 
     async def _route_execution_mode(
         self, task_description: str, task_engine_cfg: dict | None
@@ -314,6 +343,13 @@ class MainLoopRunner:
             ),
         )
 
+        # Transcript: agent start
+        self._record_event("agent_start", {
+            "agent_name": self.agent_name,
+            "execution_mode": self.execution_mode,
+            "task": task_description[:200],
+        })
+
         # Auto-detect response language from query (hook can override via on_agent_start)
         if self.response_language == "auto":
             from mem_deep_research_core.core.user_context import detect_language_by_chars
@@ -394,6 +430,7 @@ class MainLoopRunner:
         while not turn_counter.is_max_reached():
             turn_count = turn_counter.increment()
             self.context_manager.set_turn(turn_count)
+            self._record_event("turn_start", {"turn": turn_count}, turn=turn_count)
             logger.debug(f"\n--- Main Agent Turn {turn_count} ---")
 
             # Hook: on_turn_start
@@ -459,8 +496,16 @@ class MainLoopRunner:
                 # 硬超时或其他终止原因：跳出循环，走摘要流程
                 break
 
+            # Microcompact: 每轮 LLM 调用前清理旧 tool_result（零成本）
+            self.context_manager.microcompact(
+                message_history, turn_count, keep_recent=3
+            )
+
             # LLM 调用
             _perf_llm_start = time.perf_counter()
+            _llm_event_id = self._record_event("llm_call", {
+                "turn": turn_count, "message_count": len(message_history),
+            }, turn=turn_count)
             assistant_response_text, should_break, tool_calls = await self._handle_llm_call(
                 system_prompt,
                 message_history,
@@ -473,6 +518,13 @@ class MainLoopRunner:
             _perf_llm_elapsed = time.perf_counter() - _perf_llm_start
             _perf_total_llm_time += _perf_llm_elapsed
             self.task_log.append_perf("llm_call_durations", _perf_llm_elapsed)
+            self._record_event("llm_response", {
+                "turn": turn_count,
+                "has_text": assistant_response_text is not None,
+                "has_tool_calls": bool(tool_calls and tool_calls != "context_limit"),
+                "should_break": should_break,
+            }, turn=turn_count, ref_event_id=_llm_event_id,
+                duration_ms=int(_perf_llm_elapsed * 1000))
 
             last_assistant_text = assistant_response_text or ""
             if assistant_response_text is not None:
@@ -634,6 +686,17 @@ class MainLoopRunner:
             all_tool_results_with_id = []
 
             if to_execute:
+                # Transcript: record each tool_use
+                _tool_event_ids = {}
+                for call in to_execute:
+                    eid = self._record_event("tool_use", {
+                        "tool_name": call.get("tool_name", ""),
+                        "server_name": call.get("server_name", ""),
+                        "arguments_preview": str(call.get("arguments", ""))[:200],
+                    }, turn=turn_count)
+                    if eid:
+                        _tool_event_ids[call.get("id", "")] = eid
+
                 _perf_tool_start = time.perf_counter()
                 modified_tool_calls = [to_execute, tool_calls[1] if len(tool_calls) > 1 else []]
                 all_tool_results_with_id = await self._execute_tools(
@@ -644,9 +707,40 @@ class MainLoopRunner:
                 self.task_log.append_perf("tool_batch_durations", _perf_tool_elapsed)
                 total_tool_calls_executed += len(to_execute)
 
+                # Transcript: record tool_results
+                for call_id, result in all_tool_results_with_id:
+                    result_text = result.get("text", "")[:100] if isinstance(result, dict) else str(result)[:100]
+                    self._record_event("tool_result", {
+                        "call_id": call_id,
+                        "result_preview": result_text,
+                    }, turn=turn_count, ref_event_id=_tool_event_ids.get(call_id))
+
+                # Deferred tools: 如果 tool_search 发现了新工具，更新 tool_definitions
+                # 注意：XML tool format 下工具描述在 system prompt 中，mid-run 发现新工具
+                # 不会自动更新 system prompt。tool_search 返回的完整 schema 已在 tool_result
+                # 消息中，LLM 可据此调用。Native tool format 无此限制。
+                if self.deferred_tool_manager and self.deferred_tool_manager.is_active:
+                    tool_definitions, _ = self.deferred_tool_manager.apply(
+                        self._current_tool_definitions
+                    )
+
             # 添加缓存结果（dedup 命中的）
             for call_id, cached_content in cached_results:
                 all_tool_results_with_id.append((call_id, cached_content))
+
+            # Tool result 配对完整性检查：确保每个 tool_use 都有对应 tool_result
+            all_call_ids = {c.get("id") for c in calls_to_execute if c.get("id")}
+            returned_ids = {rid for rid, _ in all_tool_results_with_id}
+            missing_ids = all_call_ids - returned_ids
+            if missing_ids:
+                logger.warning(
+                    f"[{self.agent_name}] Tool result integrity: {len(missing_ids)} missing results, "
+                    f"injecting synthetic errors for: {missing_ids}"
+                )
+                for mid in missing_ids:
+                    all_tool_results_with_id.append(
+                        (mid, {"type": "text", "text": "[Tool result missing due to internal error]"})
+                    )
 
             # 注册 tool results
             if to_execute and all_tool_results_with_id:
@@ -706,6 +800,13 @@ class MainLoopRunner:
                     self.llm_client.max_context_length,
                     llm_call_fn=self._context_summarize_call,
                 )
+
+            # Transcript: record compression
+            if action and action != "none":
+                self._record_event("compact", {
+                    "action": action,
+                    "message_count": len(message_history),
+                }, turn=turn_count)
 
             # Hook: on_context_compact — 压缩发生后通知业务层
             if action is not None:
@@ -801,6 +902,13 @@ class MainLoopRunner:
                     "reflection_checkpoint", f"Injected at turn {turn_count}", "info"
                 )
                 logger.debug(f"[Deep Research] Reflection checkpoint injected at turn {turn_count}")
+
+        # Transcript: agent end
+        self._record_event("agent_end", {
+            "task_failed": task_failed,
+            "turns_used": turn_counter.current_turn,
+            "total_tool_calls": total_tool_calls_executed,
+        })
 
         # Hook: on_agent_end
         self.hooks.call(
@@ -952,7 +1060,30 @@ class MainLoopRunner:
         builtin_results = []
         remaining_calls = []
         for call in calls_to_process:
-            if call["tool_name"] == "update_todo" and self.todo_tracker:
+            if call["tool_name"] == BUILTIN_TOOL_SEARCH and self.deferred_tool_manager:
+                query = call["arguments"].get("query", "")
+                max_results = call["arguments"].get("max_results", 5)
+                results = self.deferred_tool_manager.resolve_tool_search(query, max_results)
+                if results:
+                    result_lines = []
+                    for r in results:
+                        result_lines.append(
+                            f"**{r['tool_name']}** (server: {r['server_name']})\n"
+                            f"  Description: {r['description']}\n"
+                            f"  Schema: {_json.dumps(r['schema'], ensure_ascii=False)}"
+                        )
+                    result_text = (
+                        f"Found {len(results)} matching tools. "
+                        f"You can now call these tools directly:\n\n"
+                        + "\n\n".join(result_lines)
+                    )
+                else:
+                    result_text = f"No tools found matching '{query}'. Try different keywords."
+                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                    {"server_name": "builtin", "tool_name": BUILTIN_TOOL_SEARCH, "result": result_text}
+                )
+                builtin_results.append((call["id"], tool_result_for_llm))
+            elif call["tool_name"] == "update_todo" and self.todo_tracker:
                 logger.info(
                     f"[{self.agent_name}] Builtin: update_todo action={call['arguments'].get('action', '?')}"
                 )

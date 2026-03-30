@@ -15,6 +15,9 @@ RESULT_BRIEF_LENGTH = 200
 # Minimum chars in a message before it's worth compacting
 COMPACT_MIN_CHARS = 200
 
+# Minimum chars for microcompact to consider clearing (skip already-short messages)
+MICROCOMPACT_MIN_CHARS = 300
+
 # Default chars-per-token ratio (fallback when tiktoken unavailable)
 DEFAULT_CHARS_PER_TOKEN = 3.5
 
@@ -68,6 +71,7 @@ DEFAULT_RESULT_OFFLOAD_THRESHOLD = 5000
 # Built-in tool names
 BUILTIN_TOOL_UPDATE_TODO = "update_todo"
 BUILTIN_TOOL_SPAWN_AGENT = "spawn_agent"
+BUILTIN_TOOL_SEARCH = "tool_search"
 
 # Maximum nesting depth for spawned agents (prevents exponential resource consumption)
 MAX_SPAWN_DEPTH = 2
@@ -145,6 +149,7 @@ TAG_COLLECTED_SOURCES = "[COLLECTED SOURCES]"
 # Full format: "[CONTEXT SUMMARY — turns 1-N]"
 TAG_CONTEXT_SUMMARY = "[CONTEXT SUMMARY"
 TAG_CONTENT_REMOVED = "[Content removed to reduce context]"
+TAG_OFFLOADED = "[OFFLOADED:"  # prefix for offloaded content markers
 TAG_TASK_PROGRESS = "[TASK PROGRESS]"
 
 CONTEXT_COMPRESSION_NOTICE = (

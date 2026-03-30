@@ -529,3 +529,145 @@ class TestSourceRegistry:
         source_registry.reset()
         assert len(source_registry.get_all_sources()) == 0
         assert source_registry.get_citation_summary() == ""
+
+
+# ========== Microcompact 测试 ==========
+
+
+class TestMicrocompact:
+    @staticmethod
+    def _build_history(num_turns, content_size=500):
+        """构建模拟消息历史（assistant + user 交替）"""
+        history = [
+            {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
+        ]
+        for t in range(num_turns):
+            history.append({"role": "assistant", "content": f"assistant response turn {t + 1}"})
+            history.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "x" * content_size}],
+                }
+            )
+        return history
+
+    def test_clears_old_tool_results(self):
+        """microcompact 清理超过 keep_recent 的旧 tool_result"""
+        cm = ContextManager(ContextManagerConfig(compact_keep_recent=2))
+        history = self._build_history(5, content_size=500)
+
+        cleaned = cm.microcompact(history, current_turn=5, keep_recent=2)
+        assert cleaned > 0
+
+        # 旧轮次消息应被替换为占位符
+        for msg in history[1:]:
+            content = msg.get("content", "")
+            if isinstance(content, list) and content:
+                text = content[0].get("text", "")
+                if "[microcompact]" in text:
+                    assert "chars" in text or "cleared" in text
+
+    def test_preserves_recent_messages(self):
+        """microcompact 保留最近 keep_recent 轮的消息"""
+        cm = ContextManager(ContextManagerConfig())
+        history = self._build_history(5, content_size=500)
+
+        # 记录最后一轮的用户消息原文
+        last_user_content = history[-1]["content"]
+        if isinstance(last_user_content, list):
+            original_text = last_user_content[0]["text"]
+        else:
+            original_text = last_user_content
+
+        cm.microcompact(history, current_turn=5, keep_recent=3)
+
+        # 最后一轮的消息应保持不变
+        final_content = history[-1]["content"]
+        if isinstance(final_content, list):
+            final_text = final_content[0]["text"]
+        else:
+            final_text = final_content
+        assert final_text == original_text
+
+    def test_skips_system_messages(self):
+        """microcompact 跳过系统注入消息"""
+        cm = ContextManager(ContextManagerConfig())
+        history = [
+            {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
+            {"role": "assistant", "content": "response 1"},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "[REFLECTION CHECKPOINT] " + "x" * 500}],
+            },
+            {"role": "assistant", "content": "response 2"},
+            {"role": "user", "content": [{"type": "text", "text": "y" * 500}]},
+        ]
+
+        cleaned = cm.microcompact(history, current_turn=5, keep_recent=1)
+
+        # 系统消息 ([REFLECTION CHECKPOINT]) 应保持不变
+        reflection_msg = history[2]
+        content = reflection_msg["content"]
+        if isinstance(content, list):
+            text = content[0]["text"]
+        else:
+            text = content
+        assert "[REFLECTION CHECKPOINT]" in text
+        assert "[microcompact]" not in text
+
+    def test_skips_already_offloaded(self):
+        """microcompact 跳过已卸载的内容"""
+        cm = ContextManager(ContextManagerConfig())
+        history = [
+            {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
+            {"role": "assistant", "content": "response 1"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[OFFLOADED:/tmp/result.json|5000] summary here"}
+                ],
+            },
+            {"role": "assistant", "content": "response 2"},
+            {"role": "user", "content": [{"type": "text", "text": "z" * 500}]},
+        ]
+
+        cleaned = cm.microcompact(history, current_turn=5, keep_recent=1)
+
+        # 已卸载消息应保持不变
+        offloaded_msg = history[2]
+        content = offloaded_msg["content"]
+        if isinstance(content, list):
+            text = content[0]["text"]
+        else:
+            text = content
+        assert "[OFFLOADED:" in text
+        assert "[microcompact]" not in text
+
+    def test_no_cleanup_when_cutoff_zero(self):
+        """current_turn <= keep_recent 时不清理"""
+        cm = ContextManager(ContextManagerConfig())
+        history = self._build_history(3, content_size=500)
+
+        cleaned = cm.microcompact(history, current_turn=3, keep_recent=5)
+        assert cleaned == 0
+
+    def test_skips_short_messages(self):
+        """短消息不被清理"""
+        cm = ContextManager(ContextManagerConfig())
+        history = [
+            {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
+            {"role": "assistant", "content": "resp 1"},
+            {"role": "user", "content": [{"type": "text", "text": "short"}]},  # too short
+            {"role": "assistant", "content": "resp 2"},
+            {"role": "user", "content": [{"type": "text", "text": "z" * 500}]},
+        ]
+
+        cleaned = cm.microcompact(history, current_turn=5, keep_recent=1)
+
+        # "short" message should not be touched (below MICROCOMPACT_MIN_CHARS)
+        msg2_content = history[2]["content"]
+        if isinstance(msg2_content, list):
+            text = msg2_content[0]["text"]
+        else:
+            text = msg2_content
+        assert text == "short"
