@@ -32,7 +32,7 @@ from typing import Any
 logger = logging.getLogger("mem_deep_research")
 
 # 占位符格式: [SECURE:field_name]
-SECURE_PLACEHOLDER_PATTERN = re.compile(r"\[SECURE:(\w+)\]")
+SECURE_PLACEHOLDER_PATTERN = re.compile(r"\[SECURE:([^\]]+)\]")
 SECURE_KEY = "_secure"
 
 

@@ -641,12 +641,14 @@ class Orchestrator:
         """获取工具定义（含内置工具 spawn_agent / update_todo）"""
         if not self.tool_definitions:
             tool_definitions = await self.main_agent_tool_manager.get_all_tool_definitions()
-            if getattr(self.cfg, "sub_agents", None):
-                tool_definitions += expose_sub_agents_as_tools(self.cfg.sub_agents)
         else:
             tool_definitions = list(self.tool_definitions)
 
-        # Inject built-in tools so they appear in system prompt
+        # 子 Agent 工具注入
+        if getattr(self.cfg, "sub_agents", None):
+            tool_definitions += expose_sub_agents_as_tools(self.cfg.sub_agents)
+
+        # 内置工具注入
         from mem_deep_research_core.core.main_loop import _get_spawn_agent_tool_definition
         from mem_deep_research_core.core.todo_tracker import TodoTracker
 

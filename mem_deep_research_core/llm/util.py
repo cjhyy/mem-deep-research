@@ -127,10 +127,16 @@ async def collect_openai_stream(
                     finish_reason = chunk.choices[0].finish_reason
     except TimeoutError:
         logger.warning("Stream timeout - connection may have stalled")
-        # 超时时仍然尝试发送已收集的内容
+        # 超时时仍然尝试发送已收集的内容（已收集到部分数据则继续，否则上抛）
+        if first_chunk is None:
+            raise
     except Exception as stream_error:
         logger.error(f"Error during stream iteration: {stream_error}")
-        # 出错时仍然尝试处理已收集的内容
+        # 没有收集到任何数据时必须上抛，否则调用方会拿到空/残缺响应却不知道出错
+        if first_chunk is None:
+            raise
+        # 已有部分数据：记录错误标记，继续尝试用已收集内容构建响应
+        finish_reason = "error"
 
     # 处理剩余的缓冲区内容
     if stream_message_callback is not None:

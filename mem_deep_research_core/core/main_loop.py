@@ -1067,23 +1067,9 @@ class MainLoopRunner:
 
                 agent_results = await asyncio.gather(
                     *[_run_one_agent(c) for c in agent_calls],
-                    return_exceptions=True,
                 )
 
-                for idx, item in enumerate(agent_results):
-                    if isinstance(item, Exception):
-                        failed_call = agent_calls[idx]
-                        logger.error(f"Sub-agent task failed unexpectedly: {item}")
-                        error_result = {
-                            "server_name": failed_call["server_name"],
-                            "tool_name": failed_call["tool_name"],
-                            "result": f"[Sub-agent Error] {type(item).__name__}: {str(item)[:500]}",
-                        }
-                        error_for_llm = self.output_formatter.format_tool_result_for_user(
-                            error_result
-                        )
-                        all_tool_results_with_id.append((failed_call["id"], error_for_llm))
-                        continue
+                for item in agent_results:
                     call_id, server_name, tool_name, sub_result = item
                     self.session_memory.add_sub_agent_result(
                         server_name,

@@ -317,14 +317,24 @@ class LLMProviderClientBase(ABC):
     def _filter_message_history(
         self, message_history: list[dict], keep_tool_result: int
     ) -> list[dict]:
-        """Filter message history, keep specified number of tool results"""
+        """Filter message history, keep specified number of tool results.
+
+        Always preserves the first user message (task description) to maintain context.
+        """
         if keep_tool_result == -1:
             return message_history
 
-        # Complex filtering logic can be implemented here
-        # For now, simply return the last keep_tool_result messages
         if keep_tool_result > 0 and len(message_history) > keep_tool_result:
-            return message_history[-keep_tool_result:]
+            # 保留首条 user 消息（任务描述）+ 最近 N 条消息
+            first_user_msg = None
+            for msg in message_history:
+                if msg.get("role") == "user":
+                    first_user_msg = msg
+                    break
+            tail = message_history[-keep_tool_result:]
+            if first_user_msg and first_user_msg not in tail:
+                return [first_user_msg] + tail
+            return tail
         return message_history
 
     def _format_response_for_log(self, response) -> dict:
@@ -399,7 +409,7 @@ class LLMProviderClientBase(ABC):
         Subclasses can override for provider-specific behavior.
         """
         if message_history and message_history[-1].get("role") == "user":
-            last_user_message = message_history.pop()
+            last_user_message = message_history[-1]  # 只读取不 pop，pop 由调用方负责
             content = last_user_message.get("content", "")
             if isinstance(content, list) and content:
                 text = (

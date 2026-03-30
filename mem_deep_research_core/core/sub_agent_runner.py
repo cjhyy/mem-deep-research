@@ -229,19 +229,21 @@ class SubAgentRunner:
                 logger.warning(
                     f"[SubAgent] No tool manager for '{sub_agent_name}', running without tools"
                 )
-            tool_executor = ToolExecutor(
-                tool_manager=tool_manager,
-                output_formatter=self.output_formatter,
-                tool_result_formatter=ToolResultFormatter(self.context),
-                context=self.context,
-                stream_tool_call=self.stream_handler.stream_tool_call
-                if self.stream_handler
-                else None,
-                stream_tool_reasoning=self.stream_tool_reasoning,
-                stream_usage_info=self.stream_handler.stream_usage_info
-                if self.stream_handler
-                else None,
-            )
+                tool_executor = None
+            else:
+                tool_executor = ToolExecutor(
+                    tool_manager=tool_manager,
+                    output_formatter=self.output_formatter,
+                    tool_result_formatter=ToolResultFormatter(self.context),
+                    context=self.context,
+                    stream_tool_call=self.stream_handler.stream_tool_call
+                    if self.stream_handler
+                    else None,
+                    stream_tool_reasoning=self.stream_tool_reasoning,
+                    stream_usage_info=self.stream_handler.stream_usage_info
+                    if self.stream_handler
+                    else None,
+                )
 
             llm_handler = LLMCallHandler(
                 main_llm_client=self.sub_agent_llm_client,
@@ -460,6 +462,13 @@ class SubAgentRunner:
         except Exception as e:
             logger.error(f"Spawned agent '{display_name}' failed: {e}", exc_info=True)
             return f"[Spawn Error] {display_name} failed: {str(e)[:500]}"
+        finally:
+            if message_history:
+                session_key = f"spawn_{display_name}"
+                self.task_log.sub_agent_message_history_sessions[session_key] = {
+                    "system_prompt": system_prompt,
+                    "message_history": message_history,
+                }
 
 
 def _make_noop_async():

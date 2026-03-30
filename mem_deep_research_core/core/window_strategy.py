@@ -543,7 +543,7 @@ class LLMSummarizeStrategy(WindowStrategy):
             if role == "assistant":
                 estimated_turn += 1
 
-            if estimated_turn > 0 and estimated_turn <= cutoff_turn:
+            if estimated_turn <= cutoff_turn:
                 old_messages.append(msg)
                 old_indices.append(i)
             elif estimated_turn > cutoff_turn:

@@ -1,3 +1,4 @@
+import contextvars
 import dataclasses
 import os
 
@@ -9,6 +10,14 @@ from mem_deep_research_core.mem_deep_research_logging.logger import (
 
 LOGGER_LEVEL = os.getenv("LOGGER_LEVEL", "INFO")
 logger = bootstrap_logger(level=LOGGER_LEVEL)
+
+# 使用 contextvars 替代实例变量，消除并发竞态
+_pending_tool_list_var: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "_pending_tool_list", default=None
+)
+_native_tool_name_map_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "_native_tool_name_map", default=None
+)
 
 
 @dataclasses.dataclass
@@ -25,11 +34,10 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
         stream_message_callback=None,
     ):
         """Override to inject native tool_calls list into params via _customize_params."""
-        # Pre-compute tool list and store for _customize_params to pick up.
-        # Use a local-then-instance pattern: compute locally, assign just before super() call,
-        # and clear after. This minimizes (but does not eliminate) the concurrency window.
         tool_list, name_map = await self.convert_tool_definition_to_tool_call(tools_definitions)
-        self._pending_tool_list = tool_list
+        token1 = _pending_tool_list_var.set(tool_list)
+        token2 = _native_tool_name_map_var.set(name_map)
+        # 同步设置实例变量供 process_llm_response 中的 name_map 查找使用
         self._native_tool_name_map = name_map
         try:
             return await super()._create_message(
@@ -40,11 +48,12 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
                 stream_message_callback,
             )
         finally:
-            self._pending_tool_list = None
+            _pending_tool_list_var.reset(token1)
+            _native_tool_name_map_var.reset(token2)
 
     def _customize_params(self, params: dict) -> dict:
         params["stream"] = False
-        pending = getattr(self, "_pending_tool_list", None)
+        pending = _pending_tool_list_var.get(None)
         if pending:
             params["tools"] = pending
         return params
@@ -99,7 +108,7 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
         """Extract tool call information - from response object for tool_calls finish_reason."""
         from mem_deep_research_core.utils.parsing_utils import parse_llm_response_for_tool_calls
 
-        name_map = getattr(self, "_native_tool_name_map", None)
+        name_map = _native_tool_name_map_var.get(None) or getattr(self, "_native_tool_name_map", None)
 
         if llm_response.choices[0].finish_reason == "tool_calls":
             return parse_llm_response_for_tool_calls(
