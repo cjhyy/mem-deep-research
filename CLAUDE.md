@@ -19,11 +19,20 @@ mem_deep_research_core/              # 框架核心代码
 │   ├── hooks.py                     # 钩子系统（HookRegistry, HookContext）
 │   ├── secure_context.py            # 隐私数据保护（_secure 字段 → 占位符）
 │   ├── tool_executor.py             # 工具执行器
+│   ├── tool_result_formatter.py     # 工具结果格式化
 │   ├── llm_call_handler.py          # LLM 调用 + 重试 + 摘要生成
 │   ├── sub_agent_runner.py          # 子 Agent（复用 MainLoopRunner，隔离上下文）
 │   ├── stream_handler.py            # SSE 流式输出
 │   ├── monitoring.py                # 执行监控 + 循环检测
 │   ├── task_planner.py              # LLM 任务分解（模板化）
+│   ├── memory.py                    # 记忆系统（SessionMemory + LongTermMemory）
+│   ├── todo_tracker.py              # 任务追踪（内置 update_todo 工具）
+│   ├── pipeline.py                  # 任务执行 Pipeline（组件初始化 + 错误处理）
+│   ├── agent_factory.py             # Agent 工厂（统一创建 Orchestrator/LLM/ToolManager）
+│   ├── deferred_tools.py            # 延迟工具加载（工具数超阈值时仅暴露名称+描述）
+│   ├── input_compiler.py            # 输入编译链（URL 提取 + @file 展开 + on_query_compile hook）
+│   ├── transcript.py                # 结构化事件日志（UUID + 类型 + 时间戳，JSONL 导出）
+│   ├── message_utils.py             # 消息历史纯函数（提取工具名、hash/去重）
 │   ├── message_interceptor.py       # 消息拦截
 │   ├── user_context.py              # 用户上下文构建（可选工具类，通过 hook 注入）
 │   ├── answer_handler.py            # 最终答案后处理
@@ -42,10 +51,16 @@ mem_deep_research_core/              # 框架核心代码
 │   ├── matcher.py                   # 规则匹配 + 注入
 │   ├── llm_selector.py              # LLM Skill 选择
 │   └── inline_selector.py           # Inline Skill 选择（零额外开销）
-└── utils/
-    ├── external_loader.py           # 配置加载器（全局 config_loader/external_loader）
-    ├── tool_utils.py                # 工具辅助
-    └── stream_parsing_utils.py      # 流式解析（StructuredTagExtractor, TextInterceptor）
+├── utils/
+│   ├── external_loader.py           # 配置加载器（全局 config_loader/external_loader）
+│   ├── tool_utils.py                # 工具辅助
+│   ├── parsing_utils.py             # JSON 解析工具（智能截断、JSON5 支持）
+│   ├── io_utils.py                  # 输入输出工具（用户输入处理、文件引用）
+│   ├── summary_utils.py             # 摘要生成工具
+│   └── stream_parsing_utils.py      # 流式解析（StructuredTagExtractor, TextInterceptor）
+└── mem_deep_research_logging/       # 日志基础设施
+    ├── logger.py                    # Bootstrap logger（级别控制）
+    └── task_tracer.py               # 任务执行追踪（StepRecord 结构化日志）
 config/                              # 框架默认配置
 ├── agent_example.yaml               # Agent 配置示例
 ├── tool/                            # 内置工具配置 YAML

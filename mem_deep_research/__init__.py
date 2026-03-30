@@ -17,7 +17,7 @@ Usage:
     # Programmatic configuration
     dr = DeepResearch(
         llm_provider="anthropic",
-        model="claude-3-5-sonnet-20241022",
+        model="claude-sonnet-4-20250514",
         api_key="your-api-key",
     )
     result = await dr.run("Your task")
@@ -35,5 +35,5 @@ CLI:
 
 from mem_deep_research_core.deep_research import DeepResearch, TaskResult
 
-__version__ = "1.0.1"
+__version__ = "1.0.4"
 __all__ = ["DeepResearch", "TaskResult", "__version__"]
