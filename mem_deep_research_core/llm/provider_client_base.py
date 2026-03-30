@@ -254,19 +254,22 @@ class LLMProviderClientBase(ABC):
     @staticmethod
     async def convert_tool_definition_to_tool_call(tools_definitions):
         tool_list = []
+        name_map = {}  # flat_name -> (server_name, tool_name)
         for server in tools_definitions:
             if "tools" in server and len(server["tools"]) > 0:
                 for tool in server["tools"]:
+                    flat_name = f"{server['name']}--{tool['name']}"
+                    name_map[flat_name] = (server["name"], tool["name"])
                     tool_def = {
                         "type": "function",
                         "function": {
-                            "name": f"{server['name']}-{tool['name']}",
+                            "name": flat_name,
                             "description": tool["description"],
                             "parameters": tool["schema"],
                         },
                     }
                     tool_list.append(tool_def)
-        return tool_list
+        return tool_list, name_map
 
     def close(self):
         """Close client connection (sync version)"""

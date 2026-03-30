@@ -89,7 +89,8 @@ class GPTOpenAIClient(LLMProviderClientBase):
 
         messages_copy = self._remove_tool_result_from_messages(messages, keep_tool_result)
 
-        tool_list = await self.convert_tool_definition_to_tool_call(tools_definitions)
+        tool_list, name_map = await self.convert_tool_definition_to_tool_call(tools_definitions)
+        self._native_tool_name_map = name_map
 
         try:
             # Set temperature=1 for reasoning models
@@ -251,9 +252,13 @@ class GPTOpenAIClient(LLMProviderClientBase):
         """Extract tool call information from OpenAI LLM response"""
         from mem_deep_research_core.utils.parsing_utils import parse_llm_response_for_tool_calls
 
+        name_map = getattr(self, "_native_tool_name_map", None)
+
         # For OpenAI, get tool calls directly from response object
         if llm_response.choices[0].finish_reason == "tool_calls":
-            return parse_llm_response_for_tool_calls(llm_response.choices[0].message.tool_calls)
+            return parse_llm_response_for_tool_calls(
+                llm_response.choices[0].message.tool_calls, name_map=name_map
+            )
         else:
             return [], []
 

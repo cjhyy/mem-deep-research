@@ -568,7 +568,22 @@ def _conservative_escape_fallback(raw_str):
         return raw_str
 
 
-def parse_llm_response_for_tool_calls(llm_response_content_text, _fix_depth: int = 0):
+def _resolve_native_tool_name(raw_name: str, name_map: dict | None) -> tuple[str, str] | None:
+    """Resolve a flat native function name to (server_name, tool_name).
+
+    Uses the lookup table when available; falls back to splitting on '--'.
+    Returns None if the name cannot be resolved.
+    """
+    if name_map and raw_name in name_map:
+        return name_map[raw_name]
+    if "--" in raw_name:
+        return tuple(raw_name.split("--", maxsplit=1))
+    return None
+
+
+def parse_llm_response_for_tool_calls(
+    llm_response_content_text, _fix_depth: int = 0, *, name_map: dict | None = None
+):
     """
     Parse tool_calls or <use_mcp_tool> tags from LLM response text.
     Returns a list containing tool call information.
@@ -581,10 +596,11 @@ def parse_llm_response_for_tool_calls(llm_response_content_text, _fix_depth: int
         for item in llm_response_content_text.get("output", []):
             if item.get("type") == "function_call":
                 raw_name = item.get("name", "")
-                if not raw_name or "-" not in raw_name:
+                resolved = _resolve_native_tool_name(raw_name, name_map)
+                if not resolved:
                     logger.warning(f"[Parse] Skipping function_call with invalid name: {raw_name}")
                     continue
-                server_name, tool_name = raw_name.rsplit("-", maxsplit=1)
+                server_name, tool_name = resolved
                 arguments_str = item.get("arguments")
                 try:
                     # Try to handle possible newlines and escape characters
@@ -626,10 +642,11 @@ def parse_llm_response_for_tool_calls(llm_response_content_text, _fix_depth: int
         bad_tool_calls = []
         for tool_call in llm_response_content_text:
             raw_name = getattr(tool_call.function, "name", "") or ""
-            if "-" not in raw_name:
+            resolved = _resolve_native_tool_name(raw_name, name_map)
+            if not resolved:
                 logger.warning(f"[Parse] Skipping tool_call with invalid name: {raw_name}")
                 continue
-            server_name, tool_name = raw_name.rsplit("-", maxsplit=1)
+            server_name, tool_name = resolved
             arguments_str = tool_call.function.arguments
 
             # Parse JSON string to dictionary

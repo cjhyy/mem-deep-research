@@ -28,8 +28,9 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
         # Pre-compute tool list and store for _customize_params to pick up.
         # Use a local-then-instance pattern: compute locally, assign just before super() call,
         # and clear after. This minimizes (but does not eliminate) the concurrency window.
-        tool_list = await self.convert_tool_definition_to_tool_call(tools_definitions)
+        tool_list, name_map = await self.convert_tool_definition_to_tool_call(tools_definitions)
         self._pending_tool_list = tool_list
+        self._native_tool_name_map = name_map
         try:
             return await super()._create_message(
                 system_prompt,
@@ -98,8 +99,12 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
         """Extract tool call information - from response object for tool_calls finish_reason."""
         from mem_deep_research_core.utils.parsing_utils import parse_llm_response_for_tool_calls
 
+        name_map = getattr(self, "_native_tool_name_map", None)
+
         if llm_response.choices[0].finish_reason == "tool_calls":
-            return parse_llm_response_for_tool_calls(llm_response.choices[0].message.tool_calls)
+            return parse_llm_response_for_tool_calls(
+                llm_response.choices[0].message.tool_calls, name_map=name_map
+            )
         else:
             return [], []
 
