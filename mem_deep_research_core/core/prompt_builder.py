@@ -76,7 +76,9 @@ class PromptBuilder:
     ) -> list[str] | None:
         """使用 LLM 选择相关 Skills
 
-        inline 模式下跳过此步骤（第一轮用规则匹配，后续轮次从回复中解析）。
+        inline 模式下：
+        - progressive=True（默认）：第一轮仅注入 catalog，不注入完整 skill
+        - progressive=False：第一轮用规则匹配 fallback 注入完整 skill
 
         Args:
             query: 用户查询（str 或 list）
@@ -85,8 +87,16 @@ class PromptBuilder:
         Returns:
             选中的 skill 名称列表，如果 LLM selector 不可用则返回 None
         """
-        # inline 模式：不做额外 LLM 调用，第一轮用规则匹配 fallback
+        # inline 模式：不做额外 LLM 调用
         if self.inline_skill_selector:
+            if self.inline_skill_selector._first_turn and not self.inline_skill_selector.progressive:
+                # 传统模式第一轮：用规则匹配返回 skill 名称
+                tool_names = [t.get("name", "") for t in tool_definitions if isinstance(t, dict)]
+                query_text = query if isinstance(query, str) else str(query)
+                return self.inline_skill_selector.get_first_turn_injection(
+                    query=query_text, context=self.context, tools=tool_names
+                )
+            # progressive 模式或非第一轮：catalog 已在 prompt 中，等 LLM 声明
             return None
 
         try:
@@ -133,7 +143,7 @@ class PromptBuilder:
 
         # 注入 Skills（仅在 skill_selection.enabled 时）
         skill_cfg = self.cfg.main_agent.get("skill_selection", {})
-        skill_enabled = skill_cfg.get("enabled", True) if skill_cfg else True
+        skill_enabled = skill_cfg.get("enabled", True) if skill_cfg is not None else True
         if not skill_enabled:
             pass  # skill_selection.enabled=false — 跳过所有 skill 注入
         elif self.inline_skill_selector:
@@ -142,6 +152,15 @@ class PromptBuilder:
             if catalog_prompt:
                 system_prompt += catalog_prompt
                 logger.debug("Inline skill catalog appended to system prompt")
+            # 非渐进模式第一轮：同时注入规则匹配到的完整 skill 内容
+            if selected_skill_names:
+                system_prompt = self.inline_skill_selector.injector.inject_selected_skills(
+                    base_prompt=system_prompt,
+                    skill_names=selected_skill_names,
+                )
+                logger.debug(
+                    f"Inline legacy first-turn skills injected: {selected_skill_names}"
+                )
         else:
             skill_injector = external_loader.get_skill_injector()
             if skill_injector and initial_user_content:

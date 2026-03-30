@@ -51,12 +51,13 @@ from mem_deep_research_core.utils.tool_utils import expose_sub_agents_as_tools
 
 from mem_deep_research_core.core.constants import (
     DEFAULT_SCRAPE_MAX_LENGTH,
-    FALLBACK_LOOP_TERMINATED,
-    RECENT_TOOL_LOOKBACK,
-    SYSTEM_MESSAGE_KEYWORDS,
     ensure_dict,
     generate_message_id,
     parse_bool_config,
+)
+from mem_deep_research_core.core.message_utils import (
+    deduplicate_trailing_messages,
+    extract_recent_tool_names,
 )
 
 
@@ -161,6 +162,8 @@ class Orchestrator:
         # chinese_context 内部标志：当 response_language 明确为 Chinese 时为 True
         self.chinese_context = self.response_language == "Chinese"
 
+        self.execution_mode = self.cfg.main_agent.get("execution_mode", "auto")
+
         self.add_message_id = parse_bool_config(self.cfg.main_agent.get("add_message_id", False))
         logger.info(f"add_message_id: {self.add_message_id}")
 
@@ -182,8 +185,8 @@ class Orchestrator:
     def _init_modules(self):
         """初始化各个组合模块"""
         self._init_stream_and_interceptor()
+        self._init_llm_and_summary()  # Before monitoring_and_tools (SubAgentRunner needs handlers)
         self._init_monitoring_and_tools()
-        self._init_llm_and_summary()
         self._init_skills_and_prompt()
         self._init_context_manager()
         self.current_agent_id: str | None = None
@@ -263,8 +266,8 @@ class Orchestrator:
             response_language=self.response_language,
             stream_handler=self.stream_handler,
             stream_tool_reasoning=self._stream_tool_reasoning,
-            handle_llm_call=self._handle_llm_call_with_logging,
-            handle_summary=self._handle_summary_with_context_limit_retry,
+            handle_llm_call=self.llm_handler.handle_llm_call,
+            handle_summary=self.summary_handler.handle_summary_with_retry,
             intercept_key_message=self._intercept_key_message,
             streaming_final_message=self._streaming_final_message,
         )
@@ -300,6 +303,14 @@ class Orchestrator:
         )
         self.task_planner = TaskPlanner(enabled=planning_enabled)
 
+        # TodoTracker — enabled via todo_tracker.enabled or deep_research.enabled
+        from mem_deep_research_core.core.todo_tracker import TodoTracker
+        todo_enabled = self.cfg.main_agent.get("todo_tracker", {}).get("enabled", False)
+        if not todo_enabled:
+            # Fallback: enable with deep_research
+            todo_enabled = dr_cfg and dr_cfg.get("enabled", False) if dr_cfg else False
+        self.todo_tracker = TodoTracker(enabled=todo_enabled)
+
         # Inline Skill Selector
         self.inline_skill_selector = external_loader.get_inline_skill_selector(
             self.cfg, chinese=self.chinese_context
@@ -330,114 +341,22 @@ class Orchestrator:
         if hasattr(self.llm_client, "_estimate_tokens"):
             self.context_manager.set_token_estimator(self.llm_client._estimate_tokens)
 
-    @staticmethod
-    def _extract_recent_tool_names(message_history: list, lookback: int = RECENT_TOOL_LOOKBACK) -> list:
-        """从最近消息中提取 tool_use 的 name 列表"""
-        names = []
-        for msg in message_history[-lookback:]:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        name = block.get("name")
-                        if name and name not in names:
-                            names.append(name)
-        return names
+        # Offload dir: use config if set, otherwise default to output_dir/offloaded_results
+        offload_dir = cm_cfg_dict.get("result_offload_dir", "")
+        if not offload_dir:
+            output_dir = self.cfg.get("output_dir", "logs/")
+            offload_dir = os.path.join(output_dir, "offloaded_results")
+        self.context_manager.set_offload_dir(offload_dir)
 
-    @staticmethod
-    def _deduplicate_trailing_messages(message_history: list) -> int:
-        """移除消息历史末尾重复的 assistant 响应，保留第一次出现。
+        # Long-term memory (optional, persists across sessions)
+        from mem_deep_research_core.core.memory import LongTermMemory
+        output_dir = self.cfg.get("output_dir", "logs/")
+        memory_dir = os.path.join(output_dir, "memory")
+        self.long_term_memory = LongTermMemory(storage_path=memory_dir)
 
-        当循环检测终止时，message_history 可能包含多轮相同的 assistant 响应，
-        这会导致摘要 LLM 困惑或生成空内容。此方法从末尾向前扫描，
-        移除连续重复的 assistant 消息（基于文本内容 hash），
-        并在末尾追加一条说明，引导摘要 LLM 基于已有信息作答。
-
-        Returns:
-            int: 移除的消息数量
-        """
-        if len(message_history) < 4:
-            return 0
-
-        def _text_hash(msg: dict) -> int:
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                texts = [
-                    item.get("text", "")
-                    for item in content
-                    if isinstance(item, dict) and item.get("type") == "text"
-                ]
-                text = "".join(texts)
-            elif isinstance(content, str):
-                text = content
-            else:
-                text = str(content)
-            return hash(text[:500]) if text else 0
-
-        # 从末尾收集连续 assistant 消息的 hash
-        i = len(message_history) - 1
-        tail_hashes = []
-        while i >= 0 and message_history[i].get("role") == "assistant":
-            tail_hashes.append((i, _text_hash(message_history[i])))
-            i -= 1
-            # 跳过中间的 user 消息（如 INJECT_HINT）
-            if i >= 0 and message_history[i].get("role") == "user":
-                content_str = str(message_history[i].get("content", ""))
-                if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
-                    i -= 1
-
-        if len(tail_hashes) < 2:
-            return 0
-
-        # 找出重复 hash 的索引，保留最早的一个
-        seen_hashes = {}
-        indices_to_remove = []
-        for idx, h in reversed(tail_hashes):  # 从前往后遍历
-            if h in seen_hashes:
-                indices_to_remove.append(idx)
-            else:
-                seen_hashes[h] = idx
-
-        if not indices_to_remove:
-            return 0
-
-        # 同时移除紧跟在被删 assistant 消息后面的 INJECT_HINT user 消息
-        all_remove = set(indices_to_remove)
-        for idx in indices_to_remove:
-            # 检查 idx+1 和 idx-1 是否为注入的指令消息
-            for neighbor in (idx + 1, idx - 1):
-                if 0 <= neighbor < len(message_history) and neighbor not in all_remove:
-                    msg = message_history[neighbor]
-                    if msg.get("role") == "user":
-                        content_str = str(msg.get("content", ""))
-                        if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
-                            all_remove.add(neighbor)
-
-        # 按索引从大到小移除
-        for idx in sorted(all_remove, reverse=True):
-            if idx < len(message_history):
-                message_history.pop(idx)
-
-        removed = len(all_remove)
-        if removed > 0:
-            # 追加引导消息，帮助摘要 LLM 生成有效输出
-            message_history.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": FALLBACK_LOOP_TERMINATED,
-                        }
-                    ],
-                }
-            )
-            logger.info(
-                f"[DEDUP] Removed {removed} duplicate/injected messages from history tail, "
-                f"history now {len(message_history)} messages"
-            )
-
-        return removed
+    # Static utilities delegated to message_utils (backward compat)
+    _extract_recent_tool_names = staticmethod(extract_recent_tool_names)
+    _deduplicate_trailing_messages = staticmethod(deduplicate_trailing_messages)
 
     def _load_interceptor_config(self) -> InterceptorConfig:
         """从配置文件加载拦截器配置"""
@@ -583,55 +502,8 @@ class Orchestrator:
 
     # ========== LLM 调用处理 ==========
 
-    async def _handle_llm_call_with_logging(
-        self,
-        system_prompt,
-        message_history,
-        tool_definitions,
-        step_id: int,
-        purpose: str = "LLM call",
-        keep_tool_result: int = -1,
-        agent_type: str = "main",
-        stream_message_callback: Callable = None,
-    ) -> tuple[str | None, bool, Any | None]:
-        """统一的 LLM 调用和日志处理，委托给 LLMCallHandler"""
-        return await self.llm_handler.handle_llm_call(
-            system_prompt=system_prompt,
-            message_history=message_history,
-            tool_definitions=tool_definitions,
-            step_id=step_id,
-            purpose=purpose,
-            agent_type=agent_type,
-            stream_message_callback=stream_message_callback,
-        )
-
-    async def _handle_summary_with_context_limit_retry(
-        self,
-        system_prompt,
-        agent_prompt_instance,
-        message_history,
-        tool_definitions,
-        purpose,
-        task_description,
-        task_failed,
-        agent_type="main",
-        task_guidance="",
-        stream_message_callback: Callable = None,
-        **kwargs,
-    ):
-        """处理摘要生成，委托给 SummaryHandler"""
-        return await self.summary_handler.handle_summary_with_retry(
-            system_prompt=system_prompt,
-            agent_prompt_instance=agent_prompt_instance,
-            message_history=message_history,
-            tool_definitions=tool_definitions,
-            purpose=purpose,
-            task_description=task_description,
-            task_failed=task_failed,
-            agent_type=agent_type,
-            task_guidance=task_guidance,
-            stream_message_callback=stream_message_callback,
-        )
+    # _handle_llm_call_with_logging and _handle_summary_with_context_limit_retry
+    # removed — handlers are now injected directly into MainLoopContext.
 
     # ========== 子 Agent 运行 ==========
 
@@ -752,13 +624,24 @@ class Orchestrator:
         return message_history
 
     async def _get_tool_definitions(self) -> list:
-        """获取工具定义"""
+        """获取工具定义（含内置工具 spawn_agent / update_todo）"""
         if not self.tool_definitions:
             tool_definitions = await self.main_agent_tool_manager.get_all_tool_definitions()
-            if self.cfg.sub_agents is not None and self.cfg.sub_agents:
+            if getattr(self.cfg, "sub_agents", None):
                 tool_definitions += expose_sub_agents_as_tools(self.cfg.sub_agents)
         else:
-            tool_definitions = self.tool_definitions
+            tool_definitions = list(self.tool_definitions)
+
+        # Inject built-in tools so they appear in system prompt
+        from mem_deep_research_core.core.main_loop import _get_spawn_agent_tool_definition
+        from mem_deep_research_core.core.todo_tracker import TodoTracker
+
+        effective_mode = self.cfg.main_agent.get("execution_mode", "auto")
+        if effective_mode != "flash":
+            tool_definitions.append(_get_spawn_agent_tool_definition())
+
+        if self.todo_tracker and self.todo_tracker.enabled:
+            tool_definitions.append(TodoTracker.get_tool_definition())
 
         if not tool_definitions:
             logger.debug("Warning: No tool definitions found.")
@@ -785,13 +668,17 @@ class Orchestrator:
             context=self.context,
             chinese_context=self.chinese_context,
             response_language=self.response_language,
-            handle_llm_call=self._handle_llm_call_with_logging,
-            handle_summary=self._handle_summary_with_context_limit_retry,
+            execution_mode=self.execution_mode,
+            todo_tracker=self.todo_tracker,
+            handle_llm_call=self.llm_handler.handle_llm_call,
+            handle_summary=self.summary_handler.handle_summary_with_retry,
             intercept_key_message=self._intercept_key_message,
             streaming_final_message=self._streaming_final_message,
             stream_tool_reasoning=self._stream_tool_reasoning,
             extract_recent_tool_names=self._extract_recent_tool_names,
             deduplicate_trailing_messages=self._deduplicate_trailing_messages,
+            long_term_memory=self.long_term_memory,
+            hooks=hooks,
         )
         return MainLoopRunner(ctx)
 

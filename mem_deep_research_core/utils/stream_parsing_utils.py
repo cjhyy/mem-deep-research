@@ -30,6 +30,9 @@ class StructuredTagExtractor:
         "think",
     ]
 
+    # Safety limit: flush buffer if it grows beyond this size without finding matching tags
+    MAX_BUFFER_SIZE = 1_000_000  # 1MB
+
     def __init__(self, reasoning_tags: list[str] = None):
         """
         初始化标签提取器
@@ -60,6 +63,13 @@ class StructuredTagExtractor:
         4. 只输出确定不在标签内的文本
         """
         self.buffer += text
+
+        # Safety: if buffer grows too large without finding tags, flush it
+        if len(self.buffer) > self.MAX_BUFFER_SIZE:
+            flushed = self.buffer
+            self.buffer = ""
+            return flushed, []
+
         reasoning_blocks: list[ReasoningBlock] = []
         output_parts = []
 

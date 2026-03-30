@@ -131,7 +131,10 @@ def create_mcp_server_parameters(
 
     blacklist = set()
     for black_list_item in agent_cfg.get("tool_blacklist", []):
-        blacklist.add((black_list_item[0], black_list_item[1]))
+        if isinstance(black_list_item, (list, tuple)) and len(black_list_item) >= 2:
+            blacklist.add((black_list_item[0], black_list_item[1]))
+        else:
+            logger.warning(f"[ToolUtils] Invalid blacklist entry (expected [server, tool]): {black_list_item}")
     return configs, blacklist
 
 

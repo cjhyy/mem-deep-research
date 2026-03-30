@@ -210,9 +210,58 @@ sub_agents:
     max_turns: 10
 ```
 
-不配置 `sub_agents` 时，主 Agent 独立完成所有任务。
+不配置 `sub_agents` 时，框架自动提供内置 `spawn_agent` 工具，LLM 可随时 spawn 临时子 Agent（继承主 Agent 的 LLM + 工具）。并发限制由 `max_concurrent_subagents` 控制（默认 3）。
 
-### 5. 语言控制
+### 5. 执行模式
+
+```yaml
+main_agent:
+  execution_mode: auto         # auto | flash | standard | deep
+```
+
+| 模式 | 行为 |
+|------|------|
+| `auto`（默认） | deep_research 启用 → deep，否则 standard |
+| `flash` | 单轮 LLM，不调工具，直接回答 |
+| `standard` | 多轮循环，调用工具 |
+| `deep` | 多轮 + 反思检查点 + 可 spawn 子 Agent |
+
+### 6. 记忆系统 (`core/memory.py`)
+
+**SessionMemory（短期记忆）** — 单次运行内自动追踪：
+- `key_findings`: 从 LLM 回复中提取的关键发现
+- `attempted_strategies`: 已尝试的工具调用策略（避免重复）
+- `sub_agent_results`: 子 Agent 返回的结果
+- Context 压缩时 `[SESSION MEMORY]` 不会被裁掉
+
+**LongTermMemory（长期记忆）** — 跨 session 持久化：
+- JSON 文件存储，`recall()` / `store()` / `forget()` API
+- 每次运行开始自动 recall 相关记忆
+- 运行结束自动 store 关键发现
+
+### 7. 任务追踪 (`core/todo_tracker.py`)
+
+LLM 通过内置 `update_todo` 工具管理任务列表，独立于 message_history 存储。
+
+```yaml
+main_agent:
+  todo_tracker:
+    enabled: true              # 也会随 deep_research.enabled 自动启用
+```
+
+任务状态（pending → in_progress → completed）在每轮注入到 message_history，Context 压缩时 `[TASK PROGRESS]` 不会被裁掉。
+
+### 8. 中间结果卸载
+
+大块工具结果自动写到文件，message_history 只保留摘要引用：
+
+```yaml
+main_agent:
+  context_manager:
+    result_offload_threshold: 5000   # 超过 5000 字符卸载，0=禁用
+```
+
+### 9. 语言控制
 
 通过 `response_language` 配置控制回答语言：
 
@@ -230,7 +279,7 @@ main_agent:
 `chinese_context: true` 向后兼容，等同 `response_language: Chinese`。
 自定义检测逻辑可通过 `on_agent_start` hook 覆盖。
 
-### 6. Skill 系统 (`skills/`)
+### 10. Skill 系统 (`skills/`)
 
 三种选择方式（配置 `skill_selection.method`）：
 
@@ -240,14 +289,16 @@ main_agent:
 | `llm` | 额外 LLM 调用选择 | 一次轻量 LLM |
 | `inline` | LLM 在回复中声明 `<next_skills>` | 零 |
 
-### 7. 工具系统 (`tool/manager.py`)
+Skill 渐进加载（`progressive: true`，默认）：第一轮只注入 catalog（名称+描述），LLM 声明 `<next_skills>` 后按需加载完整内容。
+
+### 11. 工具系统 (`tool/manager.py`)
 
 基于 MCP 协议，支持三种传输：
 - **stdio**: 本地进程（`npx`, `python` 脚本）
 - **streamable-http**: HTTP 远程服务
 - **sse**: Server-Sent Events
 
-### 8. Prompt 系统 (`prompts/`)
+### 12. Prompt 系统 (`prompts/`)
 
 `AgentPrompt` 统一类，通过配置组合模板：
 
@@ -280,7 +331,11 @@ main_agent:
   max_tool_calls_per_turn: 10
   keep_tool_result: -1            # -1 全部保留, N 保留最近 N 个
   response_language: auto          # auto | Chinese | English | ...
+  execution_mode: auto             # auto | flash | standard | deep
+  max_concurrent_subagents: 3      # 最大并行子 Agent 数
   add_message_id: true
+  todo_tracker:
+    enabled: false                 # 也会随 deep_research.enabled 自动启用
   skill_selection:
     enabled: true
     method: inline                 # rules | llm | inline
@@ -292,6 +347,7 @@ main_agent:
     summarize_at_ratio: 0.8
     compact_keep_recent: 3
     max_dedup_cache_size: 200
+    result_offload_threshold: 5000  # 超过此字符数卸载到文件，0=禁用
   monitoring:
     enable_loop_detection: true
     loop_escalation_terminate_threshold: 3

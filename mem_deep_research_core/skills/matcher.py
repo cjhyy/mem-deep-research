@@ -278,7 +278,11 @@ class SkillMatcher:
         elif operator == "contains":
             return expected in str(ctx_value)
         elif operator == "regex":
-            return bool(re.search(expected, str(ctx_value)))
+            try:
+                return bool(re.search(expected, str(ctx_value)))
+            except re.error:
+                logger.warning(f"[SkillMatcher] Invalid regex pattern: {expected}")
+                return False
         elif operator == "gte":
             return ctx_value >= expected
         elif operator == "lte":

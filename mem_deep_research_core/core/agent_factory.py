@@ -419,7 +419,10 @@ async def run_agent(
         print(result.final_answer)
     """
     factory = AgentFactory.from_config_file(config_path, logs_dir)
-    return await factory.run(task, **kwargs)
+    try:
+        return await factory.run(task, **kwargs)
+    finally:
+        await factory.close()
 
 
 async def run_agent_from_project(
@@ -438,4 +441,7 @@ async def run_agent_from_project(
         TaskResult: 任务执行结果
     """
     factory = AgentFactory.from_project_dir(project_dir, config_name)
-    return await factory.run(task, **kwargs)
+    try:
+        return await factory.run(task, **kwargs)
+    finally:
+        await factory.close()

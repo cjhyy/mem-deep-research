@@ -3,8 +3,14 @@ Inline Skill 选择器
 
 让 LLM 在每轮回复中顺便输出下一轮需要的 skill，零额外开销。
 
-流程：
-1. 第一轮：用规则匹配兜底
+流程（progressive=True，默认）：
+1. 第一轮：仅注入 skill catalog（名称+描述，~10 tokens/skill）
+2. LLM 声明 <next_skills>skill1, skill2</next_skills>
+3. 下一轮：注入声明的 skill 的完整内容
+4. 如果 LLM 未声明任何 skill，不注入任何内容
+
+流程（progressive=False，传统模式）：
+1. 第一轮：用规则匹配兜底，注入完整 skill 内容
 2. 之后每轮：从 LLM 回复中解析 <next_skills> 标签
 3. 下一轮自动注入对应 skill 的 knowledge 到 system prompt
 
@@ -46,17 +52,23 @@ class InlineSkillSelector:
     # <next_skills> 标签名，用于 StructuredTagExtractor 提取
     TAG_NAME = "next_skills"
 
-    def __init__(self, matcher: SkillMatcher, chinese: bool = False):
+    def __init__(self, matcher: SkillMatcher, chinese: bool = False, progressive: bool = True):
         """
         Args:
             matcher: SkillMatcher 实例
             chinese: 是否使用中文提示
+            progressive: 是否启用渐进加载（默认 True）。
+                True: 第一轮仅注入 catalog，LLM 按需声明后再加载完整内容。
+                False: 第一轮用规则匹配注入完整 skill 内容（传统模式）。
         """
         self.matcher = matcher
         self.injector = SkillInjector(matcher)
         self.chinese = chinese
+        self.progressive = progressive
         # 当前轮 LLM 声明的下一轮 skill 名称
         self._pending_skills: list[str] = []
+        # 跟踪是否为第一轮（尚未收到任何 LLM 回复）
+        self._first_turn = True
 
     def build_skill_catalog_prompt(self) -> str:
         """
@@ -93,6 +105,31 @@ class InlineSkillSelector:
                 "<next_skills>skill_name_1, skill_name_2</next_skills>\n\n"
                 "If no skill is needed, do not output this tag.\n"
             )
+
+    def get_first_turn_injection(self, query: str, context: dict, tools: list[str]) -> list[str]:
+        """
+        第一轮 skill 注入策略。
+
+        progressive=True: 返回空列表（catalog 已在 system prompt 中，无需注入完整 skill）。
+        progressive=False: 用规则匹配兜底，返回匹配到的 skill 名称列表。
+
+        Args:
+            query: 用户查询
+            context: 上下文信息
+            tools: 计划使用的工具列表
+
+        Returns:
+            需要注入完整内容的 skill 名称列表
+        """
+        if self.progressive:
+            # 渐进模式：catalog 已在 system prompt 中，第一轮不注入完整 skill
+            return []
+        else:
+            # 传统模式：用规则匹配，返回匹配到的 skill 名称
+            matched = self.matcher.match(
+                query=query, context=context, tools_to_use=tools
+            )
+            return [s.name for s in matched]
 
     @staticmethod
     def parse_next_skills(text: str) -> list[str]:
@@ -153,6 +190,7 @@ class InlineSkillSelector:
             logger.info(f"[InlineSkill] Next turn skills: {valid_names}")
 
         self._pending_skills = valid_names
+        self._first_turn = False  # 收到 LLM 回复后不再是第一轮
         return valid_names
 
     def get_pending_skills(self) -> list[str]:
@@ -198,3 +236,4 @@ class InlineSkillSelector:
     def reset(self):
         """重置状态"""
         self._pending_skills = []
+        self._first_turn = True

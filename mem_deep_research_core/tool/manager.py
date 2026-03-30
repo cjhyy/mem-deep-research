@@ -365,7 +365,9 @@ class ToolManager(ToolManagerProtocol):
         result_content = ""
 
         if tool_result.content and len(tool_result.content) > 0:
-            text_content = tool_result.content[-1].text
+            # Safely access the last content item's text attribute
+            last_item = tool_result.content[-1]
+            text_content = getattr(last_item, "text", None)
             if text_content is not None and text_content.strip():
                 result_content = text_content
             else:
@@ -688,9 +690,13 @@ class ToolManager(ToolManagerProtocol):
                         # Session may be stale, invalidate and retry once
                         logger.warning(f"Connection error for '{server_name}', retrying with new session: {conn_err}")
                         await self._invalidate_session(server_name)
-                        session, _ = await self._get_or_create_session(server_name)
-                        tool_result = await session.call_tool(tool_name, arguments=enriched_arguments)
-                        result_content = self._extract_tool_result(tool_name, tool_result, arguments)
+                        try:
+                            session, _ = await self._get_or_create_session(server_name)
+                            tool_result = await session.call_tool(tool_name, arguments=enriched_arguments)
+                            result_content = self._extract_tool_result(tool_name, tool_result, arguments)
+                        except Exception as retry_err:
+                            logger.error(f"Retry also failed for '{server_name}/{tool_name}': {retry_err}")
+                            return {"server_name": server_name, "tool_name": tool_name, "error": f"Tool call failed after retry: {str(retry_err)}"}
                     except TimeoutError as tool_error:
                         logger.error(f"Tool execution timeout: {tool_error}")
                         return {"server_name": server_name, "tool_name": tool_name, "error": f"Tool execution timed out: {str(tool_error)}"}
@@ -729,34 +735,8 @@ class ToolManager(ToolManagerProtocol):
                     f"Error: Failed to call tool '{tool_name}' (server: '{server_name}'): {outer_e}"
                 )
 
-                # Store the original error message for later use
-                error_message = str(outer_e)
-
-                if (
-                    tool_name == "scrape"
-                    and "unhandled errors" in error_message
-                    and "url" in arguments
-                    and arguments["url"] is not None
-                ):
-                    try:
-                        logger.info("Attempting to use MarkItDown for fallback...")
-                        from markitdown import MarkItDown
-
-                        md = MarkItDown(docintel_endpoint="<document_intelligence_endpoint>")
-                        result = md.convert(arguments["url"])
-                        logger.info("Successfully used MarkItDown")
-                        return {
-                            "server_name": server_name,
-                            "tool_name": tool_name,
-                            "result": result.text_content,  # Return extracted text content
-                        }
-                    except Exception as inner_e:  # Use a different name to avoid shadowing
-                        # Log the inner exception if needed
-                        logger.error(f"Fallback also failed: {inner_e}")
-
-                # Always use the outer exception for the final error response
                 return {
                     "server_name": server_name,
                     "tool_name": tool_name,
-                    "error": f"Tool call failed: {error_message}",
+                    "error": f"Tool call failed: {str(outer_e)}",
                 }

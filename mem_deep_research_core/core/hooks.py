@@ -202,7 +202,7 @@ class HookRegistry:
             # 没有注册钩子，直接执行默认逻辑
             return default_fn(ctx)
 
-        # 构建调用链
+        # 构建调用链（每个用户钩子包裹 try-except，避免一个坏钩子终止整个运行）
         def build_chain(remaining_hooks, final_fn):
             if not remaining_hooks:
                 return final_fn
@@ -211,7 +211,17 @@ class HookRegistry:
             next_fn = build_chain(remaining_hooks[1:], final_fn)
 
             def chain_fn(c: HookContext):
-                return current_hook(c, next_fn)
+                try:
+                    return current_hook(c, next_fn)
+                except Exception as e:
+                    hook_label = getattr(current_hook, "__name__", repr(current_hook))
+                    logger.error(
+                        f"[Hooks] Hook '{hook_name}' ({hook_label}) raised {type(e).__name__}: {e}. "
+                        f"Falling through to next handler.",
+                        exc_info=True,
+                    )
+                    # Fall through to next hook / default
+                    return next_fn(c)
 
             return chain_fn
 

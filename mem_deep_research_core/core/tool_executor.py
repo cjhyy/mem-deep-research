@@ -269,10 +269,14 @@ class ToolExecutor:
             )
 
         for call in tool_calls[:max_tool_calls]:
-            server_name = call["server_name"]
-            tool_name = call["tool_name"]
-            arguments = call["arguments"]
-            call_id = call["id"]
+            try:
+                server_name = call["server_name"]
+                tool_name = call["tool_name"]
+                arguments = call["arguments"]
+                call_id = call["id"]
+            except (KeyError, TypeError) as e:
+                logger.error(f"[ToolExecutor] Malformed tool call, missing key: {e}. Call: {call}")
+                continue
 
             tool_result, call_duration_ms = await self.execute_single_tool(
                 server_name=server_name,

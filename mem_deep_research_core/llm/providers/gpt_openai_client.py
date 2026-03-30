@@ -162,15 +162,20 @@ class GPTOpenAIClient(LLMProviderClientBase):
         is_async: bool,
         stream_message_callback: Callable | None = None,
     ):
-        """Handles the logic for oai_tool_thinking."""
+        """Handles the logic for oai_tool_thinking.
+
+        Uses a copy of the messages list to avoid mutating the caller's state.
+        """
+        # Work on a copy so the caller's message list is not mutated
+        messages_copy = list(messages)
+
         # ---- Step 1: Let AI output text first, without calling tools ----
         params["tool_choice"] = "none"
         response = await self._create_completion(params, is_async, stream_message_callback)
 
         text_reply = response.choices[0].message.content
-        messages.append({"role": "assistant", "content": text_reply})
-        # We need a copy of messages for the second call.
-        params["messages"] = messages
+        messages_copy.append({"role": "assistant", "content": text_reply})
+        params["messages"] = messages_copy
 
         # ---- Step 2: Allow tool_call ----
         del params["tool_choice"]
@@ -180,9 +185,6 @@ class GPTOpenAIClient(LLMProviderClientBase):
             response_tool.choices[0].message.content = text_reply
             response = response_tool
 
-        # ---- Step 3: Pop text_reply ----
-        # Because the function outside will push response again
-        messages.pop()
         return response
 
     def process_llm_response(

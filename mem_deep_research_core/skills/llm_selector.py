@@ -185,6 +185,9 @@ class LLMSkillSelector:
             response_format={"type": "json_object"},
         )
 
+        if not response.choices:
+            logger.warning("LLM skill selection returned empty choices")
+            return []
         result = response.choices[0].message.content
         if not result or not result.strip():
             logger.warning("LLM skill selection returned empty result")

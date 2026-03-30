@@ -74,8 +74,8 @@ class LLMCallHandler:
                 if isinstance(content, list):
                     for content_item in content:
                         if content_item.get("type") == "text":
-                            text = content_item["text"]
-                            if not text.startswith("[msg_"):
+                            text = content_item.get("text", "")
+                            if text and not text.startswith("[msg_"):
                                 message_id = generate_message_id()
                                 content_item["text"] = f"[{message_id}] {text}"
                 elif isinstance(content, str) and not content.startswith("[msg_"):
@@ -422,7 +422,8 @@ class SummaryHandler:
             if message_history and message_history[-1]["role"] == "assistant":
                 message_history.pop()
 
-            task_failed = True
+            # Note: don't override task_failed here — summary retry is a context issue,
+            # not a task failure. The original task_failed value is preserved.
 
             # 检查是否只剩初始消息
             if len(message_history) <= 2:

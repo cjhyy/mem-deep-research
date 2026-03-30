@@ -43,7 +43,11 @@ class PlaywrightSession:
 
         logger.info(f"Calling tool '{tool_name}' with arguments: {arguments}")
         tool_result = await self.session.call_tool(tool_name, arguments=arguments)
-        result_content = tool_result.content[0].text if tool_result.content else ""
+        if tool_result.content:
+            first_item = tool_result.content[0]
+            result_content = getattr(first_item, "text", "") or ""
+        else:
+            result_content = ""
         return result_content
 
     async def close(self):

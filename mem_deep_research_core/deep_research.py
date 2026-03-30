@@ -126,6 +126,8 @@ class DeepResearch:
         # 输入/输出处理
         hint_generation: bool = False,
         final_answer_extraction: bool = False,
+        # Execution mode
+        execution_mode: str = "auto",
         # 高级配置
         config: DictConfig | None = None,
     ):
@@ -181,6 +183,7 @@ class DeepResearch:
                 interceptor_preset=interceptor_preset,
                 hint_generation=hint_generation,
                 final_answer_extraction=final_answer_extraction,
+                execution_mode=execution_mode,
             )
 
         # 验证配置
@@ -308,6 +311,7 @@ class DeepResearch:
         interceptor_preset: str,
         hint_generation: bool,
         final_answer_extraction: bool,
+        execution_mode: str = "auto",
     ) -> DictConfig:
         """构建配置"""
         # Default model per provider
@@ -383,6 +387,7 @@ class DeepResearch:
                 "max_turns": max_turns,
                 "max_tool_calls_per_turn": max_tool_calls_per_turn,
                 "keep_tool_result": -1,
+                "execution_mode": execution_mode,
                 "deep_research": {
                     "enabled": True,
                     "reflection_interval": 3,
@@ -469,8 +474,8 @@ class DeepResearch:
                 _turns = _perf.get("main_loop_turns", {}).get("value", 0)
                 _tool_calls = _perf.get("main_loop_tool_calls", {}).get("value", 0)
                 _checkpoints = _log_data.get("checkpoints", [])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[DeepResearch] Failed to parse log metrics: {e}")
 
         return ResearchResult(
             task_id=result.task_id,
@@ -552,8 +557,8 @@ class DeepResearch:
                     _turns = _perf.get("main_loop_turns", {}).get("value", 0)
                     _tool_calls = _perf.get("main_loop_tool_calls", {}).get("value", 0)
                     _checkpoints = _log_data.get("checkpoints", [])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[DeepResearch] Failed to parse log metrics: {e}")
             research_results.append(
                 ResearchResult(
                     task_id=r.task_id,

@@ -20,7 +20,13 @@ mem_deep_research_core/core/
 ├── task_planner.py          # 任务分解
 ├── message_interceptor.py   # 消息拦截
 ├── answer_handler.py        # 答案提取
-└── user_context.py          # 用户上下文构建
+├── user_context.py          # 用户上下文构建
+├── constants.py             # 框架常量 + 工具函数
+├── prompt_builder.py        # Prompt 构建（system prompt + skill 注入 + hint）
+├── memory.py                # SessionMemory + LongTermMemory
+├── todo_tracker.py          # TodoTracker 任务追踪
+├── message_utils.py         # 消息工具函数
+└── tool_result_formatter.py # 工具结果格式化
 ```
 
 ## Orchestrator — Agent 编排器
@@ -233,3 +239,72 @@ class SubAgentRunner:
 | `reasoning` | 推理过程事件 |
 | `usage_info` | 用量统计 |
 | `show_error` | 错误展示 |
+
+## Constants — 框架常量
+
+**文件**: `core/constants.py`
+
+所有硬编码值的单一来源（27+ 常量），包括：
+- Token 阈值和比例
+- 工具调用限制
+- 超时设置
+- 消息格式模板
+- 推理标签定义
+
+同时提供工具函数如 `generate_message_id()`、`reasoning_tags()` 等。
+
+## PromptBuilder — Prompt 构建
+
+**文件**: `core/prompt_builder.py`
+
+从 Orchestrator 中提取的 Prompt 构建逻辑，负责：
+- System Prompt 组装（基础模板 + 工具描述 + SecureContext）
+- Skill 内容注入
+- Hint 和 Guidance 追加
+- 语言指令注入
+
+```python
+class PromptBuilder:
+    def build_system_prompt(
+        self, tool_definitions, skills, context, response_language,
+    ) -> str:
+        """构建完整的 system prompt"""
+```
+
+## Memory — 记忆系统
+
+**文件**: `core/memory.py`
+
+双层记忆架构：
+
+| 类 | 作用域 | 持久化 |
+|----|--------|--------|
+| `SessionMemory` | 单次运行 | 否 |
+| `LongTermMemory` | 跨 session | 是（文件系统） |
+
+**SessionMemory** 自动追踪：
+- 关键发现 (findings)
+- 已使用的策略 (strategies)
+- 失败的尝试 (failed_attempts)
+
+**LongTermMemory** 跨 session 积累：
+- 领域知识
+- 有效策略模式
+- 常见错误规避
+
+## TodoTracker — 任务追踪
+
+**文件**: `core/todo_tracker.py`
+
+内置 `update_todo` 工具，LLM 可通过工具调用管理任务列表：
+
+特性：
+- 独立于 message_history，不受 context 压缩影响
+- 每轮自动注入当前任务状态到 context
+- 支持任务的创建、更新、完成标记
+
+## MessageUtils — 消息工具函数
+
+**文件**: `core/message_utils.py`
+
+消息处理相关的工具函数集合，提供消息格式化、ID 生成、内容提取等通用功能。

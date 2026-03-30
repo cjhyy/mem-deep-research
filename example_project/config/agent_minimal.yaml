@@ -1,5 +1,5 @@
-# 最小配置 — 快速测试用
-# 仅需 OPENROUTER_API_KEY
+# Minimal config — quick testing with calculator only
+# No deep research, no task tracking, 5 turns max
 
 main_agent:
   llm:
@@ -13,7 +13,9 @@ main_agent:
   tool_config:
     - tool-calculator
 
+  execution_mode: auto
   max_turns: 5
   max_tool_calls_per_turn: 3
+  response_language: auto
 
 output_dir: logs/

@@ -4,19 +4,82 @@
 演示如何创建自定义 MCP 工具供框架调用。
 """
 
+import ast
 import math
+import operator
 
 from fastmcp import FastMCP
 
 # 初始化 MCP 服务器
 mcp = FastMCP("calculator-server")
 
+# AST-safe 数学表达式求值器（替代 eval 以防止代码注入）
+_SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+_SAFE_FUNCTIONS = {
+    "sqrt": math.sqrt,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "log": math.log10,
+    "ln": math.log,
+    "exp": math.exp,
+    "abs": abs,
+    "pow": pow,
+    "round": round,
+    "min": min,
+    "max": max,
+}
+
+_SAFE_CONSTANTS = {
+    "pi": math.pi,
+    "e": math.e,
+}
+
+
+def _safe_eval_node(node: ast.AST) -> float | int:
+    """Recursively evaluate an AST node using only whitelisted operations."""
+    if isinstance(node, ast.Expression):
+        return _safe_eval_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in _SAFE_CONSTANTS:
+        return _SAFE_CONSTANTS[node.id]
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPERATORS:
+        return _SAFE_OPERATORS[type(node.op)](_safe_eval_node(node.operand))
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPERATORS:
+        return _SAFE_OPERATORS[type(node.op)](
+            _safe_eval_node(node.left), _safe_eval_node(node.right)
+        )
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in _SAFE_FUNCTIONS:
+            args = [_safe_eval_node(arg) for arg in node.args]
+            return _SAFE_FUNCTIONS[node.func.id](*args)
+        raise ValueError(f"不允许的函数调用: {ast.dump(node.func)}")
+    raise ValueError(f"不支持的表达式节点: {type(node).__name__}")
+
+
+def safe_eval_expression(expression: str) -> float | int:
+    """Parse and evaluate a math expression safely via AST."""
+    tree = ast.parse(expression, mode="eval")
+    return _safe_eval_node(tree)
+
 
 @mcp.tool()
 async def calculate(expression: str) -> str:
     """执行数学计算表达式。
 
-    支持基本运算 (+, -, *, /, **) 和数学函数 (sqrt, sin, cos, log 等)。
+    支持基本运算 (+, -, *, /, //, %, **) 和数学函数 (sqrt, sin, cos, log 等)。
 
     Args:
         expression: 数学表达式，如 "2 + 3 * 4" 或 "sqrt(16) + log(100)"
@@ -25,23 +88,7 @@ async def calculate(expression: str) -> str:
         计算结果
     """
     try:
-        # 安全的数学函数白名单
-        safe_dict = {
-            "sqrt": math.sqrt,
-            "sin": math.sin,
-            "cos": math.cos,
-            "tan": math.tan,
-            "log": math.log10,
-            "ln": math.log,
-            "exp": math.exp,
-            "abs": abs,
-            "pow": pow,
-            "pi": math.pi,
-            "e": math.e,
-        }
-
-        # 计算表达式
-        result = eval(expression, {"__builtins__": {}}, safe_dict)
+        result = safe_eval_expression(expression)
         return f"计算结果: {expression} = {result}"
     except Exception as e:
         return f"[ERROR]: 计算失败 - {str(e)}"

@@ -1,0 +1,142 @@
+# Agent with pre-configured sub-agents
+# Tests: main agent delegates to specialized sub-agents
+
+main_agent:
+  prompt:
+    agent_type: main
+    tool_format: xml
+    presets: [research]
+
+  llm:
+    provider_class: "ClaudeOpenRouterClient"
+    model_name: "anthropic/claude-sonnet-4.6"
+    async_client: true
+    temperature: 0.3
+    top_p: 1.0
+    min_p: 0.0
+    top_k: -1
+    max_tokens: 32000
+    timeout: 300
+    retry_max_attempts: 3
+    retry_strategy: "exponential"
+    retry_multiplier: 2
+    retry_wait_seconds: 5
+    openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
+    openrouter_base_url: "${oc.env:OPENROUTER_BASE_URL,https://openrouter.ai/api/v1}"
+    openrouter_provider: ""
+    enable_streaming: true
+    disable_cache_control: false
+    keep_tool_result: 5
+    oai_tool_thinking: false
+
+  tool_config:
+    - tool-calculator
+    - tool-searching-serper
+
+  keep_tool_result: -1
+  execution_mode: deep
+  max_turns: 20
+  max_tool_calls_per_turn: 10
+  max_concurrent_subagents: 2
+  response_language: auto
+
+  input_process:
+    hint_generation: false
+  output_process:
+    final_answer_extraction: false
+
+  todo_tracker:
+    enabled: true
+
+  deep_research:
+    enabled: true
+    reflection_interval: 5
+
+  skill_selection:
+    enabled: true
+    method: inline
+    max_skills: 3
+
+  context_manager:
+    enable_dedup: true
+    enable_compact: true
+    compact_at_ratio: 0.6
+    summarize_at_ratio: 0.8
+    compact_keep_recent: 3
+    result_offload_threshold: 5000
+
+  monitoring:
+    enable_loop_detection: true
+    loop_escalation_terminate_threshold: 3
+    max_total_time: 600.0
+
+  interceptor:
+    preset: default
+
+  add_message_id: true
+
+# Pre-configured sub-agents
+sub_agents:
+  agent-researcher:
+    prompt:
+      agent_type: worker
+      tool_format: xml
+    llm:
+      provider_class: "ClaudeOpenRouterClient"
+      model_name: "anthropic/claude-sonnet-4.6"
+      async_client: true
+      temperature: 0.3
+      top_p: 1.0
+      min_p: 0.0
+      top_k: -1
+      max_tokens: 16000
+      timeout: 300
+      retry_max_attempts: 3
+      retry_strategy: "exponential"
+      retry_multiplier: 2
+      retry_wait_seconds: 5
+      openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
+      openrouter_base_url: "${oc.env:OPENROUTER_BASE_URL,https://openrouter.ai/api/v1}"
+      openrouter_provider: ""
+      enable_streaming: true
+      disable_cache_control: false
+      keep_tool_result: 3
+      oai_tool_thinking: false
+    tool_config:
+      - tool-searching-serper
+    max_turns: 8
+    max_tool_calls_per_turn: 5
+    keep_tool_result: 3
+
+  agent-calculator:
+    prompt:
+      agent_type: worker
+      tool_format: xml
+    llm:
+      provider_class: "ClaudeOpenRouterClient"
+      model_name: "anthropic/claude-sonnet-4.6"
+      async_client: true
+      temperature: 0.1
+      top_p: 1.0
+      min_p: 0.0
+      top_k: -1
+      max_tokens: 8000
+      timeout: 120
+      retry_max_attempts: 3
+      retry_strategy: "exponential"
+      retry_multiplier: 2
+      retry_wait_seconds: 5
+      openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
+      openrouter_base_url: "${oc.env:OPENROUTER_BASE_URL,https://openrouter.ai/api/v1}"
+      openrouter_provider: ""
+      enable_streaming: true
+      disable_cache_control: false
+      keep_tool_result: 3
+      oai_tool_thinking: false
+    tool_config:
+      - tool-calculator
+    max_turns: 5
+    max_tool_calls_per_turn: 3
+    keep_tool_result: 3
+
+output_dir: logs/

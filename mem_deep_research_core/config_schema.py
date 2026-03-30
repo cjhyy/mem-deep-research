@@ -123,6 +123,16 @@ class SkillSelectionConfig(BaseModel):
     model: str = Field(default="gpt-4o-mini", description="用于 Skill 选择的模型")
     fallback_to_rules: bool = Field(default=True, description="LLM 失败时是否降级到规则匹配")
 
+    # Inline 渐进加载（method=inline 时使用）
+    progressive: bool = Field(
+        default=True,
+        description=(
+            "渐进加载模式（仅 method=inline 生效）: "
+            "True=第一轮仅注入 catalog，LLM 按需声明后再加载完整内容; "
+            "False=第一轮用规则匹配注入完整 skill 内容（传统模式）"
+        ),
+    )
+
     # 通用配置
     max_skills: int = Field(default=3, ge=0, le=10, description="最大选择 Skill 数量")
 
@@ -162,6 +172,11 @@ class MonitoringConfigSchema(BaseModel):
     scrape_max_length: int = Field(default=20000, ge=1000, description="Scrape 结果最大长度")
 
 
+class TodoTrackerConfig(BaseModel):
+    """任务追踪配置"""
+    enabled: bool = Field(default=False, description="是否启用任务追踪")
+
+
 class ContextManagerConfig(BaseModel):
     """Context Manager 配置
 
@@ -189,6 +204,13 @@ class ContextManagerConfig(BaseModel):
     max_dedup_cache_size: int = Field(
         default=200, ge=1, description="Maximum entries in dedup cache"
     )
+
+    # Result offloading
+    result_offload_threshold: int = Field(
+        default=5000, ge=0,
+        description="工具结果超过此字符数时卸载到文件，0=禁用"
+    )
+    result_offload_dir: str = Field(default="", description="卸载文件目录，空=使用 output_dir")
 
     # Token 估算
     chars_per_token: float = Field(
@@ -227,6 +249,15 @@ class InterceptorConfig(BaseModel):
         extra = "allow"
 
 
+class MemoryConfig(BaseModel):
+    """记忆系统配置"""
+
+    enabled: bool = Field(default=False, description="是否启用记忆系统")
+    storage: str = Field(default="file", description="存储方式: file | sqlite | custom")
+    storage_path: str = Field(default="memory/", description="存储路径")
+    max_entries: int = Field(default=1000, ge=1, description="最大记忆条目数")
+
+
 class MainAgentConfig(BaseModel):
     """主 Agent 配置"""
 
@@ -241,10 +272,20 @@ class MainAgentConfig(BaseModel):
     max_turns: int = Field(default=20, ge=1, description="最大对话轮次")
     max_tool_calls_per_turn: int = Field(default=10, ge=1, description="每轮最大工具调用数")
     keep_tool_result: int = Field(default=-1, description="保留工具结果数")
+    execution_mode: str = Field(
+        default="auto",
+        description="执行模式: 'auto' 自动判断, 'flash' 单轮直接回答, 'standard' 多轮工具调用, 'deep' 多轮+反思+子agent"
+    )
+    max_concurrent_subagents: int = Field(default=3, ge=1, description="最大并行子 Agent 数")
 
     # Deep Research
     deep_research: DeepResearchConfig = Field(
         default_factory=DeepResearchConfig, description="Deep Research 配置"
+    )
+
+    # TodoTracker
+    todo_tracker: TodoTrackerConfig = Field(
+        default_factory=TodoTrackerConfig, description="任务追踪配置"
     )
 
     # Processing
@@ -273,6 +314,11 @@ class MainAgentConfig(BaseModel):
     # Monitoring
     monitoring: MonitoringConfigSchema = Field(
         default_factory=MonitoringConfigSchema, description="执行监控配置"
+    )
+
+    # Memory
+    memory: MemoryConfig = Field(
+        default_factory=MemoryConfig, description="记忆系统配置"
     )
 
     # Language

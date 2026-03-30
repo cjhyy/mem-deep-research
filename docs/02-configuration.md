@@ -53,7 +53,21 @@ main_agent:
 
   # ─── Agent 参数 ───
   max_turns: 20                   # 最大执行轮数
-  chinese_context: false          # 启用中文语境
+  execution_mode: auto            # auto | flash | standard | deep
+                                  # auto: 框架根据任务复杂度自动选择
+                                  # flash: 简单问答，不调用工具
+                                  # standard: 需要工具的常规任务
+                                  # deep: 深度研究模式
+  max_concurrent_subagents: 3     # 并发子 Agent 数量上限（asyncio.Semaphore）
+  response_language: auto         # auto | Chinese | English | Japanese | ...
+                                  # auto: 从 query 自动检测语言
+                                  # 替代旧的 chinese_context 配置
+  chinese_context: false          # （已废弃，向后兼容）等同 response_language: Chinese
+
+  # ─── TodoTracker ───
+  todo_tracker:
+    enabled: true                 # 启用任务追踪（内置 update_todo 工具）
+                                  # 独立于 message_history，不受 context 压缩影响
 
   # ─── Skill 选择 ───
   skill_selection:
@@ -61,6 +75,8 @@ main_agent:
     method: inline                # rules | llm | inline
     max_skills: 3                 # 最大选择 Skill 数
     model: null                   # LLM 选择时使用的模型
+    progressive: true             # 渐进式加载：首轮只加载 Skill 目录
+                                  # 后续通过 <next_skills> 按需加载完整内容
 
   # ─── 上下文管理 ───
   context_manager:
@@ -69,6 +85,8 @@ main_agent:
     compact_at_ratio: 0.6         # L1 触发阈值（token 占比）
     summarize_at_ratio: 0.8       # L2 触发阈值
     compact_keep_recent: 3        # 保留最近 N 轮不压缩
+    result_offload_threshold: 5000  # 工具结果超过此字符数时卸载到文件系统
+                                    # context 中只保留摘要引用
 
   # ─── 执行监控 ───
   monitoring:

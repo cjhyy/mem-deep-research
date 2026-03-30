@@ -1,114 +1,92 @@
 # Example Project
 
-演示如何使用 Mem Deep Research 框架构建研究型 Agent。
+一个通用 Agent，能处理从简单问候到小时级深度研究的任何任务。
 
 ## 快速开始
 
 ```bash
-# 1. 安装框架（在项目根目录）
-pip install -e ..
-
-# 2. 配置 API 密钥
+# 1. 配置 API Key
 cp .env.example .env
-# 编辑 .env，填入你的 API Key
+# 编辑 .env，填入 OPENROUTER_API_KEY
+
+# 2. 安装框架
+cd .. && pip install -e . && cd example_project
 
 # 3. 运行
-python run.py "123 * 456 + 789 等于多少？"
+python run.py "你好"
 ```
+
+## 使用示例
+
+```bash
+# 快速回答（flash 模式 — 不调工具，直接回答）
+python run.py "你好"
+python run.py "什么是机器学习？" --flash
+
+# 计算（standard 模式 — 调用工具）
+python run.py "123 * 456 + 789"
+
+# 研究（deep 模式 — 多轮搜索 + 反思 + 任务追踪）
+python run.py "研究量子计算的最新进展" --deep
+
+# 框架自动选择模式（auto — 默认）
+python run.py "分析 2024 年 AI Agent 领域的关键技术突破"
+```
+
+## 框架自动处理的事情
+
+| 能力 | 说明 |
+|------|------|
+| **执行模式自动选择** | 简单问答 → flash，需要工具 → standard，deep_research → deep |
+| **语言自动检测** | 中文问题中文答，英文问题英文答 |
+| **任务追踪** | 复杂任务自动维护 todo list，context 压缩不丢 |
+| **子 Agent** | LLM 自主决定是否 spawn 子 agent 处理子任务 |
+| **上下文管理** | 三级压缩防爆，大结果自动卸载到文件 |
+| **循环检测** | 检测重复响应，自动升级策略或终止 |
+| **记忆系统** | SessionMemory 追踪发现，LongTermMemory 跨 session 积累 |
+| **Skill 渐进加载** | 按需注入 skill，省 token |
 
 ## 项目结构
 
 ```
 example_project/
 ├── config/
-│   ├── agent.yaml              # 默认配置（OpenRouter + Claude）
-│   ├── agent_anthropic.yaml    # Anthropic 直连配置
-│   ├── agent_minimal.yaml      # 最小配置
-│   ├── tool/                   # 项目级自定义工具
-│   │   └── tool-custom-api.yaml
-│   ├── skills/
-│   │   └── definitions/
-│   │       └── analysis_guide.md   # 自定义 Skill
-│   └── prompts/
-│       └── custom_system.md    # 自定义 Prompt 模板
-├── hooks.py                    # 钩子（自动加载）
+│   ├── agent.yaml              # 主配置（auto 模式，覆盖所有场景）
+│   ├── agent_anthropic.yaml    # Anthropic 直连
+│   ├── agent_minimal.yaml      # 最小配置（快速测试）
+│   ├── tool/                   # 自定义工具
+│   ├── skills/definitions/     # 自定义 Skill
+│   └── prompts/                # 自定义 Prompt 模板
+├── hooks.py                    # 生命周期钩子（自动加载）
 ├── run.py                      # 入口脚本
-├── run_advanced.py             # 高级用法示例
-├── .env.example                # 环境变量模板
-├── .env                        # 你的 API 密钥（不提交）
-├── logs/                       # 运行日志
-└── README.md
+├── .env                        # API 密钥
+└── logs/                       # 运行日志 + 卸载结果 + 长期记忆
+    ├── offloaded_results/      # 大工具结果文件
+    └── memory/                 # 长期记忆存储
 ```
 
-## 配置说明
+## 添加搜索能力
 
-### 切换配置
+取消 `agent.yaml` 中 `tool-searching-serper` 的注释，并在 `.env` 中配置 `SERPER_API_KEY`：
 
-```bash
-# 使用默认 OpenRouter 配置
-python run.py "你的任务"
-
-# 使用 Anthropic 直连
-python run.py "你的任务" --config agent_anthropic
-
-# 使用最小配置
-python run.py "你的任务" --config agent_minimal
-```
-
-### 配置文件说明
-
-| 文件 | LLM Provider | 工具 | 适用场景 |
-|------|-------------|------|---------|
-| `agent.yaml` | OpenRouter (Claude) | calculator + search | 通用研究 |
-| `agent_anthropic.yaml` | Anthropic 直连 | calculator + search | 需要 cache_control |
-| `agent_minimal.yaml` | OpenRouter (Claude) | calculator | 快速测试 |
-
-## 自定义工具
-
-在 `config/tool/` 目录下添加 YAML 文件即可注册自定义工具：
-
-```yaml
-# config/tool/tool-my-api.yaml
-name: "tool-my-api"
-url: "http://localhost:8080/mcp"
-transport: "streamable-http"
-headers:
-  Authorization: "Bearer ${oc.env:MY_API_TOKEN}"
-```
-
-然后在 `config/agent.yaml` 的 `tool_config` 中引用：
 ```yaml
 tool_config:
   - tool-calculator
-  - tool-my-api
+  - tool-searching-serper
 ```
 
-## 自定义 Skill
+这样 Agent 就能搜索互联网、阅读网页，处理真实的研究任务。
 
-在 `config/skills/definitions/` 下添加 Markdown 文件：
+## 自定义
 
-```markdown
----
-name: my_skill
-type: knowledge
-description: "技能描述"
-triggers:
-  keywords: ["关键词"]
-metadata:
-  priority: 10
----
-# Skill 内容（会注入到 system prompt）
-```
+### 添加工具
 
-## 钩子系统
+在 `config/tool/` 下加 YAML 文件，然后在 `agent.yaml` 的 `tool_config` 中引用。
 
-`hooks.py` 会被 `from_project()` 自动加载。可用钩子：
+### 添加 Skill
 
-- `on_agent_start` / `on_agent_end` — Agent 生命周期
-- `on_turn_start` / `on_turn_end` — 每轮开始/结束
-- `on_tool_start` / `on_tool_end` — 工具调用前/后
-- `on_tool_filter` — 工具调用过滤（去重后，执行前）
-- `on_system_prompt_build` — 修改 system prompt
-- `on_tool_result_format` — 自定义工具结果格式
-- `on_before_llm_call` / `on_after_llm_call` — LLM 调用前后（可做 guardrail）
-- `on_env_inject` — MCP 环境变量注入
+在 `config/skills/definitions/` 下加 Markdown 文件。LLM 会按需加载。
+
+### 修改行为
+
+编辑 `hooks.py`。所有 Agent 行为都可通过 17 个 hook 自定义。

@@ -238,8 +238,11 @@ class OpenAICompatibleClient(LLMProviderClientBase):
                 logger.debug(f"LLM Context limit exceeded: {error_str}")
                 raise ContextLimitError(f"Context limit exceeded: {error_str}")
 
+            # Redact message history from logged params to avoid leaking sensitive data
+            safe_params = {k: v for k, v in params.items() if k != "messages"}
+            safe_params["messages"] = f"[{len(params.get('messages', []))} messages redacted]"
             logger.error(
-                f"LLM call failed: {str(e)}, input = {json.dumps(params)}",
+                f"LLM call failed: {str(e)}, params = {json.dumps(safe_params, default=str)}",
                 exc_info=True,
             )
             raise e
@@ -523,38 +526,8 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         except Exception:
             return len(text) // 4
 
-    def handle_max_turns_reached_summary_prompt(self, message_history, summary_prompt):
-        """Handle max turns reached summary prompt. Default: return as-is."""
-        return summary_prompt
+    # handle_max_turns_reached_summary_prompt: uses base class default
 
-    def _apply_cache_control(self, messages):
-        """Apply cache control to the last user message and system message."""
-        cached_messages = []
-        user_turns_processed = 0
-        for turn in reversed(messages):
-            if (turn["role"] == "user" and user_turns_processed < 1) or (turn["role"] == "system"):
-                new_content = []
-                processed_text = False
-                if isinstance(turn.get("content"), list):
-                    for item in turn["content"]:
-                        if (
-                            item.get("type") == "text"
-                            and len(item.get("text")) > 0
-                            and not processed_text
-                        ):
-                            text_item = item.copy()
-                            text_item["cache_control"] = {"type": "ephemeral"}
-                            new_content.append(text_item)
-                            processed_text = True
-                        else:
-                            new_content.append(item.copy())
-                    cached_messages.append({"role": turn["role"], "content": new_content})
-                else:
-                    logger.debug(
-                        "Warning: User message content is not in expected list format, cache control not applied."
-                    )
-                    cached_messages.append(turn)
-                user_turns_processed += 1
-            else:
-                cached_messages.append(turn)
-        return list(reversed(cached_messages))
+    # _apply_cache_control: override to include system messages
+    def _apply_cache_control(self, messages, include_system: bool = True):
+        return super()._apply_cache_control(messages, include_system=include_system)

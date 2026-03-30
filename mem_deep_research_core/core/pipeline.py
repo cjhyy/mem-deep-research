@@ -99,7 +99,7 @@ async def execute_task_pipeline(
 
         # Initialize sub agent LLM client
         if sub_agent_llm_client is None:
-            if cfg.sub_agents is not None and cfg.sub_agents:
+            if getattr(cfg, "sub_agents", None):
                 first_sub_agent = next(iter(cfg.sub_agents.values()))
                 if hasattr(first_sub_agent, "llm") and first_sub_agent.llm is not None:
                     sub_agent_llm_client = LLMClient(
@@ -212,7 +212,7 @@ def create_pipeline_components(cfg: DictConfig, logs_dir: str | None = None):
     )
 
     sub_agent_tool_managers = {}
-    if cfg.sub_agents is not None and cfg.sub_agents:
+    if getattr(cfg, "sub_agents", None):
         for sub_agent in cfg.sub_agents:
             sub_agent_mcp_server_configs, sub_agent_blacklist = create_mcp_server_parameters(
                 cfg, cfg.sub_agents[sub_agent], logs_dir

@@ -183,6 +183,10 @@ class ContextManagerConfig:
     # Token 估算
     chars_per_token: float = 3.5  # 无 tiktoken 时的 fallback 估算
 
+    # Result offloading
+    result_offload_threshold: int = 5000  # 0 = disabled
+    result_offload_dir: str = ""
+
 
 # ============================================================
 # ContextManager
@@ -225,6 +229,9 @@ class ContextManager:
         # 窗口策略管道（可外部注入或从 config 自动构建）
         self._pipeline = pipeline or self._build_pipeline_from_config()
 
+        # Offload directory for large results
+        self._offload_dir: str = ""
+
     # ---- 初始化 ----
 
     def _build_pipeline_from_config(self) -> WindowStrategyPipeline:
@@ -262,6 +269,55 @@ class ContextManager:
 
     def set_turn(self, turn: int) -> None:
         self._current_turn = turn
+
+    def set_offload_dir(self, path: str) -> None:
+        """Set the directory for offloading large results."""
+        self._offload_dir = path
+
+    def offload_large_result(self, result_text: str, tool_name: str, turn: int) -> tuple[str, str | None]:
+        """Offload large tool results to filesystem.
+
+        Args:
+            result_text: Full result text
+            tool_name: Tool name (for file naming)
+            turn: Current turn number
+
+        Returns:
+            (text_for_context, file_path) — shortened text + file path if offloaded, or (original, None)
+        """
+        threshold = self.config.result_offload_threshold
+        if threshold <= 0 or len(result_text) <= threshold:
+            return result_text, None
+
+        # Determine offload directory
+        offload_dir = self._offload_dir or self.config.result_offload_dir
+        if not offload_dir:
+            return result_text, None
+
+        import os
+        os.makedirs(offload_dir, exist_ok=True)
+
+        # Write full result to file
+        file_name = f"turn{turn}_{tool_name}_{len(result_text)}chars.txt"
+        file_path = os.path.join(offload_dir, file_name)
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(result_text)
+        except Exception as e:
+            logger.warning(f"[Context] Failed to offload result: {e}")
+            return result_text, None
+
+        # Create summary for context
+        preview = result_text[:500].replace("\n", " ")
+        summary = (
+            f"[Result offloaded to file: {file_name}]\n"
+            f"Total length: {len(result_text)} chars\n"
+            f"Preview: {preview}...\n"
+            f"Use file operations to read the full content if needed."
+        )
+
+        logger.info(f"[Context] Offloaded {len(result_text)} chars to {file_path}")
+        return summary, file_path
 
     # ============================================================
     # Token 估算
@@ -361,10 +417,13 @@ class ContextManager:
             else:
                 to_execute.append(call)
 
-        # Evict oldest entries if cache exceeds limit
+        # Evict oldest entries (by turn) if cache exceeds limit
         if len(self._dedup_cache) > self._max_dedup_cache_size:
             excess = len(self._dedup_cache) - self._max_dedup_cache_size
-            for k in list(self._dedup_cache.keys())[:excess]:
+            evict_keys = sorted(
+                self._dedup_cache, key=lambda k: self._dedup_cache[k].turn
+            )[:excess]
+            for k in evict_keys:
                 del self._dedup_cache[k]
 
         return to_execute, cached_results

@@ -59,6 +59,28 @@ DEFAULT_SCRAPE_MAX_LENGTH = 20000
 # Sub-agent tool name prefix
 SUB_AGENT_PREFIX = "agent-"
 
+# Default max concurrent sub-agents
+DEFAULT_MAX_CONCURRENT_SUBAGENTS = 3
+
+# Default threshold for offloading large tool results to filesystem
+DEFAULT_RESULT_OFFLOAD_THRESHOLD = 5000
+
+# Built-in tool names
+BUILTIN_TOOL_UPDATE_TODO = "update_todo"
+BUILTIN_TOOL_SPAWN_AGENT = "spawn_agent"
+
+# Maximum nesting depth for spawned agents (prevents exponential resource consumption)
+MAX_SPAWN_DEPTH = 2
+
+# ============================================================
+# Execution Modes
+# ============================================================
+
+EXECUTION_MODE_AUTO = "auto"
+EXECUTION_MODE_FLASH = "flash"
+EXECUTION_MODE_STANDARD = "standard"
+EXECUTION_MODE_DEEP = "deep"
+
 # ============================================================
 # Monitoring
 # ============================================================
@@ -85,6 +107,10 @@ SYSTEM_MESSAGE_KEYWORDS = [
     "[RESEARCH CONTEXT SUMMARY",
     "[COLLECTED SOURCES",
     "[RESEARCH PLAN",
+    "[TASK PROGRESS",
+    "[CONTEXT NOTE",
+    "[SESSION MEMORY",
+    "[LONG-TERM MEMORY",
 ]
 
 # ============================================================
@@ -113,6 +139,13 @@ TAG_COLLECTED_SOURCES = "[COLLECTED SOURCES]"
 # Full format: "[RESEARCH CONTEXT SUMMARY — turns 1-N]"
 TAG_RESEARCH_CONTEXT_SUMMARY = "[RESEARCH CONTEXT SUMMARY"
 TAG_CONTENT_REMOVED = "[Content removed to reduce context]"
+TAG_TASK_PROGRESS = "[TASK PROGRESS]"
+
+CONTEXT_COMPRESSION_NOTICE = (
+    "[CONTEXT NOTE] Some earlier messages have been compressed to manage context size. "
+    "Key findings are preserved in the task progress. "
+    "If you need detailed information from compressed content, use available tools to re-fetch it."
+)
 
 # ============================================================
 # Fallback Messages

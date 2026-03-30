@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Run a research task using Mem Deep Research.
+Universal Agent Runner — handles everything from greetings to deep research.
 
 Usage:
-    python run.py "What is 123 * 456 + 789?"
-    python run.py "Your research task" --config agent_anthropic
-    python run.py "快速测试" --config agent_minimal
+    python run.py "你好"                                  # Quick greeting
+    python run.py "123 * 456 + 789"                       # Calculator
+    python run.py "What is quantum computing?"            # Standard research
+    python run.py "深入研究 AI Agent 的最新进展" --deep     # Deep research mode
 
-Available configs:
-    agent           — OpenRouter + Claude (default)
-    agent_anthropic — Anthropic direct API
-    agent_minimal   — Minimal config for quick testing
+Options:
+    --deep      Force deep research mode (reflection + task tracking)
+    --flash     Force flash mode (single response, no tools)
+    --config    Config file name (default: agent)
+    --verbose   Enable debug logging
 """
 
 import argparse
@@ -35,12 +37,13 @@ if env_file.exists():
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Run research agent",
+        description="Universal Agent — quick answers to deep research",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="See run_advanced.py for more usage patterns (context, batch, etc.)",
     )
-    parser.add_argument("task", help="Research task description")
+    parser.add_argument("task", help="Task or question")
     parser.add_argument("--config", default="agent", help="Config name (default: agent)")
+    parser.add_argument("--deep", action="store_true", help="Force deep research mode")
+    parser.add_argument("--flash", action="store_true", help="Force flash mode (no tools)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -51,12 +54,22 @@ async def main():
         logging.basicConfig(level=getattr(logging, log_level), format="%(name)s %(levelname)s: %(message)s")
 
     from mem_deep_research import DeepResearch
+    from omegaconf import OmegaConf
 
     dr = DeepResearch.from_project(PROJECT_DIR, config_name=args.config)
+
+    # Override execution mode from CLI flags
+    if args.flash:
+        OmegaConf.update(dr._cfg, "main_agent.execution_mode", "flash")
+    elif args.deep:
+        OmegaConf.update(dr._cfg, "main_agent.execution_mode", "deep")
+
     result = await dr.run(args.task)
 
-    print(f"\nStatus: {result.status}")
-    print(f"Duration: {result.duration_seconds:.1f}s")
+    # Pretty output
+    print(f"\n{'=' * 60}")
+    print(f"Status: {result.status} | Duration: {result.duration_seconds:.1f}s")
+    print(f"{'=' * 60}")
     print(f"\n{result.answer}")
 
     if result.error:

@@ -169,8 +169,8 @@ class LLMProviderClientBase(ABC):
         pass
 
     def _remove_tool_result_from_messages(self, messages, keep_tool_result):
-        messages_copy = [m.copy() for m in messages]
         """Remove tool results from messages"""
+        messages_copy = [m.copy() for m in messages]
         if keep_tool_result >= 0:
             # Find indices of all user messages
             user_indices = [
@@ -388,11 +388,64 @@ class LLMProviderClientBase(ABC):
     ):
         raise NotImplementedError("must implement in subclass")
 
-    @abstractmethod
     def handle_max_turns_reached_summary_prompt(
         self, message_history: list[dict[str, Any]], summary_prompt: str
     ):
-        raise NotImplementedError("must implement in subclass")
+        """Default: merge summary with last user message if present.
+
+        Subclasses can override for provider-specific behavior.
+        """
+        if message_history and message_history[-1].get("role") == "user":
+            last_user_message = message_history.pop()
+            content = last_user_message.get("content", "")
+            if isinstance(content, list) and content:
+                text = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
+            else:
+                text = str(content)
+            return text + "\n\n-----------------\n\n" + summary_prompt
+        return summary_prompt
+
+    def _apply_cache_control(self, messages, include_system: bool = False):
+        """Apply ephemeral cache control to the last user message.
+
+        Args:
+            messages: Message history list.
+            include_system: If True, also apply cache control to system messages.
+        """
+        cached_messages = []
+        user_turns_processed = 0
+        for turn in reversed(messages):
+            should_process = (
+                (turn["role"] == "user" and user_turns_processed < 1)
+                or (include_system and turn["role"] == "system")
+            )
+            if should_process:
+                new_content = []
+                processed_text = False
+                if isinstance(turn.get("content"), list):
+                    for item in turn["content"]:
+                        if (
+                            item.get("type") == "text"
+                            and len(item.get("text", "")) > 0
+                            and not processed_text
+                        ):
+                            text_item = item.copy()
+                            text_item["cache_control"] = {"type": "ephemeral"}
+                            new_content.append(text_item)
+                            processed_text = True
+                        else:
+                            new_content.append(item.copy())
+                    cached_messages.append({"role": turn["role"], "content": new_content})
+                else:
+                    logger.debug(
+                        "Warning: Message content is not in expected list format, cache control not applied."
+                    )
+                    cached_messages.append(turn)
+                if turn["role"] == "user":
+                    user_turns_processed += 1
+            else:
+                cached_messages.append(turn)
+        return list(reversed(cached_messages))
 
     def get_usage(self) -> dict[str, Any]:
         """

@@ -209,44 +209,4 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
         # else:
         return summary_prompt
 
-    def _apply_cache_control(self, messages):
-        """Apply cache control to the last user message and system message (if applicable)"""
-        cached_messages = []
-        user_turns_processed = 0
-        for turn in reversed(messages):
-            if turn["role"] == "user" and user_turns_processed < 1:
-                # Add ephemeral cache control to the text part of the last user message
-                new_content = []
-                processed_text = False
-                # Check if content is a list
-                if isinstance(turn.get("content"), list):
-                    # see example here
-                    # https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
-                    for item in turn["content"]:
-                        if (
-                            item.get("type") == "text"
-                            and len(item.get("text")) > 0
-                            and not processed_text
-                        ):
-                            # Copy and add cache control
-                            text_item = item.copy()
-                            text_item["cache_control"] = {"type": "ephemeral"}
-                            new_content.append(text_item)
-                            processed_text = True
-                        else:
-                            # Other types of content (like image) copied directly
-                            new_content.append(item.copy())
-                    cached_messages.append({"role": "user", "content": new_content})
-                else:
-                    # If content is not a list (e.g., plain text), add as is without cache control
-                    # Or adjust logic as needed
-                    logger.debug(
-                        "Warning: User message content is not in expected list format, cache control not applied."
-                    )
-                    cached_messages.append(turn)
-
-                user_turns_processed += 1
-            else:
-                # Add other messages directly
-                cached_messages.append(turn)
-        return list(reversed(cached_messages))
+    # Uses base class _apply_cache_control(messages, include_system=False)

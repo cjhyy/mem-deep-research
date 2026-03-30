@@ -172,9 +172,15 @@ class ConfigLoader:
             if isinstance(arg, str):
                 # 检查是否是相对路径（不是以 - 开头的选项）
                 if not arg.startswith("-") and not arg.startswith("/"):
-                    potential_path = project_dir / arg
-                    if potential_path.exists() or arg.endswith(".py"):
-                        arg = str(potential_path)
+                    potential_path = (project_dir / arg).resolve()
+                    # Prevent path traversal: resolved path must be under project_dir
+                    if str(potential_path).startswith(str(project_dir.resolve())):
+                        if potential_path.exists() or arg.endswith(".py"):
+                            arg = str(potential_path)
+                    else:
+                        logger.warning(
+                            f"[ConfigLoader] Blocked path traversal in tool arg: {arg}"
+                        )
             resolved_args.append(arg)
         return resolved_args
 
@@ -340,11 +346,15 @@ class ConfigLoader:
 
             from mem_deep_research_core.skills import InlineSkillSelector
 
+            progressive = skill_selection_cfg.get("progressive", True)
             selector = InlineSkillSelector(
                 matcher=injector.matcher,
                 chinese=chinese,
+                progressive=progressive,
             )
-            logger.info("[ConfigLoader] Inline skill selector initialized")
+            logger.info(
+                f"[ConfigLoader] Inline skill selector initialized (progressive={progressive})"
+            )
             return selector
 
         except Exception as e:
