@@ -1,0 +1,409 @@
+import asyncio
+import json
+import logging
+import os
+import socket
+import threading
+import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache
+from pathlib import Path
+from typing import Literal
+
+import hydra
+import zmq
+import zmq.asyncio
+from rich.console import Console
+from rich.logging import RichHandler
+
+# Task context variable
+TASK_CONTEXT_VAR: ContextVar[str | None] = ContextVar("CURRENT_TASK_ID", default=None)
+
+# Maximum length for debug log content (to prevent log bloat)
+DEBUG_LOG_MAX_LENGTH = 500
+
+
+def truncate_for_log(content: str, max_length: int = DEBUG_LOG_MAX_LENGTH) -> str:
+    """Truncate long content for logging to prevent log bloat.
+
+    Args:
+        content: The content to potentially truncate
+        max_length: Maximum length before truncation (default: 500)
+
+    Returns:
+        Truncated content with length indicator if truncated
+    """
+    if not content:
+        return content
+    content_str = str(content)
+    if len(content_str) <= max_length:
+        return content_str
+    return f"{content_str[:max_length]}... ({len(content_str)} chars total)"
+
+
+# Context variables for logging identifiers
+trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
+chat_id_var: ContextVar[str] = ContextVar("chat_id", default="")
+user_id_var: ContextVar[str] = ContextVar("user_id", default="")
+message_id_var: ContextVar[str] = ContextVar("message_id", default="")
+
+# Global variable to store the actual ZMQ address being used
+_ZMQ_ADDRESS: str = "tcp://127.0.0.1:6000"
+
+
+def generate_trace_id() -> str:
+    """Generate a new trace ID"""
+    return str(uuid.uuid4())
+
+
+def get_trace_id() -> str:
+    """Get current trace ID from context"""
+    return trace_id_var.get()
+
+
+def set_trace_id(trace_id: str = None) -> str:
+    """Set trace ID in context, generate new one if not provided"""
+    if trace_id is None:
+        trace_id = generate_trace_id()
+    trace_id_var.set(trace_id)
+    return trace_id
+
+
+def get_chat_id() -> str:
+    """Get current chat ID from context"""
+    return chat_id_var.get()
+
+
+def set_chat_id(chat_id: str) -> str:
+    """Set chat ID in context"""
+    chat_id_var.set(chat_id)
+    return chat_id
+
+
+def get_user_id() -> str:
+    """Get current user ID from context"""
+    return user_id_var.get()
+
+
+def set_user_id(user_id: str) -> str:
+    """Set user ID in context"""
+    user_id_var.set(user_id)
+    return user_id
+
+
+def get_message_id() -> str:
+    """Get current message ID from context"""
+    return message_id_var.get()
+
+
+def set_message_id(message_id: str) -> str:
+    """Set message ID in context"""
+    message_id_var.set(message_id)
+    return message_id
+
+
+def find_available_port(start_port: int = 6000, max_attempts: int = 10) -> int:
+    """Find an available port starting from start_port."""
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(
+        f"Could not find an available port in range {start_port}-{start_port + max_attempts - 1}"
+    )
+
+
+def get_zmq_address() -> str:
+    """Get the current ZMQ address."""
+    return _ZMQ_ADDRESS
+
+
+def set_zmq_address(address: str) -> None:
+    """Set the ZMQ address."""
+    global _ZMQ_ADDRESS
+    _ZMQ_ADDRESS = address
+
+
+def _extract_port_from_address(addr: str) -> int:
+    """Extract port number from ZMQ address."""
+    try:
+        return int(addr.split(":")[-1])
+    except (ValueError, IndexError):
+        return 6000
+
+
+def _bind_zmq_socket(sock, bind_addr: str) -> str:
+    """Bind ZMQ socket to an available port and return the actual address."""
+    port = _extract_port_from_address(bind_addr)
+
+    try:
+        available_port = find_available_port(port)
+        actual_addr = f"tcp://127.0.0.1:{available_port}"
+        sock.bind(actual_addr)
+        return actual_addr
+    except RuntimeError:
+        # Fallback to random port
+        port = sock.bind_to_random_port("tcp://127.0.0.1")
+        return f"tcp://127.0.0.1:{port}"
+
+
+class ZMQLogHandler(logging.Handler):
+    def __init__(self, addr=None, tool_name="unknown_tool"):
+        super().__init__()
+        ctx = zmq.Context()
+        self.sock = ctx.socket(zmq.PUSH)
+
+        # Use the global ZMQ address if no specific address is provided
+        if addr is None:
+            addr = get_zmq_address()
+
+        # Try to connect to the address
+        try:
+            self.sock.connect(addr)
+            logging.getLogger(__name__).info(f"ZMQ handler connected to: {addr}")
+        except zmq.error.ZMQError as e:
+            # If connection fails, disable the handler
+            logging.getLogger(__name__).warning(f"Could not connect to ZMQ listener at {addr}: {e}")
+            logging.getLogger(__name__).warning("Disabling ZMQ logging for this handler")
+            self.sock = None
+
+        self.task_id = os.environ.get("TASK_ID", "0")
+        self.tool_name = tool_name
+
+    def emit(self, record):
+        if self.sock is None:
+            return
+
+        try:
+            msg = f"{record.getMessage()}"
+            self.sock.send_string(f"{self.task_id}||{self.tool_name}||{msg}")
+        except Exception:
+            self.handleError(record)
+
+
+async def zmq_log_listener(bind_addr="tcp://127.0.0.1:6000"):
+    ctx = zmq.asyncio.Context()
+    sock = ctx.socket(zmq.PULL)
+
+    # Bind to available port
+    actual_addr = _bind_zmq_socket(sock, bind_addr)
+    set_zmq_address(actual_addr)
+    logging.getLogger(__name__).info(f"ZMQ listener bound to: {actual_addr}")
+
+    root_logger = logging.getLogger()
+
+    while True:
+        raw = await sock.recv_string()
+        if "||" in raw:
+            task_id, tool_name, msg = raw.split("||", 2)
+
+            record = root_logger.makeRecord(
+                name=f"[TOOL] {tool_name}",
+                level=logging.INFO,
+                fn="",
+                lno=0,
+                msg=msg,
+                args=(),
+                exc_info=None,
+            )
+            record.task_id = task_id
+
+            root_logger.handle(record)
+        else:
+            root_logger.info(raw)
+
+
+def start_zmq_listener():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(zmq_log_listener())
+
+
+def setup_mcp_logging(level="INFO", addr=None, tool_name="unknown_tool"):
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    # Remove root handlers
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+        h.close()
+
+    # Remove all handlers from fastmcp child loggers
+    for _name, logger in logging.Logger.manager.loggerDict.items():
+        if isinstance(logger, logging.Logger):
+            for h in logger.handlers[:]:
+                logger.removeHandler(h)
+                h.close()
+            logger.propagate = True  # Ensure bubbling to root
+
+    # Re-add the ZMQ handler (will use global address if addr is None)
+    handler = ZMQLogHandler(addr=addr, tool_name=tool_name)
+    handler.setFormatter(logging.Formatter("[TOOL] %(asctime)s %(levelname)s: %(message)s"))
+    root.addHandler(handler)
+
+
+def setup_log_record_factory():
+    old_factory = logging.getLogRecordFactory()
+
+    def record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        record.task_id = TASK_CONTEXT_VAR.get()
+        return record
+
+    logging.setLogRecordFactory(record_factory)
+
+
+class TaskFilter(logging.Filter):
+    def __init__(self, task_id: str):
+        super().__init__()
+        self.task_id = task_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return getattr(record, "task_id", None) == self.task_id
+
+
+def make_task_logger(task_id: str, log_dir: Path) -> logging.Handler:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    file_path = log_dir / f"task_{task_id}.log"
+    fh = logging.FileHandler(file_path, encoding="utf-8")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    fh.setFormatter(fmt)
+    fh.addFilter(TaskFilter(task_id))
+    logging.getLogger().addHandler(fh)
+    return fh
+
+
+class JSONFormatter(logging.Formatter):
+    """Custom JSON formatter that includes trace_id, chat_id, user_id, and message_id"""
+
+    def format(self, record):
+        log_obj = {
+            "timestamp": self.formatTime(record, datefmt="%Y-%m-%d %H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "file": record.filename,
+            "line": record.lineno,
+            "message": record.getMessage(),
+            "trace_id": get_trace_id(),
+            "chat_id": get_chat_id(),
+            "user_id": get_user_id(),
+            "message_id": get_message_id(),
+        }
+
+        # Add exception info if present
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_obj, ensure_ascii=False)
+
+
+def remove_all_console_handlers():
+    """
+    Remove all console handlers (StreamHandler/RichHandler) from all loggers in the current process.
+    """
+    for _name, logger in logging.Logger.manager.loggerDict.items():
+        if isinstance(logger, logging.Logger):
+            handlers_to_remove = []
+            for h in logger.handlers:
+                if isinstance(h, (logging.StreamHandler, RichHandler)):
+                    handlers_to_remove.append(h)
+            for h in handlers_to_remove:
+                logger.removeHandler(h)
+                h.close()
+
+    root_logger = logging.getLogger()
+    handlers_to_remove = []
+    for h in root_logger.handlers:
+        if isinstance(h, logging.StreamHandler):
+            handlers_to_remove.append(h)
+    for h in handlers_to_remove:
+        root_logger.removeHandler(h)
+        h.close()
+
+
+@contextmanager
+def task_logging_context(task_id: str, log_dir: Path):
+    token = TASK_CONTEXT_VAR.set(task_id)
+    handler = make_task_logger(task_id, log_dir / "task_logs")
+    try:
+        yield
+    finally:
+        TASK_CONTEXT_VAR.reset(token)
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+
+def init_logging_for_benchmark_evaluation(print_task_logs=False):
+    threading.Thread(target=start_zmq_listener, daemon=True).start()  # monitoring tool logs
+    logging.basicConfig(handlers=[])
+    setup_log_record_factory()
+    if not print_task_logs:
+        remove_all_console_handlers()
+
+
+@lru_cache
+def bootstrap_logger(
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | int = "INFO",
+    logger_name: str = "mem_deep_research",
+    logger: logging.Logger | None = None,
+    log_dir: str | Path | None = None,  # Log storage directory
+    log_filename: str = "mem_deep_research.log",  # Default log filename
+    to_console: bool = True,  # Whether to display to console
+) -> logging.Logger:
+    """Configure only this logger, not the root logger"""
+    if logger is None:
+        logger = logging.getLogger(logger_name)
+
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+
+    # Check if we should use JSON logging (production mode)
+    is_prod = os.getenv("ENV") == "prod"
+
+    if to_console:
+        if is_prod:
+            # Use JSON formatter in production
+            handler = logging.StreamHandler()
+            handler.setFormatter(JSONFormatter())
+        else:
+            # Use Rich handler in development
+            handler = RichHandler(
+                console=Console(
+                    stderr=True,
+                    width=200,
+                    color_system=None,
+                    force_terminal=False,
+                    legacy_windows=False,
+                ),
+                rich_tracebacks=True,
+                tracebacks_suppress=[hydra],
+                tracebacks_show_locals=True,
+                show_level=False,
+            )
+            formatter = logging.Formatter("[%(levelname)s] %(message)s")
+            handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    if log_dir is not None:
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_path = log_dir / log_filename
+        file_handler = logging.FileHandler(file_path, encoding="utf-8")
+        if is_prod:
+            # Use JSON formatter for file logging in production
+            file_handler.setFormatter(JSONFormatter())
+        else:
+            # Use standard formatter in development
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+            )
+        logger.addHandler(file_handler)
+
+    logger.setLevel(level)
+    logger.propagate = True
+
+    return logger

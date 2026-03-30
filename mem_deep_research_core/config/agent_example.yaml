@@ -1,0 +1,131 @@
+# Example Agent Configuration
+# Copy this file and modify for your specific use case
+
+defaults:
+  - override hydra/job_logging: none
+  - _self_
+
+# Main Agent Configuration
+main_agent:
+  # === Prompt Configuration (New Unified System) ===
+  #
+  # Method 1: Use AgentPrompt with configuration
+  prompt:
+    agent_type: main           # "main" (primary agent) or "worker" (sub-agent)
+    tool_format: xml           # "xml" (Claude/GPT) or "native" (DeepSeek)
+    presets: []                # Optional: ["research", "research_planning", "time_sensitive"]
+    # templates_dir: /path/to/custom/templates  # Optional: custom templates directory
+
+  # Method 2: Use legacy prompt_class (backward compatible)
+  # prompt_class: MainAgentPromptResearch
+  # Available classes:
+  #   - AgentPrompt: New unified class (recommended)
+  #   - MainBoxedAnswerPrompt: Default prompt
+  #   - MainAgentPromptResearch: Research-focused with presets
+  #   - MainAgentPromptDeepSeek: Native tool format
+  #   - SubWorkerPrompt: Sub-agent worker
+
+  # === Common Preset Combinations ===
+  #
+  # Basic Agent (default):
+  #   prompt:
+  #     agent_type: main
+  #     tool_format: xml
+  #
+  # Deep Research Agent:
+  #   prompt:
+  #     agent_type: main
+  #     tool_format: xml
+  #     presets: [research, time_sensitive]
+  #
+  # DeepSeek Agent:
+  #   prompt:
+  #     agent_type: main
+  #     tool_format: native
+  #
+  # Worker Agent:
+  #   prompt:
+  #     agent_type: worker
+  #     tool_format: xml
+
+  # LLM Provider Configuration
+  llm:
+    # Provider class from src/llm/providers/
+    # Options: ClaudeOpenRouterClient, ClaudeAnthropicClient, GPTOpenAIClient, GPT5OpenAIClient, GPT5OpenRouterClient, DeepSeekOpenRouterClient
+    provider_class: "ClaudeOpenRouterClient"
+    model_name: "anthropic/claude-3.5-sonnet"
+    async_client: true
+
+    # Model parameters
+    temperature: 0.3
+    top_p: 0.95
+    min_p: 0.0
+    top_k: -1
+    max_tokens: 32000
+
+    # Timeout and retry configuration
+    timeout: 1800                    # Request timeout in seconds (default: 1800 = 30min)
+    retry_max_attempts: 5            # Max retry attempts on failure
+    retry_strategy: "exponential"    # "exponential" or "fixed"
+    retry_multiplier: 5              # For exponential backoff
+    retry_wait_seconds: 10           # For fixed wait strategy
+
+    # OpenRouter settings (if using OpenRouter providers)
+    openrouter_api_key: "${oc.env:OPENROUTER_API_KEY,}"
+    openrouter_base_url: "${oc.env:OPENROUTER_BASE_URL,https://openrouter.ai/api/v1}"
+    openrouter_provider: ""          # Optional: "anthropic", "google", "amazon" to force specific provider
+
+    # Anthropic settings (if using ClaudeAnthropicClient)
+    # anthropic_api_key: "${oc.env:ANTHROPIC_API_KEY,}"
+
+    # OpenAI settings (if using GPTOpenAIClient or GPT5OpenAIClient)
+    # openai_api_key: "${oc.env:OPENAI_API_KEY,}"
+    # openai_base_url: "${oc.env:OPENAI_BASE_URL,https://api.openai.com/v1}"
+
+    # Streaming and caching
+    enable_streaming: true
+    disable_cache_control: false
+
+    # Tool result handling
+    keep_tool_result: 5              # -1 = keep all, 0+ = keep last N full results (rest become placeholders)
+    oai_tool_thinking: false         # OpenAI-style tool thinking
+
+    # Context management
+    # max_context_length: 128000     # Model's max context in tokens (-1 = unlimited, enables pre-flight checks)
+
+  # Tool configuration - list of tool config names from config/tool/
+  # Available tools: tool-reading, tool-searching, tool-browsing, tool-code, tool-reasoning, etc.
+  tool_config:
+    - tool-reading
+    - tool-searching
+
+  # Tool blacklist - list of [server_name, tool_name] pairs to disable specific tools
+  # tool_blacklist:
+  #   - ["tool-searching", "dangerous_tool"]
+
+  # Execution limits
+  max_turns: 20                      # Max conversation turns
+  max_tool_calls_per_turn: 10        # Max tool calls per turn
+
+  # Deep Research Protocol (alternative to prompt.presets)
+  # Deprecated: prefer using prompt.presets: [research, time_sensitive]
+  deep_research:
+    enabled: false
+    reflection_interval: 5           # Trigger reflection every N turns
+    require_explicit_planning: true  # Require explicit research plan
+
+  # Input/Output processing
+  input_process:
+    hint_generation: false
+    hint_llm_base_url: "${oc.env:HINT_LLM_BASE_URL,}"
+  output_process:
+    final_answer_extraction: false
+    final_answer_llm_base_url: "${oc.env:FINAL_ANSWER_LLM_BASE_URL,}"
+    final_answer_model: ""
+
+  # Context settings
+  add_message_id: true
+  chinese_context: "${oc.env:CHINESE_CONTEXT,false}"
+
+# Output directory for logs
+output_dir: logs/

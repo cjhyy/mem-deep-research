@@ -1,0 +1,146 @@
+[project]
+name = "mem-deep-research"
+version = "0.1.0"
+description = "Mem Deep Research - AI Agent Orchestration Framework"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "maki maki", email = "chenjunhong54321@163.com"}]
+requires-python = ">=3.12"
+keywords = ["ai", "agent", "research", "llm", "deep-research"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "hydra-core>=1.3.2",
+    "anthropic>=0.60.0",
+    "fastmcp>=2.10.6",
+    "markitdown-mcp>=0.0.1a3",
+    "mcp>=1.12.2",
+    "openai>=2.8.0",
+    "rich>=14.1.0",
+    "json5>=0.12.0",
+    "pyyaml>=6.0.2",
+    "tenacity>=8.2.3,<9.0.0",
+    "tiktoken>=0.9.0",
+    "requests>=2.32.4",
+    "pyzmq",
+    "markdown-it-py>=3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/cjhyy/mem-deep-research"
+Repository = "https://github.com/cjhyy/mem-deep-research"
+Issues = "https://github.com/cjhyy/mem-deep-research/issues"
+Documentation = "https://github.com/cjhyy/mem-deep-research/tree/main/docs"
+
+[project.scripts]
+mem-deep-research = "mem_deep_research_core.cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mem_deep_research_core", "mem_deep_research"]
+
+[tool.hatch.build.targets.sdist]
+include = ["mem_deep_research_core", "mem_deep_research"]
+
+[tool.hatch.build]
+artifacts = ["*.yaml", "*.md"]
+
+# Development dependencies
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "mypy>=1.11.0",
+    "ruff>=0.5.0",
+    "types-requests>=2.32.0",
+    "types-PyYAML>=6.0.0",
+]
+
+# Mypy configuration
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Start permissive, gradually enable
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+namespace_packages = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = [
+    "mcp.*",
+    "fastmcp.*",
+    "hydra.*",
+    "omegaconf.*",
+    "tenacity.*",
+    "anthropic.*",
+    "markitdown.*",
+]
+ignore_missing_imports = true
+
+# Ruff (linter) configuration
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults
+    "B012",   # return inside finally (intentional in pipeline)
+    "B904",   # raise from in except (too verbose for this codebase)
+    "SIM102", # nested if (sometimes more readable)
+    "SIM105", # contextlib.suppress (explicit try-except is clearer)
+    "SIM108", # ternary operator (sometimes less readable)
+    "SIM117", # nested with (required by MCP client API)
+    "UP042",  # StrEnum (keep str+Enum for 3.12 compat)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mem_deep_research_core"]
+
+# Pytest configuration
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-v --tb=short"
+
+# Coverage configuration
+[tool.coverage.run]
+source = ["mem_deep_research_core"]
+omit = ["*/tests/*", "*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]

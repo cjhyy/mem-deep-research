@@ -1,0 +1,6 @@
+name: "tool-calculator"
+tool_command: "python"
+args:
+  - "-m"
+  - "mem_deep_research_core.tool.mcp_servers.calculator_server"
+env: {}
