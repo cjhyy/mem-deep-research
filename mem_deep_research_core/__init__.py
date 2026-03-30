@@ -1,5 +1,5 @@
 """
-mem_deep_research - AI Agent 深度研究框架
+mem_deep_research - AI Agent 端到端任务完成框架
 
 主要模块:
 - core: Pipeline 和 Orchestrator 核心执行逻辑
@@ -15,6 +15,7 @@ from mem_deep_research_core.exceptions import (
     ConfigurationError,
     ConfigValidationError,
     ContextLimitError,
+    GuardrailError,
     JSONParseError,
     LLMAPIError,
     LLMError,
@@ -36,7 +37,7 @@ from mem_deep_research_core.exceptions import (
     ToolTimeoutError,
 )
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 __author__ = "maki maki"
 
 __all__ = [
@@ -68,6 +69,7 @@ __all__ = [
     "PipelineError",
     "MaxTurnsExceededError",
     "TaskCancelledError",
+    "GuardrailError",
     # Parse exceptions
     "ParseError",
     "JSONParseError",

@@ -16,6 +16,7 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
+from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX
 from mem_deep_research_core.core.context_manager import ContextManager
 from mem_deep_research_core.core.hooks import HookContext, hooks
 from mem_deep_research_core.core.llm_call_handler import LLMCallHandler, SummaryHandler
@@ -28,7 +29,6 @@ from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTra
 from mem_deep_research_core.tool.manager import ToolManager
 from mem_deep_research_core.utils.external_loader import external_loader
 from mem_deep_research_core.utils.io_utils import OutputFormatter
-from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX
 from mem_deep_research_core.utils.tool_utils import _load_agent_prompt
 
 logger = logging.getLogger("mem_deep_research")
@@ -196,7 +196,9 @@ class SubAgentRunner:
 
         final_answer_text = ""
         system_prompt = ""
-        message_history = [{"role": "user", "content": [{"type": "text", "text": task_description}]}]
+        message_history = [
+            {"role": "user", "content": [{"type": "text", "text": task_description}]}
+        ]
 
         try:
             # Build prompt + tools
@@ -224,15 +226,21 @@ class SubAgentRunner:
 
             tool_manager = self.sub_agent_tool_managers.get(sub_agent_name)
             if tool_manager is None:
-                logger.warning(f"[SubAgent] No tool manager for '{sub_agent_name}', running without tools")
+                logger.warning(
+                    f"[SubAgent] No tool manager for '{sub_agent_name}', running without tools"
+                )
             tool_executor = ToolExecutor(
                 tool_manager=tool_manager,
                 output_formatter=self.output_formatter,
                 tool_result_formatter=ToolResultFormatter(self.context),
                 context=self.context,
-                stream_tool_call=self.stream_handler.stream_tool_call if self.stream_handler else None,
+                stream_tool_call=self.stream_handler.stream_tool_call
+                if self.stream_handler
+                else None,
                 stream_tool_reasoning=self.stream_tool_reasoning,
-                stream_usage_info=self.stream_handler.stream_usage_info if self.stream_handler else None,
+                stream_usage_info=self.stream_handler.stream_usage_info
+                if self.stream_handler
+                else None,
             )
 
             llm_handler = LLMCallHandler(
@@ -281,7 +289,7 @@ class SubAgentRunner:
                 handle_summary=self.handle_summary or _noop_async,
                 intercept_key_message=self.intercept_key_message or _noop_async,
                 streaming_final_message=self.streaming_final_message or _noop_async,
-                stream_tool_reasoning=self.stream_tool_reasoning or (lambda *a, **kw: None),
+                stream_tool_reasoning=self.stream_tool_reasoning or _noop_async,
                 extract_recent_tool_names=extract_recent_tool_names,
                 deduplicate_trailing_messages=deduplicate_trailing_messages,
             )
@@ -292,7 +300,7 @@ class SubAgentRunner:
                 message_history=message_history,
                 tool_definitions=tool_definitions,
                 main_agent_prompt_instance=prompt_instance,
-                deep_research_cfg=None,  # No reflection for sub-agents
+                task_engine_cfg=None,  # No reflection for sub-agents
                 task_description=task_description,
                 task_guidance="",
                 keep_tool_result=effective_keep,
@@ -347,12 +355,13 @@ class SubAgentRunner:
             spawn_depth: Current nesting depth for the spawned agent.
             hooks_instance: HookRegistry instance (defaults to module-level singleton).
         """
-        from mem_deep_research_core.core.task_planner import TaskPlanner
+        from omegaconf import OmegaConf
+
         from mem_deep_research_core.core.message_utils import (
             deduplicate_trailing_messages,
             extract_recent_tool_names,
         )
-        from omegaconf import OmegaConf
+        from mem_deep_research_core.core.task_planner import TaskPlanner
 
         task_description = self._parse_task_description(task_description)
         task_description += "\n\nPlease provide the answer and detailed supporting information."
@@ -383,13 +392,15 @@ class SubAgentRunner:
         )
         summary_handler.context = self.context
 
-        spawn_cfg = OmegaConf.create({
-            "main_agent": {
-                "max_turns": 15,
-                "max_tool_calls_per_turn": 5,
-                "keep_tool_result": keep_tool_result,
+        spawn_cfg = OmegaConf.create(
+            {
+                "main_agent": {
+                    "max_turns": 15,
+                    "max_tool_calls_per_turn": 5,
+                    "keep_tool_result": keep_tool_result,
+                }
             }
-        })
+        )
 
         _noop_async = _make_noop_async()
         from mem_deep_research_core.utils.tool_utils import _load_agent_prompt
@@ -422,14 +433,16 @@ class SubAgentRunner:
             handle_summary=parent_callbacks.get("handle_summary") or _noop_async,
             intercept_key_message=parent_callbacks.get("intercept_key_message") or _noop_async,
             streaming_final_message=parent_callbacks.get("streaming_final_message") or _noop_async,
-            stream_tool_reasoning=parent_callbacks.get("stream_tool_reasoning") or (lambda *a, **kw: None),
+            stream_tool_reasoning=parent_callbacks.get("stream_tool_reasoning") or _noop_async,
             extract_recent_tool_names=extract_recent_tool_names,
             deduplicate_trailing_messages=deduplicate_trailing_messages,
             spawn_depth=spawn_depth,
             hooks=hooks_instance,
         )
 
-        message_history = [{"role": "user", "content": [{"type": "text", "text": task_description}]}]
+        message_history = [
+            {"role": "user", "content": [{"type": "text", "text": task_description}]}
+        ]
         runner = MainLoopRunner(ctx)
 
         try:
@@ -438,7 +451,7 @@ class SubAgentRunner:
                 message_history=message_history,
                 tool_definitions=parent_tool_definitions,
                 main_agent_prompt_instance=prompt_instance,
-                deep_research_cfg=None,
+                task_engine_cfg=None,
                 task_description=task_description,
                 task_guidance="",
                 keep_tool_result=keep_tool_result,
@@ -451,6 +464,8 @@ class SubAgentRunner:
 
 def _make_noop_async():
     """Create a no-op async callable for optional callback defaults."""
+
     async def _noop(*args, **kwargs):
         return None
+
     return _noop

@@ -1,8 +1,8 @@
-# Explicit Research Planning Protocol
+# Explicit Task Planning Protocol
 
-## Phase 1: Research Planning
+## Phase 1: Task Planning
 
-Before any tool use, output a research outline:
+Before any tool use, output a task execution outline:
 <research_plan>
 **Main Question**: [One sentence summary]
 **Sub-questions**: 1. [...] 2. [...]

@@ -138,6 +138,52 @@ tool_manager.set_context({
 
 浏览器自动化工具，支持网页抓取。
 
+### code_executor_server.py
+
+沙箱化的代码执行工具。支持 Python 代码和 shell 命令执行。
+
+```yaml
+# config/tool/tool-code-executor.yaml
+name: "tool-code-executor"
+transport: "inprocess"
+module: "mem_deep_research_core.tool.mcp_servers.code_executor_server"
+object: "mcp"
+```
+
+提供两个工具：
+- `execute_python(code, timeout=30)` — 执行 Python 代码，返回 stdout/stderr
+- `execute_command(command, timeout=30)` — 执行 shell 命令（受白名单限制）
+
+安全限制：
+- Python 代码写入临时文件后执行，非 `exec()` 方式
+- Shell 命令白名单：`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `find`, `echo`, `pwd`, `date`, `python`, `pip`
+- 执行超时保护（默认 30 秒）
+- 工作目录隔离
+
+### filesystem_server.py
+
+文件系统读写工具，支持路径白名单访问控制。
+
+```yaml
+# config/tool/tool-filesystem.yaml
+name: "tool-filesystem"
+transport: "inprocess"
+module: "mem_deep_research_core.tool.mcp_servers.filesystem_server"
+object: "mcp"
+env:
+  MCP_ALLOWED_DIRS: "${oc.env:MCP_ALLOWED_DIRS,./}"  # 逗号分隔的允许目录
+```
+
+提供工具：
+- `read_file(path, encoding="utf-8")` — 读取文件（大文件截断到 1MB）
+- `write_file(path, content, encoding="utf-8")` — 写入文件
+- `list_directory(path, max_entries=200)` — 列出目录内容
+
+安全限制：
+- 路径白名单：通过 `MCP_ALLOWED_DIRS` 环境变量配置允许访问的目录
+- 所有路径操作前校验 `Path.resolve()` 后是否在白名单内
+- 默认允许当前工作目录
+
 ## Hook 集成
 
 工具系统与 Hook 系统深度集成：

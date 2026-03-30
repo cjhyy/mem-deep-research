@@ -240,7 +240,8 @@ class LLMCallHandler:
                     if isinstance(inner, ContextLimitError):
                         logger.debug(f"⚠️ {purpose} context limit exceeded (from RetryError): {e}")
                         self._log_step(
-                            purpose, "context_limit",
+                            purpose,
+                            "context_limit",
                             f"{purpose} context limit exceeded (RetryError): {inner}",
                         )
                         return None, True, "context_limit"
@@ -310,6 +311,7 @@ class SummaryHandler:
             str: 摘要文本，失败时返回错误消息
         """
         import time as _time
+
         _summary_deadline = _time.perf_counter() + SUMMARY_GENERATION_TIMEOUT
 
         retry_count = 0
@@ -317,7 +319,9 @@ class SummaryHandler:
 
         while retry_count < max_context_retries:
             if _time.perf_counter() > _summary_deadline:
-                logger.warning(f"[SummaryHandler] Summary generation deadline exceeded ({SUMMARY_GENERATION_TIMEOUT}s)")
+                logger.warning(
+                    f"[SummaryHandler] Summary generation deadline exceeded ({SUMMARY_GENERATION_TIMEOUT}s)"
+                )
                 break
             target_language = self.response_language
 
@@ -330,11 +334,14 @@ class SummaryHandler:
             )
 
             # Hook: on_summarize_prompt_build
-            hook_result = hooks.call("on_summarize_prompt_build", HookContext(
-                hook_name="on_summarize_prompt_build",
-                result=summary_prompt,
-                context=self.context,
-            ))
+            hook_result = hooks.call(
+                "on_summarize_prompt_build",
+                HookContext(
+                    hook_name="on_summarize_prompt_build",
+                    result=summary_prompt,
+                    context=self.context,
+                ),
+            )
             if isinstance(hook_result, str):
                 summary_prompt = hook_result
 
@@ -344,7 +351,8 @@ class SummaryHandler:
                 message_history, summary_prompt
             )
 
-            # 添加摘要提示到消息历史
+            # 添加摘要提示到消息历史（记录位置以便失败时回滚）
+            history_len_before_summary = len(message_history)
             message_history.append(
                 {"role": "user", "content": [{"type": "text", "text": summary_prompt}]}
             )
@@ -415,12 +423,8 @@ class SummaryHandler:
                     "warning",
                 )
 
-            # 移除刚添加的摘要提示
-            if message_history and message_history[-1]["role"] == "user":
-                message_history.pop()
-            # 移除最近的 assistant 消息（可能是空响应）
-            if message_history and message_history[-1]["role"] == "assistant":
-                message_history.pop()
+            # 回滚：移除摘要提示及可能的空 assistant 响应，恢复到 append 前状态
+            del message_history[history_len_before_summary:]
 
             # Note: don't override task_failed here — summary retry is a context issue,
             # not a task failure. The original task_failed value is preserved.
@@ -546,7 +550,9 @@ def generate_reflection_prompt(
         反思提示词
     """
     task_preview = (
-        task_description[:TASK_PREVIEW_LENGTH] + "..." if len(task_description) > TASK_PREVIEW_LENGTH else task_description
+        task_description[:TASK_PREVIEW_LENGTH] + "..."
+        if len(task_description) > TASK_PREVIEW_LENGTH
+        else task_description
     )
 
     template_name = "reflection/reflection_chinese" if chinese_context else "reflection/reflection"

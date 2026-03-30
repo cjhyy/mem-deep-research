@@ -178,9 +178,7 @@ class ConfigLoader:
                         if potential_path.exists() or arg.endswith(".py"):
                             arg = str(potential_path)
                     else:
-                        logger.warning(
-                            f"[ConfigLoader] Blocked path traversal in tool arg: {arg}"
-                        )
+                        logger.warning(f"[ConfigLoader] Blocked path traversal in tool arg: {arg}")
             resolved_args.append(arg)
         return resolved_args
 
@@ -437,7 +435,11 @@ def load_yaml_config(config_path: Path) -> Any:
     cfg = OmegaConf.load(config_path)
     try:
         cfg = OmegaConf.to_container(cfg, resolve=True)
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            f"[ConfigLoader] OmegaConf variable resolution failed for {config_path}: {e}. "
+            f"Falling back to unresolved mode — check that all environment variables are set."
+        )
         cfg = OmegaConf.to_container(cfg, resolve=False)
     cfg = OmegaConf.create(cfg)
     return cfg

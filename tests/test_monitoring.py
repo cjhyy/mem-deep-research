@@ -336,11 +336,11 @@ class TestStallEscalation:
         """超过阈值 → WARN"""
         monitor = ExecutionMonitor(
             config=MonitoringConfig(
-                stall_detection_threshold=0.01,
-                stall_terminate_multiplier=2.0,
+                stall_detection_threshold=0.05,
+                stall_terminate_multiplier=4.0,
             )
         )
-        time.sleep(0.015)  # > 0.01 but < 0.02
+        time.sleep(0.08)  # > 0.05 but < 0.20 (terminate threshold)
         action = await monitor.check_stall()
         assert action == EscalationAction.WARN
 
@@ -460,7 +460,7 @@ class TestBackwardCompatibility:
         """默认配置值向后兼容"""
         config = MonitoringConfig()
         assert config.stall_detection_threshold == 120.0
-        assert config.max_total_time == 600.0
+        assert config.max_total_time == 1800.0
         assert config.max_consecutive_empty_turns == 3
         assert config.enable_loop_detection is True
         assert config.loop_detection_text_length == 500

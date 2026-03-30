@@ -26,7 +26,7 @@ class InterceptorConfig:
             默认: ["use_mcp_tool"]
 
         reasoning_tags: 需要提取为 reasoning block 的标签列表
-            默认: ["thinking", "think", "research_plan", "findings_update", "reflection_checkpoint"]
+            默认: ["thinking", "think", "task_plan", "findings_update", "reflection_checkpoint"]
 
         show_reasoning: 是否将 reasoning 内容作为事件发送
             默认: True
@@ -93,7 +93,7 @@ class InterceptorConfig:
 
     def get_all_filter_keywords(self) -> list[str]:
         """获取所有需要过滤的完整标签（带尖括号）"""
-        return [f"<{tag}>" for tag in self.filter_tags]
+        return [f"<{tag}>" for tag in self.filter_tags if tag and not tag.startswith("<")]
 
     def should_extract_as_reasoning(self, tag_name: str) -> bool:
         """判断标签是否应该提取为 reasoning"""

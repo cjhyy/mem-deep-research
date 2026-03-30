@@ -4,15 +4,15 @@
 # The framework auto-selects execution mode based on task complexity.
 #
 # Usage:
-#   python run.py "你好"                          → flash: 直接回答
+#   python run.py "你好"                          → quick: 快速回答(≤3轮)
 #   python run.py "123 * 456"                     → standard: 用计算器
-#   python run.py "研究量子计算的最新进展" --deep   → deep: 多轮研究 + 反思
+#   python run.py "研究量子计算的最新进展" --deep   → deep: 多轮执行 + 反思
 
 main_agent:
   prompt:
     agent_type: main
     tool_format: xml
-    presets: [research]
+    presets: [task_completion]
 
   llm:
     provider_class: "ClaudeOpenRouterClient"
@@ -39,12 +39,13 @@ main_agent:
   # Tools — framework auto-provides spawn_agent + update_todo as built-in tools
   tool_config:
     - tool-calculator
+    - tool-filesystem
     - tool-searching-serper
 
   keep_tool_result: -1             # -1 全部保留
 
   # Execution
-  execution_mode: auto             # auto | flash | standard | deep
+  execution_mode: auto             # auto | quick | standard | deep
   max_turns: 30                    # 足够长程任务
   max_tool_calls_per_turn: 10
   max_concurrent_subagents: 3      # 并行子 agent 限制
@@ -63,8 +64,8 @@ main_agent:
     enabled: true
 
   # Deep research — reflection checkpoints for long tasks
-  deep_research:
-    enabled: true
+  task_engine:
+    enabled: false                   # true 时强制 deep 模式，false 时 auto 由 LLM 判断
     reflection_interval: 5
     auto_planning: false           # LLM 自主决定是否分解任务
 

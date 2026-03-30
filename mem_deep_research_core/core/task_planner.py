@@ -28,7 +28,7 @@ class SubQuestion:
 
 
 @dataclass
-class ResearchPlan:
+class TaskPlan:
     """研究计划"""
 
     main_question: str
@@ -70,7 +70,7 @@ class TaskPlanner:
         task_description: str,
         llm_client,
         system_prompt: str = "",
-    ) -> ResearchPlan | None:
+    ) -> TaskPlan | None:
         """创建研究计划
 
         Args:
@@ -79,7 +79,7 @@ class TaskPlanner:
             system_prompt: 系统提示词
 
         Returns:
-            ResearchPlan 或 None（如果规划失败）
+            TaskPlan 或 None（如果规划失败）
         """
         if not self.enabled:
             return None
@@ -119,7 +119,7 @@ class TaskPlanner:
             logger.warning(f"[TaskPlanner] Planning failed (graceful fallback): {e}")
             return None
 
-    def _parse_plan(self, task_description: str, response_text: str) -> ResearchPlan | None:
+    def _parse_plan(self, task_description: str, response_text: str) -> TaskPlan | None:
         """解析 LLM 返回的规划 JSON
 
         Args:
@@ -127,7 +127,7 @@ class TaskPlanner:
             response_text: LLM 返回的文本
 
         Returns:
-            ResearchPlan 或 None
+            TaskPlan 或 None
         """
         try:
             # 尝试直接解析
@@ -153,7 +153,7 @@ class TaskPlanner:
                 logger.warning(f"[TaskPlanner] JSON parse failed: {e}")
                 return None
 
-        # 构建 ResearchPlan
+        # 构建 TaskPlan
         sub_questions = []
         raw_questions = data.get("sub_questions", [])
 
@@ -172,7 +172,7 @@ class TaskPlanner:
             logger.warning("[TaskPlanner] No valid sub-questions found")
             return None
 
-        plan = ResearchPlan(
+        plan = TaskPlan(
             main_question=task_description,
             sub_questions=sub_questions,
         )

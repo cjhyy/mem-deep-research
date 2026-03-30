@@ -12,11 +12,10 @@ Commented examples:
   - Language detection override
 """
 
-import json
 import logging
 import time
 
-from mem_deep_research_core.core.hooks import hooks, HookContext
+from mem_deep_research_core.core.hooks import HookContext, hooks
 
 logger = logging.getLogger(__name__)
 

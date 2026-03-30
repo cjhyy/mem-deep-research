@@ -263,8 +263,10 @@ async def collect_anthropic_stream(stream: AsyncIterator[Any]) -> Any:
                 try:
                     block["input"] = json.loads(block["input"])
                 except json.JSONDecodeError:
+                    logger.warning(
+                        f"[Stream] Failed to parse tool_use input as JSON, keeping as string (length={len(block['input'])})"
+                    )
                     # Keep as string if parsing fails
-                    pass
 
     # Convert dict content blocks to proper Anthropic content block objects
     # We need to reconstruct them using the proper model classes

@@ -77,9 +77,15 @@ MAX_SPAWN_DEPTH = 2
 # ============================================================
 
 EXECUTION_MODE_AUTO = "auto"
-EXECUTION_MODE_FLASH = "flash"
+EXECUTION_MODE_QUICK = "quick"
 EXECUTION_MODE_STANDARD = "standard"
 EXECUTION_MODE_DEEP = "deep"
+
+# Quick mode limits
+QUICK_MODE_MAX_TURNS = 3
+
+# Transient errors eligible for tool auto-retry
+TOOL_TRANSIENT_ERRORS = (ConnectionError, TimeoutError, BrokenPipeError, EOFError, OSError)
 
 # ============================================================
 # Monitoring
@@ -124,7 +130,7 @@ DEFAULT_FILTER_TAGS = ["use_mcp_tool"]
 DEFAULT_REASONING_TAGS = [
     "thinking",
     "think",
-    "research_plan",
+    "task_plan",
     "findings_update",
     "reflection_checkpoint",
 ]
@@ -133,11 +139,11 @@ DEFAULT_REASONING_TAGS = [
 # Message Tags (injected into message_history)
 # ============================================================
 
-TAG_RESEARCH_PLAN = "[RESEARCH PLAN]"
+TAG_TASK_PLAN = "[TASK PLAN]"
 TAG_COLLECTED_SOURCES = "[COLLECTED SOURCES]"
 # NOTE: Intentionally without closing ']' — used as prefix for startswith() checks.
-# Full format: "[RESEARCH CONTEXT SUMMARY — turns 1-N]"
-TAG_RESEARCH_CONTEXT_SUMMARY = "[RESEARCH CONTEXT SUMMARY"
+# Full format: "[CONTEXT SUMMARY — turns 1-N]"
+TAG_CONTEXT_SUMMARY = "[CONTEXT SUMMARY"
 TAG_CONTENT_REMOVED = "[Content removed to reduce context]"
 TAG_TASK_PROGRESS = "[TASK PROGRESS]"
 
@@ -172,6 +178,7 @@ FALLBACK_LOOP_TERMINATED = (
 def generate_message_id() -> str:
     """Generate random message ID using common LLM format"""
     import uuid
+
     return f"msg_{uuid.uuid4().hex[:8]}"
 
 

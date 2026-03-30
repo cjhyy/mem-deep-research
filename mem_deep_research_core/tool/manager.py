@@ -47,6 +47,7 @@ class _InProcessSessionAdapter:
 
     class _ListToolsResult:
         """Wrapper so that ``result.tools`` works like MCP ClientSession."""
+
         def __init__(self, tools: list):
             self.tools = tools
 
@@ -72,7 +73,7 @@ def _default_env_inject(ctx) -> Any:
     # Inject all string-valued context fields as env vars (skip internal fields)
     if context:
         skip_keys = {"_secure", "meta_chat_history", "mode", "role_purpose"}
-        for key, val in context.items():
+        for key, _val in context.items():
             if key in skip_keys or key.startswith("_"):
                 continue
             real_val = get_real_value(context, key)
@@ -173,7 +174,10 @@ class ToolManager(ToolManagerProtocol):
         }
         # In-process MCP server module references
         self.server_module_info = {
-            config["name"]: {"module": config.get("module", ""), "object": config.get("object", "mcp")}
+            config["name"]: {
+                "module": config.get("module", ""),
+                "object": config.get("object", "mcp"),
+            }
             for config in server_configs
             if config.get("transport") == "inprocess"
         }
@@ -267,6 +271,7 @@ class ToolManager(ToolManagerProtocol):
             headers = self.server_headers.get(server_name, {})
 
             import time as _time
+
             _sess_start = _time.perf_counter()
 
             if transport == "inprocess":
@@ -279,18 +284,22 @@ class ToolManager(ToolManagerProtocol):
                     raise ValueError(f"No module specified for in-process server '{server_name}'")
 
                 import importlib
+
                 mod = importlib.import_module(module_path)
                 mcp_app = getattr(mod, object_name)
 
                 # FastMCP Client wrapped in adapter for MCP ClientSession compatibility
                 from fastmcp import Client
+
                 client = Client(mcp_app)
                 await self._exit_stack.enter_async_context(client)
                 session = _InProcessSessionAdapter(client)
 
                 self._persistent_sessions[server_name] = session
                 _sess_elapsed = _time.perf_counter() - _sess_start
-                logger.info(f"[ToolManager] In-process session created for '{server_name}' in {_sess_elapsed:.3f}s")
+                logger.info(
+                    f"[ToolManager] In-process session created for '{server_name}' in {_sess_elapsed:.3f}s"
+                )
                 return session, False
 
             try:
@@ -298,7 +307,9 @@ class ToolManager(ToolManagerProtocol):
                     updated_params = update_server_params_with_context(server_params, self._context)
                     transport_ctx = stdio_client(updated_params)
                     read, write = await self._exit_stack.enter_async_context(transport_ctx)
-                elif isinstance(server_params, str) and server_params.startswith(("http://", "https://")):
+                elif isinstance(server_params, str) and server_params.startswith(
+                    ("http://", "https://")
+                ):
                     if transport == "streamable-http" and HAS_STREAMABLE_HTTP:
                         transport_ctx = streamablehttp_client(server_params, headers=headers)
                         read, write, _ = await self._exit_stack.enter_async_context(transport_ctx)
@@ -306,7 +317,9 @@ class ToolManager(ToolManagerProtocol):
                         transport_ctx = sse_client(server_params)
                         read, write = await self._exit_stack.enter_async_context(transport_ctx)
                 else:
-                    raise TypeError(f"Unknown server params type for {server_name}: {type(server_params)}")
+                    raise TypeError(
+                        f"Unknown server params type for {server_name}: {type(server_params)}"
+                    )
 
                 session = await self._exit_stack.enter_async_context(
                     ClientSession(read, write, sampling_callback=None)
@@ -315,11 +328,15 @@ class ToolManager(ToolManagerProtocol):
 
                 self._persistent_sessions[server_name] = session
                 _sess_elapsed = _time.perf_counter() - _sess_start
-                logger.info(f"[ToolManager] Persistent session created for '{server_name}' (transport={transport}) in {_sess_elapsed:.3f}s")
+                logger.info(
+                    f"[ToolManager] Persistent session created for '{server_name}' (transport={transport}) in {_sess_elapsed:.3f}s"
+                )
                 return session, False
 
             except Exception as e:
-                logger.error(f"[ToolManager] Failed to create persistent session for '{server_name}': {e}")
+                logger.error(
+                    f"[ToolManager] Failed to create persistent session for '{server_name}': {e}"
+                )
                 raise
 
     async def _invalidate_session(self, server_name: str) -> None:
@@ -332,9 +349,16 @@ class ToolManager(ToolManagerProtocol):
         logger.info(f"[ToolManager] Invalidated session for '{server_name}'")
 
     async def close_sessions(self) -> None:
-        """Close all persistent sessions and reset the exit stack."""
+        """Close all persistent sessions, browser session, and reset the exit stack."""
         self._persistent_sessions.clear()
         self._session_locks.clear()
+        # Close browser session if it was created
+        if self.browser_session is not None:
+            try:
+                await self.browser_session.close()
+            except Exception as e:
+                logger.warning(f"[ToolManager] Error closing browser session: {e}")
+            self.browser_session = None
         try:
             await self._exit_stack.aclose()
         except Exception as e:
@@ -453,7 +477,6 @@ class ToolManager(ToolManagerProtocol):
         server_name = config["name"]
         server_params = config["params"]
         transport = config.get("transport", "stdio")
-        headers = config.get("headers", {})
         one_server_for_prompt = {"name": server_name, "tools": []}
 
         # Check cache first
@@ -544,7 +567,12 @@ class ToolManager(ToolManagerProtocol):
     # Timeout configurable via _TOOL_CALL_TIMEOUT class variable
     @with_timeout(900)
     async def execute_tool_call(
-        self, server_name, tool_name, arguments, context: dict = None
+        self,
+        server_name,
+        tool_name,
+        arguments,
+        context: dict = None,
+        _correction_depth: int = 0,
     ) -> Any:
         """
         Execute a single tool call.
@@ -564,7 +592,7 @@ class ToolManager(ToolManagerProtocol):
 
             error_message = f"Server '{server_name}' not found."
 
-            if len(suggested_servers) == 1:
+            if len(suggested_servers) == 1 and _correction_depth < 1:
                 # Auto-correction: only one server contains the tool, try to auto-correct and execute
                 correct_server = suggested_servers[0]
                 logger.info(
@@ -572,9 +600,13 @@ class ToolManager(ToolManagerProtocol):
                 )
 
                 try:
-                    # Recursive call, using the correct server name
+                    # Recursive call, using the correct server name (depth-limited to prevent infinite recursion)
                     corrected_result = await self.execute_tool_call(
-                        correct_server, tool_name, arguments
+                        correct_server,
+                        tool_name,
+                        arguments,
+                        context=context,
+                        _correction_depth=_correction_depth + 1,
                     )
 
                     # If auto-correction is successful, add a note in the result
@@ -674,6 +706,7 @@ class ToolManager(ToolManagerProtocol):
 
                 # Use persistent session pool
                 import time as _time
+
                 try:
                     _perf_sess_start = _time.perf_counter()
                     session, was_cached = await self._get_or_create_session(server_name)
@@ -684,29 +717,58 @@ class ToolManager(ToolManagerProtocol):
                     )
                     _perf_call_start = _time.perf_counter()
                     try:
-                        tool_result = await session.call_tool(tool_name, arguments=enriched_arguments)
-                        result_content = self._extract_tool_result(tool_name, tool_result, arguments)
+                        tool_result = await session.call_tool(
+                            tool_name, arguments=enriched_arguments
+                        )
+                        result_content = self._extract_tool_result(
+                            tool_name, tool_result, arguments
+                        )
                     except (ConnectionError, OSError, BrokenPipeError, EOFError) as conn_err:
                         # Session may be stale, invalidate and retry once
-                        logger.warning(f"Connection error for '{server_name}', retrying with new session: {conn_err}")
+                        logger.warning(
+                            f"Connection error for '{server_name}', retrying with new session: {conn_err}"
+                        )
                         await self._invalidate_session(server_name)
                         try:
                             session, _ = await self._get_or_create_session(server_name)
-                            tool_result = await session.call_tool(tool_name, arguments=enriched_arguments)
-                            result_content = self._extract_tool_result(tool_name, tool_result, arguments)
+                            tool_result = await session.call_tool(
+                                tool_name, arguments=enriched_arguments
+                            )
+                            result_content = self._extract_tool_result(
+                                tool_name, tool_result, arguments
+                            )
                         except Exception as retry_err:
-                            logger.error(f"Retry also failed for '{server_name}/{tool_name}': {retry_err}")
-                            return {"server_name": server_name, "tool_name": tool_name, "error": f"Tool call failed after retry: {str(retry_err)}"}
+                            logger.error(
+                                f"Retry also failed for '{server_name}/{tool_name}': {retry_err}"
+                            )
+                            return {
+                                "server_name": server_name,
+                                "tool_name": tool_name,
+                                "error": f"Tool call failed after retry: {str(retry_err)}",
+                            }
                     except TimeoutError as tool_error:
                         logger.error(f"Tool execution timeout: {tool_error}")
-                        return {"server_name": server_name, "tool_name": tool_name, "error": f"Tool execution timed out: {str(tool_error)}"}
+                        await self._invalidate_session(server_name)
+                        return {
+                            "server_name": server_name,
+                            "tool_name": tool_name,
+                            "error": f"Tool execution timed out: {str(tool_error)}",
+                        }
                     except (ValueError, TypeError, RuntimeError) as tool_error:
                         logger.error(f"Tool execution error: {tool_error}")
-                        return {"server_name": server_name, "tool_name": tool_name, "error": f"Tool execution failed: {str(tool_error)}"}
+                        return {
+                            "server_name": server_name,
+                            "tool_name": tool_name,
+                            "error": f"Tool execution failed: {str(tool_error)}",
+                        }
                 except Exception as e:
                     # Session creation failed
                     logger.error(f"Failed to get session for '{server_name}': {e}")
-                    return {"server_name": server_name, "tool_name": tool_name, "error": f"Session creation failed: {str(e)}"}
+                    return {
+                        "server_name": server_name,
+                        "tool_name": tool_name,
+                        "error": f"Session creation failed: {str(e)}",
+                    }
 
                 _perf_call_elapsed = _time.perf_counter() - _perf_call_start
                 logger.info(
@@ -721,7 +783,11 @@ class ToolManager(ToolManagerProtocol):
                             f"Auto-correction: Tool '{tool_name}' not found in '{server_name}', trying '{suggested_servers[0]}'"
                         )
                         return await self.execute_tool_call(
-                            suggested_servers[0], tool_name, arguments
+                            suggested_servers[0],
+                            tool_name,
+                            arguments,
+                            context=context,
+                            _correction_depth=_correction_depth + 1,
                         )
 
                 return {

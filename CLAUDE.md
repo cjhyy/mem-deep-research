@@ -216,13 +216,13 @@ sub_agents:
 
 ```yaml
 main_agent:
-  execution_mode: auto         # auto | flash | standard | deep
+  execution_mode: auto         # auto | quick | standard | deep
 ```
 
 | 模式 | 行为 |
 |------|------|
-| `auto`（默认） | deep_research 启用 → deep，否则 standard |
-| `flash` | 单轮 LLM，不调工具，直接回答 |
+| `auto`（默认） | task_engine 启用 → deep，否则 standard |
+| `quick` | 少轮执行，可调工具，不做反思 |
 | `standard` | 多轮循环，调用工具 |
 | `deep` | 多轮 + 反思检查点 + 可 spawn 子 Agent |
 
@@ -306,7 +306,7 @@ Skill 渐进加载（`progressive: true`，默认）：第一轮只注入 catalo
 prompt:
   agent_type: main           # main | worker
   tool_format: xml           # xml | native
-  presets: [research, time_sensitive]  # 可选预设
+  presets: [task_completion, time_sensitive]  # 可选预设
   custom_system_template: my_prompt    # 自定义模板
 ```
 
@@ -331,11 +331,11 @@ main_agent:
   max_tool_calls_per_turn: 10
   keep_tool_result: -1            # -1 全部保留, N 保留最近 N 个
   response_language: auto          # auto | Chinese | English | ...
-  execution_mode: auto             # auto | flash | standard | deep
+  execution_mode: auto             # auto | quick | standard | deep (Literal 校验)
   max_concurrent_subagents: 3      # 最大并行子 Agent 数
   add_message_id: true
   todo_tracker:
-    enabled: false                 # 也会随 deep_research.enabled 自动启用
+    enabled: false                 # 也会随 task_engine.enabled 自动启用
   skill_selection:
     enabled: true
     method: inline                 # rules | llm | inline
@@ -343,7 +343,7 @@ main_agent:
   context_manager:
     enable_dedup: true
     enable_compact: true
-    compact_at_ratio: 0.6
+    compact_at_ratio: 0.6            # 必须 < summarize_at_ratio（交叉校验）
     summarize_at_ratio: 0.8
     compact_keep_recent: 3
     max_dedup_cache_size: 200
@@ -354,7 +354,7 @@ main_agent:
     max_total_time: 600.0
     temperature_boost: 0.3
     temperature_boost_cap: 1.0
-  deep_research:
+  task_engine:
     enabled: false
     reflection_interval: 5
     auto_planning: false
@@ -375,3 +375,5 @@ output_dir: logs/
 - 业务逻辑不内置在框架中，通过 hook 注入（如用户身份、benchmark 特定逻辑）
 - 新增核心功能需在 `config_schema.py` 添加配置项并设合理默认值
 - 所有硬编码值统一管理在 `core/constants.py`
+- Hook 链中 `GuardrailError` 会被 re-raise，不会被 catch-all 吞掉
+- `GuardrailError` 已在 `__init__.py` 导出，可通过 `from mem_deep_research_core import GuardrailError` 使用

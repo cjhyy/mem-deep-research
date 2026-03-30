@@ -62,7 +62,9 @@ class MessageInterceptorHandler:
             self.config = config
         elif keywords is not None:
             # 兼容旧接口：从 keywords 创建配置
-            self.config = InterceptorConfig(filter_tags=[k.strip("<>") for k in keywords])
+            self.config = InterceptorConfig(
+                filter_tags=[k.lstrip("<").rstrip(">") for k in keywords]
+            )
         else:
             self.config = InterceptorConfig()
 
@@ -89,7 +91,7 @@ class MessageInterceptorHandler:
         self.key_message_interceptor = TextInterceptor(
             filter_keywords, reasoning_tags=reasoning_tags
         )
-        # 最终消息拦截器（用于最终输出）
+        # 最终消息拦截器重置（确保 update_config 后不使用旧实例）
         self._final_message_interceptor: TextInterceptor | None = None
 
     def update_config(self, config: InterceptorConfig) -> None:
@@ -177,7 +179,7 @@ class MessageInterceptorHandler:
                 ),
             )
             if hook_result is not None:
-                result = hook_result
+                result = hook_result  # Allow hook to return "" (empty string) as valid override
 
             # Debug: Log extracted reasoning blocks
             if reasoning_blocks:

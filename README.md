@@ -1,15 +1,20 @@
 # Mem Deep Research
 
-可扩展的 AI Agent 框架，专注于深度研究任务。基于 MCP 工具协议，支持多 LLM 提供商。
+可扩展的 AI Agent 端到端任务完成框架。基于 MCP 工具协议，支持多 LLM 提供商。
 
 ## 特性
 
 - **MCP 工具系统** — 本地 (stdio)、远程 HTTP (streamable-http)、SSE 三种传输模式
+- **内置工具** — 计算器、文件系统读写、代码执行器、搜索引擎
 - **三级上下文管理** — Observation Masking → LLM 摘要压缩 → 二分裁剪，自动防爆
 - **执行监控** — 三级升级策略 (WARN → INJECT_HINT → TERMINATE)，循环检测 + 超时控制
 - **Hook 系统** — 17 个生命周期钩子，所有行为可自定义
 - **多语言支持** — `response_language: auto` 自动检测回答语言
 - **子 Agent** — 复杂任务自动分解，子 Agent 复用主循环，上下文隔离
+- **记忆系统** — SessionMemory（短期）+ LongTermMemory（跨 session 持久化）
+- **任务追踪** — TodoTracker 独立于消息历史，上下文压缩时不丢失
+- **四种执行模式** — quick / standard / deep / auto，按需选择
+- **任务恢复** — `resume()` 从中断点恢复执行
 - **Skill 系统** — 规则匹配 / LLM 选择 / Inline 三种模式
 - **隐私保护** — `_secure` 字段自动占位符替换
 - **多 LLM 支持** — Anthropic、OpenAI、OpenRouter、DeepSeek 等
@@ -68,6 +73,12 @@ result = await dr.run("123 * 456 + 789")
 
 # 同步调用
 result = dr.run_sync("你的任务")
+
+# 批量运行
+results = await dr.run_batch(["任务1", "任务2"], parallel=True, max_concurrent=3)
+
+# 从中断点恢复
+result = await dr.resume("logs/task_xxx.json")
 ```
 
 ## 项目结构
@@ -107,7 +118,7 @@ main_agent:
   prompt:
     agent_type: main             # main | worker
     tool_format: xml             # xml | native
-    presets: [research]          # 可选: research, time_sensitive, research_planning
+    presets: [task_completion]    # 可选: task_completion, task_planning, time_sensitive
 
   llm:
     provider_class: "ClaudeOpenRouterClient"
@@ -119,6 +130,7 @@ main_agent:
 
   tool_config:
     - tool-calculator
+    - tool-filesystem            # 文件读写
     - tool-searching-serper      # 需要 SERPER_API_KEY
 
   max_turns: 20
@@ -127,7 +139,7 @@ main_agent:
 
   response_language: auto        # auto | Chinese | English | Japanese | ...
 
-  deep_research:
+  task_engine:
     enabled: true
     reflection_interval: 5
 
@@ -209,11 +221,12 @@ def customize_prompt(ctx: HookContext, original_fn):
     return prompt + "\n\nAlways cite sources."
 
 # Guardrail — 阻止危险操作
+from mem_deep_research_core import GuardrailError
+
 @hooks.register("on_before_llm_call", priority=10)
 def guardrail(ctx: HookContext, original_fn):
-    from mem_deep_research_core.exceptions import GuardrailError
     if "DELETE" in str(ctx.extra.get("messages", [])):
-        raise GuardrailError("Blocked: SQL DELETE detected")
+        raise GuardrailError("safety", "Blocked: SQL DELETE detected")
     return original_fn(ctx)
 ```
 
@@ -269,13 +282,31 @@ DeepResearch.run(query)
   → ResearchResult
 ```
 
-详细文档见 [`docs/`](docs/) 目录。
+详细文档见 [`docs/`](docs/) 目录：
+
+| 文档 | 内容 |
+|------|------|
+| [00-architecture](docs/00-architecture.md) | 架构概览 |
+| [01-quick-start](docs/01-quick-start.md) | 快速开始 |
+| [02-configuration](docs/02-configuration.md) | 配置系统 |
+| [03-core-modules](docs/03-core-modules.md) | 核心模块 |
+| [04-context-management](docs/04-context-management.md) | 上下文管理 |
+| [05-monitoring](docs/05-monitoring.md) | 执行监控 |
+| [06-llm-providers](docs/06-llm-providers.md) | LLM Provider |
+| [07-tool-system](docs/07-tool-system.md) | 工具系统 |
+| [08-hook-and-secure-context](docs/08-hook-and-secure-context.md) | Hook 与隐私保护 |
+| [09-prompt-system](docs/09-prompt-system.md) | Prompt 系统 |
+| [10-skill-system](docs/10-skill-system.md) | Skill 系统 |
+| [11-development](docs/11-development.md) | 开发指南 |
+| [12-memory-and-todo](docs/12-memory-and-todo.md) | 记忆与任务追踪 |
+| [13-execution-modes](docs/13-execution-modes.md) | 执行模式与语言控制 |
+| [14-api-reference](docs/14-api-reference.md) | API 参考 |
 
 ## 开发
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest tests/ -v     # 248 tests
+python -m pytest tests/ -v
 ```
 
 ## License

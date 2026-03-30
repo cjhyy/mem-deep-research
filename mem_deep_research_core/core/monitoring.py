@@ -34,8 +34,10 @@ class MonitoringConfig:
 
     # 停滞检测阈值（秒）
     stall_detection_threshold: float = 120.0
-    # 最大总运行时间（秒）
-    max_total_time: float = 600.0
+    # 最大总运行时间（秒），0 表示不限时
+    max_total_time: float = 1800.0
+    # 软超时比例（到达此比例时注入 hint 而非终止）
+    soft_timeout_ratio: float = 0.8
     # 连续空响应导致终止的阈值
     max_consecutive_empty_turns: int = 3
     # 是否启用重复响应检测
@@ -62,6 +64,7 @@ class MonitoringConfig:
         return cls(
             stall_detection_threshold=schema.stall_detection_threshold,
             max_total_time=schema.max_total_time,
+            soft_timeout_ratio=getattr(schema, "soft_timeout_ratio", 0.8),
             max_consecutive_empty_turns=schema.max_consecutive_empty_turns,
             enable_loop_detection=schema.enable_loop_detection,
             loop_detection_text_length=schema.loop_detection_text_length,
@@ -118,11 +121,13 @@ class ExecutionMonitor:
         self.stream_reasoning_callback = stream_reasoning_callback
         self.state = MonitoringState()
         self._last_loop_action = EscalationAction.NONE
+        self._soft_timeout_fired = False
 
     def reset(self):
         """重置监控状态"""
         self.state = MonitoringState()
         self._last_loop_action = EscalationAction.NONE
+        self._soft_timeout_fired = False
 
     @property
     def last_loop_action(self) -> EscalationAction:
@@ -137,24 +142,40 @@ class ExecutionMonitor:
         """获取距离上次进展的时间（秒）"""
         return time.time() - self.state.last_progress_time
 
-    async def check_timeout(self) -> bool:
+    async def check_timeout(self) -> str | None:
         """
         检查是否超时
 
         Returns:
             bool: True 表示已超时，应该终止
         """
+        if self.config.max_total_time <= 0:
+            return None  # Unlimited time
+
         elapsed = self.get_elapsed_time()
+        soft_limit = self.config.max_total_time * self.config.soft_timeout_ratio
+
         if elapsed > self.config.max_total_time:
-            logger.warning(f"[MONITOR] 思考超时，已运行 {elapsed:.0f}s，强制结束")
+            logger.warning(f"[MONITOR] 硬超时，已运行 {elapsed:.0f}s，生成中间结论")
             if self.stream_reasoning_callback:
                 await self.stream_reasoning_callback(
                     "monitor",
                     "TIMEOUT",
-                    f"思考过程已超过 {self.config.max_total_time}s 限制，将生成当前结论",
+                    f"已超过 {self.config.max_total_time:.0f}s 时间限制，将基于当前进展生成结论",
                 )
-            return True
-        return False
+            return "hard_timeout"
+        elif elapsed > soft_limit and not getattr(self, "_soft_timeout_fired", False):
+            self._soft_timeout_fired = True
+            remaining = int(self.config.max_total_time - elapsed)
+            logger.info(f"[MONITOR] 软超时，已运行 {elapsed:.0f}s，剩余 {remaining}s")
+            if self.stream_reasoning_callback:
+                await self.stream_reasoning_callback(
+                    "monitor",
+                    "SOFT_TIMEOUT",
+                    f"已运行 {elapsed:.0f}s，剩余约 {remaining}s。请尽快总结当前进展。",
+                )
+            return "soft_timeout"
+        return None
 
     async def check_stall(self) -> EscalationAction:
         """
@@ -398,10 +419,15 @@ class ExecutionMonitor:
         轮次前检查
 
         Returns:
-            Optional[str]: 如果需要终止，返回终止原因；否则返回 None
+            Optional[str]: 如果需要终止，返回终止原因；
+                           "soft_timeout" 表示应注入催促但不终止；
+                           None 表示正常继续。
         """
-        if await self.check_timeout():
+        timeout_result = await self.check_timeout()
+        if timeout_result == "hard_timeout":
             return "timeout"
+        elif timeout_result == "soft_timeout":
+            return "soft_timeout"
 
         stall_action = await self.check_stall()
         if stall_action == EscalationAction.TERMINATE:

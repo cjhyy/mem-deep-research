@@ -25,16 +25,27 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
         stream_message_callback=None,
     ):
         """Override to inject native tool_calls list into params via _customize_params."""
-        # Pre-compute tool list and store for _customize_params to pick up
-        self._pending_tool_list = await self.convert_tool_definition_to_tool_call(tools_definitions)
-        return await super()._create_message(
-            system_prompt, messages, tools_definitions, keep_tool_result, stream_message_callback
-        )
+        # Pre-compute tool list and store for _customize_params to pick up.
+        # Use a local-then-instance pattern: compute locally, assign just before super() call,
+        # and clear after. This minimizes (but does not eliminate) the concurrency window.
+        tool_list = await self.convert_tool_definition_to_tool_call(tools_definitions)
+        self._pending_tool_list = tool_list
+        try:
+            return await super()._create_message(
+                system_prompt,
+                messages,
+                tools_definitions,
+                keep_tool_result,
+                stream_message_callback,
+            )
+        finally:
+            self._pending_tool_list = None
 
     def _customize_params(self, params: dict) -> dict:
         params["stream"] = False
-        if hasattr(self, "_pending_tool_list") and self._pending_tool_list:
-            params["tools"] = self._pending_tool_list
+        pending = getattr(self, "_pending_tool_list", None)
+        if pending:
+            params["tools"] = pending
         return params
 
     def process_llm_response(

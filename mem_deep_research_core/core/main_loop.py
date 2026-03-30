@@ -25,20 +25,20 @@ from mem_deep_research_core.core.constants import (
     DEFAULT_TEMPERATURE_BOOST_CAP,
     EXECUTION_MODE_AUTO,
     EXECUTION_MODE_DEEP,
-    EXECUTION_MODE_FLASH,
+    EXECUTION_MODE_QUICK,
     EXECUTION_MODE_STANDARD,
-    FALLBACK_NO_ANSWER,
     MAX_CONTEXT_LIMIT_RETRIES,
     MAX_SPAWN_DEPTH,
+    QUICK_MODE_MAX_TURNS,
     SUB_AGENT_PREFIX,
     TAG_COLLECTED_SOURCES,
-    TAG_RESEARCH_PLAN,
+    TAG_TASK_PLAN,
     generate_message_id,
 )
-from mem_deep_research_core.core.hooks import HookContext, HookRegistry, hooks as _default_hooks
-from mem_deep_research_core.core.memory import SessionMemory
-from mem_deep_research_core.core.todo_tracker import TodoTracker
+from mem_deep_research_core.core.hooks import HookContext
+from mem_deep_research_core.core.hooks import hooks as _default_hooks
 from mem_deep_research_core.core.llm_call_handler import generate_reflection_prompt
+from mem_deep_research_core.core.memory import SessionMemory
 from mem_deep_research_core.core.monitoring import (
     EscalationAction,
     TurnCounter,
@@ -173,18 +173,72 @@ class MainLoopRunner:
         # 当前 Agent ID
         self.current_agent_id: str | None = None
 
+    async def _route_execution_mode(
+        self, task_description: str, task_engine_cfg: dict | None
+    ) -> str:
+        """LLM 智能路由：判断任务复杂度，选择执行模式。
+
+        Returns:
+            "quick" | "standard" | "deep"
+        """
+        # 如果 deep_research 配置显式启用，直接 deep
+        if task_engine_cfg and task_engine_cfg.get("enabled"):
+            return EXECUTION_MODE_DEEP
+
+        # 用 LLM 判断任务复杂度
+        routing_prompt = (
+            "You are a task complexity classifier. Given the user's task, respond with EXACTLY one word:\n"
+            '- "quick" — simple question, greeting, calculation, or factual lookup (1-2 steps)\n'
+            '- "standard" — moderate task needing multiple tool calls or analysis (3-10 steps)\n'
+            '- "deep" — complex research, multi-step investigation, report generation (10+ steps)\n\n'
+            f"Task: {task_description[:500]}\n\n"
+            "Your answer (one word):"
+        )
+        try:
+            response = await self.llm_client.create_message(
+                system_prompt="You are a task complexity classifier. Respond with exactly one word: quick, standard, or deep.",
+                message_history=[
+                    {"role": "user", "content": [{"type": "text", "text": routing_prompt}]}
+                ],
+                tool_definitions=[],
+                keep_tool_result=-1,
+            )
+            if response and response.choices:
+                content = getattr(response.choices[0].message, "content", None)
+                if not content:
+                    return EXECUTION_MODE_STANDARD
+                choice = content.strip().lower()
+                if choice in ("quick", "standard", "deep"):
+                    logger.info(f"[AutoRoute] LLM classified task as: {choice}")
+                    return choice
+                # 从回复中提取关键词
+                for mode in ("deep", "standard", "quick"):
+                    if mode in choice:
+                        logger.info(f"[AutoRoute] LLM classified task as: {mode} (extracted)")
+                        return mode
+        except Exception as e:
+            logger.warning(f"[AutoRoute] LLM routing failed, falling back to standard: {e}")
+
+        # Fallback: standard
+        return EXECUTION_MODE_STANDARD
+
     async def run(
         self,
         system_prompt: str,
         message_history: list,
         tool_definitions: list,
         main_agent_prompt_instance,
-        deep_research_cfg: dict | None,
+        task_engine_cfg: dict | None,
         task_description: str,
         task_guidance: str,
         keep_tool_result: int,
+        resume_from: dict | None = None,
     ) -> tuple[str, bool]:
         """运行主执行循环
+
+        Args:
+            resume_from: 恢复状态 (来自 TaskTracer.get_resumable_state())，
+                         包含 message_history, last_turn 等。为 None 表示正常启动。
 
         Returns:
             (最终答案文本, is_simple_response)
@@ -197,11 +251,51 @@ class MainLoopRunner:
         # 初始化监控和计数器
         self.monitor.reset()
         self.context_manager.reset()
+        self.session_memory = SessionMemory()  # Reset session memory between runs
+        if self.inline_skill_selector:
+            self.inline_skill_selector.reset()
+
+        # Resume: restore state from previous run
+        _resume_turn_offset = 0
+        if resume_from:
+            prev_history = resume_from.get("message_history", [])
+            if prev_history:
+                message_history.clear()
+                message_history.extend(prev_history)
+            _resume_turn_offset = resume_from.get("last_turn", 0)
+            # Restore session memory snapshot
+            snapshot = resume_from.get("session_memory_snapshot", "")
+            if snapshot:
+                for line in snapshot.split("\n"):
+                    line = line.strip().lstrip("- ")
+                    if line:
+                        self.session_memory.add_finding(line)
+            # Inject resume notice into conversation
+            message_history.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"[RESUME NOTICE] This task was previously interrupted at turn {_resume_turn_offset}. "
+                                f"The conversation history above contains all prior work. "
+                                f"Please continue from where you left off and complete the remaining work."
+                            ),
+                        }
+                    ],
+                }
+            )
+            logger.info(
+                f"[Resume] Restored state from turn {_resume_turn_offset}, "
+                f"message_history={len(message_history)} messages"
+            )
+
         turn_counter = TurnCounter(
             max_turns=max_turns,
-            reflection_enabled=deep_research_cfg and deep_research_cfg.get("enabled", False),
-            reflection_interval=deep_research_cfg.get("reflection_interval", 5)
-            if deep_research_cfg
+            reflection_enabled=task_engine_cfg and task_engine_cfg.get("enabled", False),
+            reflection_interval=task_engine_cfg.get("reflection_interval", 5)
+            if task_engine_cfg
             else 5,
         )
 
@@ -223,6 +317,7 @@ class MainLoopRunner:
         # Auto-detect response language from query (hook can override via on_agent_start)
         if self.response_language == "auto":
             from mem_deep_research_core.core.user_context import detect_language_by_chars
+
             self.response_language = detect_language_by_chars(task_description)
             self.chinese_context = self.response_language == "Chinese"
             logger.info(f"[Language] Auto-detected: {self.response_language}")
@@ -232,41 +327,41 @@ class MainLoopRunner:
             memories = self.long_term_memory.recall(task_description, top_k=5)
             if memories:
                 memory_text = "\n".join(f"- {m.value}" for m in memories)
-                message_history.append({
-                    "role": "user",
-                    "content": [{"type": "text", "text": f"[LONG-TERM MEMORY]\nRelevant past knowledge:\n{memory_text}"}],
-                })
+                message_history.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"[LONG-TERM MEMORY]\nRelevant past knowledge:\n{memory_text}",
+                            }
+                        ],
+                    }
+                )
 
         # Resolve execution mode
+        # auto mode: let the main LLM self-adapt via system prompt instructions (no extra routing call)
         effective_mode = self.execution_mode
-        logger.info(f"[{self.agent_name}] Execution mode: {effective_mode} (config={self.execution_mode})")
         if effective_mode == EXECUTION_MODE_AUTO:
-            # Auto: deep if deep_research enabled, otherwise standard
-            if deep_research_cfg and deep_research_cfg.get("enabled"):
+            if task_engine_cfg and task_engine_cfg.get("enabled"):
                 effective_mode = EXECUTION_MODE_DEEP
             else:
                 effective_mode = EXECUTION_MODE_STANDARD
 
-        # Flash mode: single LLM call, no tools, direct response
-        if effective_mode == EXECUTION_MODE_FLASH:
-            logger.info(f"[{self.agent_name}] FLASH mode: single LLM call, no tools")
-            self.current_agent_id = await self.stream_handler.stream_start_agent(self.agent_name)
-            await self.stream_handler.stream_start_llm(self.agent_name)
+        logger.info(
+            f"[{self.agent_name}] Execution mode: {effective_mode} (config={self.execution_mode})"
+        )
 
-            response_text, _, _ = await self._handle_llm_call(
-                system_prompt, message_history, [],  # empty tools = no tool use
-                1, f"{self.agent_name} flash response",
-                agent_type=self.agent_name,
-                stream_message_callback=self._intercept_key_message,
+        # Quick mode: limited turns, tools enabled, skip heavy features (reflection/skills/hints)
+        is_quick_mode = effective_mode == EXECUTION_MODE_QUICK
+        if is_quick_mode:
+            max_turns = min(max_turns, QUICK_MODE_MAX_TURNS)
+            logger.info(
+                f"[{self.agent_name}] QUICK mode: max_turns={max_turns}, tools enabled, no reflection/skills"
             )
 
-            if response_text:
-                await self._streaming_final_message(generate_message_id(), response_text, True)
-
-            return response_text or FALLBACK_NO_ANSWER, True  # is_simple=True
-
-        # 自动任务分解（仅深度研究模式 + auto_planning 启用时）
-        if self.task_planner.enabled:
+        # 自动任务分解（仅深度研究模式 + auto_planning 启用时，quick 模式跳过）
+        if self.task_planner.enabled and not is_quick_mode:
             plan = await self.task_planner.create_plan(
                 task_description=task_description,
                 llm_client=self.llm_client,
@@ -276,7 +371,7 @@ class MainLoopRunner:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": f"{TAG_RESEARCH_PLAN}\n{plan.to_context_string()}"}
+                            {"type": "text", "text": f"{TAG_TASK_PLAN}\n{plan.to_context_string()}"}
                         ],
                     }
                 )
@@ -341,7 +436,27 @@ class MainLoopRunner:
 
             # 监控前检查
             terminate_reason = await self.monitor.pre_turn_check()
-            if terminate_reason:
+            if terminate_reason == "soft_timeout":
+                # 软超时：注入催促 hint，继续执行
+                remaining = int(
+                    self.monitor.config.max_total_time - self.monitor.get_elapsed_time()
+                )
+                message_history.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"[TIME WARNING] 剩余时间约 {remaining}s。请尽快总结当前已有的发现和结论，"
+                                    "如果核心任务已完成请直接给出最终答案。"
+                                ),
+                            }
+                        ],
+                    }
+                )
+            elif terminate_reason:
+                # 硬超时或其他终止原因：跳出循环，走摘要流程
                 break
 
             # LLM 调用
@@ -352,7 +467,6 @@ class MainLoopRunner:
                 tool_definitions,
                 turn_count,
                 f"{self.agent_name} agent turn {turn_count}",
-                keep_tool_result=keep_tool_result,
                 agent_type=self.agent_name,
                 stream_message_callback=self._intercept_key_message,
             )
@@ -375,7 +489,9 @@ class MainLoopRunner:
 
             # 立即检查终止原因
             if terminate_reason:
-                logger.warning(f"[{self.agent_name}] TERMINATED: {terminate_reason} (turn {turn_count})")
+                logger.warning(
+                    f"[{self.agent_name}] TERMINATED: {terminate_reason} (turn {turn_count})"
+                )
                 task_failed = True
                 break
 
@@ -389,12 +505,16 @@ class MainLoopRunner:
                 message_history.append(
                     {"role": "user", "content": [{"type": "text", "text": hint_text}]}
                 )
-                temp_boost = getattr(self.monitor.config, 'temperature_boost', DEFAULT_TEMPERATURE_BOOST)
-                temp_cap = getattr(self.monitor.config, 'temperature_boost_cap', DEFAULT_TEMPERATURE_BOOST_CAP)
+                temp_boost = getattr(
+                    self.monitor.config, "temperature_boost", DEFAULT_TEMPERATURE_BOOST
+                )
+                temp_cap = getattr(
+                    self.monitor.config, "temperature_boost_cap", DEFAULT_TEMPERATURE_BOOST_CAP
+                )
                 self.llm_client.set_temperature_boost(boost=temp_boost, cap=temp_cap)
 
-            # Inline Skill: 从 LLM 回复中解析 <next_skills>，下一轮动态注入
-            if self.inline_skill_selector and assistant_response_text:
+            # Inline Skill: 从 LLM 回复中解析 <next_skills>，下一轮动态注入（quick 模式跳过）
+            if not is_quick_mode and self.inline_skill_selector and assistant_response_text:
                 next_skills = self.inline_skill_selector.update_pending_skills(
                     assistant_response_text
                 )
@@ -405,7 +525,9 @@ class MainLoopRunner:
             # 处理 LLM 响应
             if assistant_response_text is not None:
                 if should_break:
-                    logger.info(f"[{self.agent_name}] LLM signaled completion (turn {turn_count}, task_failed={task_failed})")
+                    logger.info(
+                        f"[{self.agent_name}] LLM signaled completion (turn {turn_count}, task_failed={task_failed})"
+                    )
                     # 保存最终 checkpoint（即使 1 轮就结束）
                     self.task_log.save_checkpoint(
                         turn=turn_count,
@@ -413,6 +535,12 @@ class MainLoopRunner:
                         tool_calls_executed=total_tool_calls_executed,
                         last_assistant_text=last_assistant_text,
                         task_failed=task_failed,
+                        todo_state=self.todo_tracker.to_dict()
+                        if self.todo_tracker and not self.todo_tracker.is_empty
+                        else None,
+                        session_memory_snapshot=self.session_memory.to_context_string()
+                        if not self.session_memory.is_empty()
+                        else "",
                     )
                     break
             else:
@@ -424,7 +552,9 @@ class MainLoopRunner:
                             f"Context limit retry exhausted after {MAX_CONTEXT_LIMIT_RETRIES} attempts",
                             "failed",
                         )
-                        logger.warning(f"[{self.agent_name}] TERMINATED: context limit exhausted after {MAX_CONTEXT_LIMIT_RETRIES} retries (turn {turn_count})")
+                        logger.warning(
+                            f"[{self.agent_name}] TERMINATED: context limit exhausted after {MAX_CONTEXT_LIMIT_RETRIES} retries (turn {turn_count})"
+                        )
                         task_failed = True
                         break
                     # Level 3: 紧急裁剪
@@ -458,7 +588,9 @@ class MainLoopRunner:
                     )
                 else:
                     self.task_log.log_step("main_agent", "LLM call failed", "failed")
-                logger.warning(f"[{self.agent_name}] LLM call failed, task_failed=True (turn {turn_count})")
+                logger.warning(
+                    f"[{self.agent_name}] LLM call failed, task_failed=True (turn {turn_count})"
+                )
                 task_failed = True
                 continue
 
@@ -468,7 +600,9 @@ class MainLoopRunner:
                 or len(tool_calls) < 2
                 or (len(tool_calls[0]) == 0 and len(tool_calls[1]) == 0)
             ):
-                logger.info(f"[{self.agent_name}] No tool calls, ending (turn {turn_count}, task_failed={task_failed})")
+                logger.info(
+                    f"[{self.agent_name}] No tool calls, ending (turn {turn_count}, task_failed={task_failed})"
+                )
                 break
 
             # 跨轮次去重过滤
@@ -521,9 +655,23 @@ class MainLoopRunner:
 
             # Update session memory with findings from this turn
             if assistant_response_text:
-                for line in assistant_response_text.split('\n'):
+                for line in assistant_response_text.split("\n"):
                     line = line.strip()
-                    if len(line) > 30 and any(kw in line.lower() for kw in ['found', 'result', 'answer', 'conclusion', 'shows', 'indicates', '发现', '结果', '结论', '表明']):
+                    if len(line) > 30 and any(
+                        kw in line.lower()
+                        for kw in [
+                            "found",
+                            "result",
+                            "answer",
+                            "conclusion",
+                            "shows",
+                            "indicates",
+                            "发现",
+                            "结果",
+                            "结论",
+                            "表明",
+                        ]
+                    ):
                         self.session_memory.add_finding(line[:200])
 
             # Record tool strategies
@@ -577,10 +725,12 @@ class MainLoopRunner:
             if action and action != "none":
                 recent_texts = [str(m.get("content", "")) for m in message_history[-3:]]
                 if not any("[CONTEXT NOTE]" in t for t in recent_texts):
-                    message_history.append({
-                        "role": "user",
-                        "content": [{"type": "text", "text": CONTEXT_COMPRESSION_NOTICE}],
-                    })
+                    message_history.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": CONTEXT_COMPRESSION_NOTICE}],
+                        }
+                    )
 
             # Hook: on_turn_end
             tool_calls_count = len(tool_calls[0]) if tool_calls and len(tool_calls) > 0 else 0
@@ -608,18 +758,23 @@ class MainLoopRunner:
                 f"task_failed={task_failed}"
             )
 
-            # Turn checkpoint — save progress for debugging and potential resume
+            # Turn checkpoint — save progress for debugging and resume
             self.task_log.save_checkpoint(
                 turn=turn_count,
                 message_count=len(message_history),
                 tool_calls_executed=total_tool_calls_executed,
                 last_assistant_text=last_assistant_text,
                 task_failed=task_failed,
+                todo_state=self.todo_tracker.to_dict()
+                if self.todo_tracker and not self.todo_tracker.is_empty
+                else None,
+                session_memory_snapshot=self.session_memory.to_context_string()
+                if not self.session_memory.is_empty()
+                else "",
             )
 
-            # 反思检查点
-            if turn_counter.should_inject_reflection():
-
+            # 反思检查点（quick 模式跳过）
+            if not is_quick_mode and turn_counter.should_inject_reflection():
                 reflection_prompt = generate_reflection_prompt(
                     turn_count, task_description, self.chinese_context
                 )
@@ -684,7 +839,9 @@ class MainLoopRunner:
         if turn_counter.is_max_reached():
             if not task_failed:
                 task_failed = True
-            logger.warning(f"[{self.agent_name}] MAX TURNS REACHED: {turn_counter.current_turn}/{max_turns}, task_failed=True")
+            logger.warning(
+                f"[{self.agent_name}] MAX TURNS REACHED: {turn_counter.current_turn}/{max_turns}, task_failed=True"
+            )
             self.task_log.log_step(
                 "max_turns_reached", f"Reached maximum turns ({max_turns})", "warning"
             )
@@ -734,7 +891,9 @@ class MainLoopRunner:
 
         if is_simple_response:
             # 简单响应：跳过 summary LLM 调用，直接使用最后的 assistant 文本
-            self.task_log.log_step("final_summary", "Simple response detected, skipping summary LLM call")
+            self.task_log.log_step(
+                "final_summary", "Simple response detected, skipping summary LLM call"
+            )
             self.task_log.record_perf("summary_skipped", 1, unit="bool")
             self.task_log.record_perf("summary_duration", 0.0)
 
@@ -745,7 +904,9 @@ class MainLoopRunner:
             final_answer_text = last_assistant_text
         else:
             # 生成最终摘要
-            logger.info(f"[{self.agent_name}] Generating summary: task_failed={task_failed}, turns={turn_counter.current_turn}")
+            logger.info(
+                f"[{self.agent_name}] Generating summary: task_failed={task_failed}, turns={turn_counter.current_turn}"
+            )
             self.task_log.log_step("final_summary", "Generating final summary")
             self.task_log.record_perf("summary_skipped", 0, unit="bool")
 
@@ -764,7 +925,6 @@ class MainLoopRunner:
                 agent_type=self.agent_name,
                 task_guidance=task_guidance,
                 stream_message_callback=self._streaming_final_message,
-                deep_research_cfg=deep_research_cfg,
             )
             self.task_log.record_perf("summary_duration", time.perf_counter() - _perf_summary_start)
 
@@ -793,13 +953,17 @@ class MainLoopRunner:
         remaining_calls = []
         for call in calls_to_process:
             if call["tool_name"] == "update_todo" and self.todo_tracker:
-                logger.info(f"[{self.agent_name}] Builtin: update_todo action={call['arguments'].get('action', '?')}")
+                logger.info(
+                    f"[{self.agent_name}] Builtin: update_todo action={call['arguments'].get('action', '?')}"
+                )
                 result_text = self.todo_tracker.update_from_tool_call(call["arguments"])
-                tool_result_for_llm = self.output_formatter.format_tool_result_for_user({
-                    "server_name": "builtin",
-                    "tool_name": "update_todo",
-                    "result": result_text,
-                })
+                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                    {
+                        "server_name": "builtin",
+                        "tool_name": "update_todo",
+                        "result": result_text,
+                    }
+                )
                 builtin_results.append((call["id"], tool_result_for_llm))
             elif call["tool_name"] == BUILTIN_TOOL_SPAWN_AGENT:
                 task_desc = call["arguments"].get("task_description", str(call["arguments"]))
@@ -809,12 +973,16 @@ class MainLoopRunner:
                 except Exception as e:
                     logger.error(f"spawn_agent failed: {e}")
                     spawn_result = f"[Spawn Error] {str(e)[:500]}"
-                self.session_memory.add_sub_agent_result(BUILTIN_TOOL_SPAWN_AGENT, spawn_result[:500])
-                tool_result_for_llm = self.output_formatter.format_tool_result_for_user({
-                    "server_name": "builtin",
-                    "tool_name": BUILTIN_TOOL_SPAWN_AGENT,
-                    "result": spawn_result,
-                })
+                self.session_memory.add_sub_agent_result(
+                    BUILTIN_TOOL_SPAWN_AGENT, spawn_result[:500]
+                )
+                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                    {
+                        "server_name": "builtin",
+                        "tool_name": BUILTIN_TOOL_SPAWN_AGENT,
+                        "result": spawn_result,
+                    }
+                )
                 builtin_results.append((call["id"], tool_result_for_llm))
             else:
                 remaining_calls.append(call)
@@ -842,10 +1010,17 @@ class MainLoopRunner:
             tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
 
             # Offload large results to filesystem
-            result_text = tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
-            if isinstance(result_text, str) and self.context_manager.config.result_offload_threshold > 0:
+            result_text = (
+                tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
+            )
+            if (
+                isinstance(result_text, str)
+                and self.context_manager.config.result_offload_threshold > 0
+            ):
                 shortened, file_path = self.context_manager.offload_large_result(
-                    result_text, tool_name=call["tool_name"], turn=self.context_manager._current_turn
+                    result_text,
+                    tool_name=call["tool_name"],
+                    turn=self.context_manager._current_turn,
                 )
                 if file_path:
                     tool_result_for_llm["text"] = shortened
@@ -856,7 +1031,10 @@ class MainLoopRunner:
         if agent_calls:
             if self.sub_agent_runner is None:
                 for call in agent_calls:
-                    tool_result_for_llm = {"type": "text", "text": "[Error] Sub-agent spawning is not available in this context."}
+                    tool_result_for_llm = {
+                        "type": "text",
+                        "text": "[Error] Sub-agent spawning is not available in this context.",
+                    }
                     all_tool_results_with_id.append((call["id"], tool_result_for_llm))
             else:
                 # Pause main agent stream
@@ -864,7 +1042,11 @@ class MainLoopRunner:
                 await self.stream_handler.stream_end_agent(self.agent_name, self.current_agent_id)
 
                 # Run sub-agents with concurrency limit
-                max_concurrent = getattr(self.cfg.main_agent, 'max_concurrent_subagents', DEFAULT_MAX_CONCURRENT_SUBAGENTS)
+                max_concurrent = getattr(
+                    self.cfg.main_agent,
+                    "max_concurrent_subagents",
+                    DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+                )
                 semaphore = asyncio.Semaphore(max_concurrent)
 
                 async def _run_one_agent(call):
@@ -876,28 +1058,54 @@ class MainLoopRunner:
                             return call["id"], call["server_name"], call["tool_name"], result
                         except Exception as e:
                             logger.error(f"Sub-agent '{call['server_name']}' failed: {e}")
-                            return call["id"], call["server_name"], call["tool_name"], f"[Sub-agent Error] {str(e)[:500]}"
+                            return (
+                                call["id"],
+                                call["server_name"],
+                                call["tool_name"],
+                                f"[Sub-agent Error] {str(e)[:500]}",
+                            )
 
                 agent_results = await asyncio.gather(
                     *[_run_one_agent(c) for c in agent_calls],
+                    return_exceptions=True,
                 )
 
-                for item in agent_results:
+                for idx, item in enumerate(agent_results):
+                    if isinstance(item, Exception):
+                        failed_call = agent_calls[idx]
+                        logger.error(f"Sub-agent task failed unexpectedly: {item}")
+                        error_result = {
+                            "server_name": failed_call["server_name"],
+                            "tool_name": failed_call["tool_name"],
+                            "result": f"[Sub-agent Error] {type(item).__name__}: {str(item)[:500]}",
+                        }
+                        error_for_llm = self.output_formatter.format_tool_result_for_user(
+                            error_result
+                        )
+                        all_tool_results_with_id.append((failed_call["id"], error_for_llm))
+                        continue
                     call_id, server_name, tool_name, sub_result = item
-                    self.session_memory.add_sub_agent_result(server_name, sub_result[:500] if isinstance(sub_result, str) else str(sub_result)[:500])
+                    self.session_memory.add_sub_agent_result(
+                        server_name,
+                        sub_result[:500] if isinstance(sub_result, str) else str(sub_result)[:500],
+                    )
                     tool_result = {
                         "server_name": server_name,
                         "tool_name": tool_name,
                         "result": sub_result,
                     }
-                    tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
+                    tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                        tool_result
+                    )
                     all_tool_results_with_id.append((call_id, tool_result_for_llm))
 
                 # Resume main agent stream
                 self.current_agent_id = await self.stream_handler.stream_start_agent(
                     self.agent_name, display_name="Summarizing"
                 )
-                await self.stream_handler.stream_start_llm(self.agent_name, display_name="Summarizing")
+                await self.stream_handler.stream_start_llm(
+                    self.agent_name, display_name="Summarizing"
+                )
 
         # Handle failed tool calls
         if len(tool_calls) > 1 and len(tool_calls[1]) > 0:
@@ -938,7 +1146,8 @@ class MainLoopRunner:
         next_depth = self.spawn_depth + 1
         if next_depth >= MAX_SPAWN_DEPTH:
             spawn_tool_defs = [
-                t for t in (self._current_tool_definitions or [])
+                t
+                for t in (self._current_tool_definitions or [])
                 if t.get("name") != BUILTIN_TOOL_SPAWN_AGENT
             ]
         else:

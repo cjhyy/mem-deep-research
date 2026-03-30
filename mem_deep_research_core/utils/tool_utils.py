@@ -6,8 +6,8 @@ import sys
 from mcp import StdioServerParameters
 from omegaconf import DictConfig, OmegaConf
 
-from mem_deep_research_core.mem_deep_research_logging.logger import bootstrap_logger
 from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX
+from mem_deep_research_core.mem_deep_research_logging.logger import bootstrap_logger
 from mem_deep_research_core.prompts import AgentPrompt
 from mem_deep_research_core.utils.external_loader import external_loader
 
@@ -97,13 +97,15 @@ def create_mcp_server_parameters(
                     )
                 elif tool_cfg_resolved.get("transport") == "inprocess":
                     # In-process MCP tool — no subprocess, direct Python import
-                    configs.append({
-                        "name": tool_name,
-                        "params": "inprocess",  # Sentinel: truthy, distinguishes from None
-                        "transport": "inprocess",
-                        "module": tool_cfg_resolved.get("module", ""),
-                        "object": tool_cfg_resolved.get("object", "mcp"),
-                    })
+                    configs.append(
+                        {
+                            "name": tool_name,
+                            "params": "inprocess",  # Sentinel: truthy, distinguishes from None
+                            "transport": "inprocess",
+                            "module": tool_cfg_resolved.get("module", ""),
+                            "object": tool_cfg_resolved.get("object", "mcp"),
+                        }
+                    )
                     logger.info(
                         f"[ToolUtils] Configured in-process MCP tool '{tool_name}': "
                         f"module={tool_cfg_resolved.get('module')}"
@@ -134,7 +136,9 @@ def create_mcp_server_parameters(
         if isinstance(black_list_item, (list, tuple)) and len(black_list_item) >= 2:
             blacklist.add((black_list_item[0], black_list_item[1]))
         else:
-            logger.warning(f"[ToolUtils] Invalid blacklist entry (expected [server, tool]): {black_list_item}")
+            logger.warning(
+                f"[ToolUtils] Invalid blacklist entry (expected [server, tool]): {black_list_item}"
+            )
     return configs, blacklist
 
 

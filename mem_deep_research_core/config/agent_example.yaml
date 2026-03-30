@@ -13,7 +13,7 @@ main_agent:
   prompt:
     agent_type: main           # "main" (primary agent) or "worker" (sub-agent)
     tool_format: xml           # "xml" (Claude/GPT) or "native" (DeepSeek)
-    presets: []                # Optional: ["research", "research_planning", "time_sensitive"]
+    presets: []                # Optional: ["task_completion", "task_planning", "time_sensitive"]
     # templates_dir: /path/to/custom/templates  # Optional: custom templates directory
 
   # Method 2: Use legacy prompt_class (backward compatible)
@@ -107,12 +107,11 @@ main_agent:
   max_turns: 20                      # Max conversation turns
   max_tool_calls_per_turn: 10        # Max tool calls per turn
 
-  # Deep Research Protocol (alternative to prompt.presets)
-  # Deprecated: prefer using prompt.presets: [research, time_sensitive]
-  deep_research:
+  # Task Engine (deep mode — reflection checkpoints + auto planning)
+  task_engine:
     enabled: false
     reflection_interval: 5           # Trigger reflection every N turns
-    require_explicit_planning: true  # Require explicit research plan
+    require_explicit_planning: true  # Require explicit task plan
 
   # Input/Output processing
   input_process:

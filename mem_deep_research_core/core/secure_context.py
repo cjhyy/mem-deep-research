@@ -61,8 +61,10 @@ def resolve_secure_value(context: dict[str, Any] | None, field_name: str) -> str
     if field_name in secure:
         return str(secure[field_name])
     # 回退：顶层字段也可能被标记为 secure（向后兼容）
-    val = context.get(field_name)
-    return str(val) if val is not None else None
+    if field_name in context:
+        val = context[field_name]
+        return str(val) if val is not None else None
+    return None
 
 
 def get_display_value(context: dict[str, Any] | None, field_name: str, default: str = "") -> str:

@@ -123,13 +123,20 @@ class PromptTemplateLoader:
             渲染后的字符串
         """
 
+        missing_vars = []
+
         def replace_var(match):
             var_name = match.group(1).strip()
+            if var_name not in variables:
+                missing_vars.append(var_name)
             value = variables.get(var_name, "")
             return str(value) if value is not None else ""
 
         pattern = r"\{\{([^}]+)\}\}"
         rendered = re.sub(pattern, replace_var, template)
+
+        if missing_vars:
+            logger.warning(f"[TemplateLoader] Missing template variables: {missing_vars}")
 
         return rendered
 

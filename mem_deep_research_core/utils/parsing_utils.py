@@ -568,7 +568,7 @@ def _conservative_escape_fallback(raw_str):
         return raw_str
 
 
-def parse_llm_response_for_tool_calls(llm_response_content_text):
+def parse_llm_response_for_tool_calls(llm_response_content_text, _fix_depth: int = 0):
     """
     Parse tool_calls or <use_mcp_tool> tags from LLM response text.
     Returns a list containing tool call information.
@@ -580,7 +580,11 @@ def parse_llm_response_for_tool_calls(llm_response_content_text):
         bad_tool_calls = []
         for item in llm_response_content_text.get("output", []):
             if item.get("type") == "function_call":
-                server_name, tool_name = item.get("name").rsplit("-", maxsplit=1)
+                raw_name = item.get("name", "")
+                if not raw_name or "-" not in raw_name:
+                    logger.warning(f"[Parse] Skipping function_call with invalid name: {raw_name}")
+                    continue
+                server_name, tool_name = raw_name.rsplit("-", maxsplit=1)
                 arguments_str = item.get("arguments")
                 try:
                     # Try to handle possible newlines and escape characters
@@ -621,7 +625,11 @@ def parse_llm_response_for_tool_calls(llm_response_content_text):
         tool_calls = []
         bad_tool_calls = []
         for tool_call in llm_response_content_text:
-            server_name, tool_name = tool_call.function.name.rsplit("-", maxsplit=1)
+            raw_name = getattr(tool_call.function, "name", "") or ""
+            if "-" not in raw_name:
+                logger.warning(f"[Parse] Skipping tool_call with invalid name: {raw_name}")
+                continue
+            server_name, tool_name = raw_name.rsplit("-", maxsplit=1)
             arguments_str = tool_call.function.arguments
 
             # Parse JSON string to dictionary
@@ -663,10 +671,15 @@ def parse_llm_response_for_tool_calls(llm_response_content_text):
     # for other clients, such as qwen and anthropic, we use MCP instead of tool calls
     tool_calls = []
     bad_tool_calls = []
-    # Find all <use_mcp_tool> tags, using more robust regular expressions
-    # Allow more whitespace, case insensitive, allow tag attributes
+    # Find all <use_mcp_tool> tags, using robust regular expressions
+    # Allow whitespace, case insensitive, allow tag attributes
+    # Use non-greedy captures with explicit delimiters to avoid catastrophic backtracking
     tool_call_patterns = re.findall(
-        r"<use_mcp_tool[^>]*?>\s*<server_name[^>]*?>(.*?)</server_name>\s*<tool_name[^>]*?>(.*?)</tool_name>\s*<arguments[^>]*?>\s*([\s\S]*?)\s*</arguments>\s*</use_mcp_tool>",
+        r"<use_mcp_tool[^>]*>\s*"
+        r"<server_name[^>]*>(.*?)</server_name>\s*"
+        r"<tool_name[^>]*>(.*?)</tool_name>\s*"
+        r"<arguments[^>]*>([\s\S]*?)</arguments>\s*"
+        r"</use_mcp_tool>",
         llm_response_content_text,
         re.DOTALL | re.IGNORECASE,
     )
@@ -741,8 +754,8 @@ def parse_llm_response_for_tool_calls(llm_response_content_text):
         )
 
     for item in bad_tool_calls:
-        if item["error"] == "Unclosed arguments tag":
-            # Try to fix missing </arguments> case
+        if item["error"] == "Unclosed arguments tag" and _fix_depth < 1:
+            # Try to fix missing </arguments> case (depth-limited to prevent infinite recursion)
             content = llm_response_content_text
             if content.find("<arguments>") != -1 and content.find("</arguments>") == -1:
                 # Find <arguments> start position
@@ -757,7 +770,7 @@ def parse_llm_response_for_tool_calls(llm_response_content_text):
                     fixed_content = content + "</arguments>"
 
                 logger.info("Attempting to fix tool call with missing </arguments>, re-parsing...")
-                # Recursively call self to re-parse fixed content
-                return parse_llm_response_for_tool_calls(fixed_content)
+                # Re-parse fixed content (non-recursive to prevent infinite loops)
+                return parse_llm_response_for_tool_calls(fixed_content, _fix_depth=1)
 
     return tool_calls, bad_tool_calls

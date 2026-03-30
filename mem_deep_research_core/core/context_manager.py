@@ -274,7 +274,9 @@ class ContextManager:
         """Set the directory for offloading large results."""
         self._offload_dir = path
 
-    def offload_large_result(self, result_text: str, tool_name: str, turn: int) -> tuple[str, str | None]:
+    def offload_large_result(
+        self, result_text: str, tool_name: str, turn: int
+    ) -> tuple[str, str | None]:
         """Offload large tool results to filesystem.
 
         Args:
@@ -295,6 +297,7 @@ class ContextManager:
             return result_text, None
 
         import os
+
         os.makedirs(offload_dir, exist_ok=True)
 
         # Write full result to file
@@ -420,9 +423,7 @@ class ContextManager:
         # Evict oldest entries (by turn) if cache exceeds limit
         if len(self._dedup_cache) > self._max_dedup_cache_size:
             excess = len(self._dedup_cache) - self._max_dedup_cache_size
-            evict_keys = sorted(
-                self._dedup_cache, key=lambda k: self._dedup_cache[k].turn
-            )[:excess]
+            evict_keys = sorted(self._dedup_cache, key=lambda k: self._dedup_cache[k].turn)[:excess]
             for k in evict_keys:
                 del self._dedup_cache[k]
 
@@ -645,7 +646,10 @@ class ContextManager:
 
     @staticmethod
     def _compute_arguments_hash(tool_name: str, arguments: dict) -> str:
-        args_str = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        try:
+            args_str = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            args_str = str(arguments)
         raw = f"{tool_name}:{args_str}"
         return hashlib.md5(raw.encode("utf-8", errors="replace")).hexdigest()
 

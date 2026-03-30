@@ -79,10 +79,10 @@ class PromptConfig(BaseModel):
     custom_summarize_template: str | None = Field(default=None, description="自定义总结模板")
 
 
-class DeepResearchConfig(BaseModel):
-    """Deep Research 协议配置"""
+class TaskEngineConfig(BaseModel):
+    """任务引擎配置（deep 模式下的反思 + 规划）"""
 
-    enabled: bool = Field(default=False, description="是否启用深度研究模式")
+    enabled: bool = Field(default=False, description="是否启用 deep 模式（反思检查点 + 任务分解）")
     reflection_interval: int = Field(default=5, ge=1, description="反思间隔轮次")
     require_explicit_planning: bool = Field(default=True, description="是否需要显式规划")
     auto_planning: bool = Field(default=False, description="是否启用 LLM 自动任务分解")
@@ -93,6 +93,14 @@ class InputProcessConfig(BaseModel):
 
     hint_generation: bool = Field(default=False, description="是否启用提示生成")
     hint_llm_base_url: str | None = Field(default=None, description="提示生成 LLM Base URL")
+
+
+class ToolRetryConfig(BaseModel):
+    """工具自动重试配置"""
+
+    enabled: bool = Field(default=True, description="是否启用工具自动重试")
+    max_retries: int = Field(default=2, ge=0, le=5, description="最大重试次数")
+    backoff_base: float = Field(default=1.0, ge=0.1, description="退避基数(秒)")
 
 
 class OutputProcessConfig(BaseModel):
@@ -145,7 +153,12 @@ class MonitoringConfigSchema(BaseModel):
         default=120.0, ge=0.0, description="停滞检测阈值（秒）"
     )
     stall_terminate_multiplier: float = Field(default=2.0, ge=1.0, description="停滞终止倍数")
-    max_total_time: float = Field(default=600.0, ge=0.0, description="最大总运行时间（秒）")
+    max_total_time: float = Field(
+        default=1800.0, ge=0.0, description="最大总运行时间（秒），0=不限时"
+    )
+    soft_timeout_ratio: float = Field(
+        default=0.8, ge=0.0, le=1.0, description="软超时比例（到达后注入催促）"
+    )
 
     # 空响应检测
     max_consecutive_empty_turns: int = Field(default=3, ge=1, description="连续空响应终止阈值")
@@ -174,6 +187,7 @@ class MonitoringConfigSchema(BaseModel):
 
 class TodoTrackerConfig(BaseModel):
     """任务追踪配置"""
+
     enabled: bool = Field(default=False, description="是否启用任务追踪")
 
 
@@ -207,8 +221,7 @@ class ContextManagerConfig(BaseModel):
 
     # Result offloading
     result_offload_threshold: int = Field(
-        default=5000, ge=0,
-        description="工具结果超过此字符数时卸载到文件，0=禁用"
+        default=5000, ge=0, description="工具结果超过此字符数时卸载到文件，0=禁用"
     )
     result_offload_dir: str = Field(default="", description="卸载文件目录，空=使用 output_dir")
 
@@ -225,18 +238,23 @@ class ContextManagerConfig(BaseModel):
         default=True, description="[已废弃] 旧配置，被 enable_compact 取代"
     )
 
-    @model_validator(mode='after')
-    def warn_deprecated(self) -> 'ContextManagerConfig':
+    @model_validator(mode="after")
+    def validate_ratios_and_warn_deprecated(self) -> "ContextManagerConfig":
         import logging
+
         _logger = logging.getLogger("mem_deep_research")
+        # 交叉校验：compact 阈值必须小于 summarize 阈值
+        if self.compact_at_ratio >= self.summarize_at_ratio:
+            raise ValueError(
+                f"compact_at_ratio ({self.compact_at_ratio}) must be less than "
+                f"summarize_at_ratio ({self.summarize_at_ratio})"
+            )
         if self.mask_after_n_turns != 5:  # non-default means user set it
             _logger.warning(
                 "Config 'mask_after_n_turns' is deprecated, use 'compact_keep_recent' instead"
             )
         if not self.enable_masking:  # non-default means user set it
-            _logger.warning(
-                "Config 'enable_masking' is deprecated, use 'enable_compact' instead"
-            )
+            _logger.warning("Config 'enable_masking' is deprecated, use 'enable_compact' instead")
         return self
 
 
@@ -267,20 +285,23 @@ class MainAgentConfig(BaseModel):
     llm: LLMConfig = Field(..., description="LLM 配置")
     tool_config: list[str] = Field(default_factory=list, description="工具配置列表")
     tool_blacklist: list = Field(default_factory=list, description="工具黑名单")
+    tool_retry: ToolRetryConfig = Field(
+        default_factory=ToolRetryConfig, description="工具自动重试配置"
+    )
 
     # Execution limits
     max_turns: int = Field(default=20, ge=1, description="最大对话轮次")
     max_tool_calls_per_turn: int = Field(default=10, ge=1, description="每轮最大工具调用数")
     keep_tool_result: int = Field(default=-1, description="保留工具结果数")
-    execution_mode: str = Field(
+    execution_mode: Literal["auto", "quick", "standard", "deep"] = Field(
         default="auto",
-        description="执行模式: 'auto' 自动判断, 'flash' 单轮直接回答, 'standard' 多轮工具调用, 'deep' 多轮+反思+子agent"
+        description="执行模式: 'auto' LLM智能路由, 'quick' 快速模式(≤3轮), 'standard' 多轮工具调用, 'deep' 多轮+反思+子agent",
     )
     max_concurrent_subagents: int = Field(default=3, ge=1, description="最大并行子 Agent 数")
 
     # Deep Research
-    deep_research: DeepResearchConfig = Field(
-        default_factory=DeepResearchConfig, description="Deep Research 配置"
+    task_engine: TaskEngineConfig = Field(
+        default_factory=TaskEngineConfig, description="任务引擎配置（deep 模式反思+规划）"
     )
 
     # TodoTracker
@@ -317,17 +338,18 @@ class MainAgentConfig(BaseModel):
     )
 
     # Memory
-    memory: MemoryConfig = Field(
-        default_factory=MemoryConfig, description="记忆系统配置"
-    )
+    memory: MemoryConfig = Field(default_factory=MemoryConfig, description="记忆系统配置")
 
     # Language
     response_language: str = Field(
         default="auto",
-        description="响应语言: 'auto' 从 query 自动检测, 或指定语言如 'Chinese', 'English', 'Japanese' 等"
+        description="响应语言: 'auto' 从 query 自动检测, 或指定语言如 'Chinese', 'English', 'Japanese' 等",
     )
     add_message_id: bool = Field(default=True, description="是否添加消息 ID")
-    chinese_context: bool = Field(default=False, description="[已废弃] 使用 response_language 代替。设为 true 等同 response_language='Chinese'")
+    chinese_context: bool = Field(
+        default=False,
+        description="[已废弃] 使用 response_language 代替。设为 true 等同 response_language='Chinese'",
+    )
 
     class Config:
         extra = "allow"
@@ -359,8 +381,8 @@ class AgentConfig(BaseModel):
                 raise ValueError(f"Sub-agent name must start with 'agent-': {name}")
             if not isinstance(cfg, dict):
                 raise ValueError(f"Sub-agent '{name}' config must be a dict")
-            if "llm" not in cfg and "max_turns" not in cfg:
-                raise ValueError(f"Sub-agent '{name}' must have at least 'llm' or 'max_turns' config")
+            if "llm" not in cfg:
+                raise ValueError(f"Sub-agent '{name}' must have 'llm' config")
         return v
 
     class Config:

@@ -33,7 +33,7 @@ CLI:
     python run.py "Your research task"
 """
 
-from mem_deep_research_core.deep_research import DeepResearch, ResearchResult
+from mem_deep_research_core.deep_research import DeepResearch, TaskResult
 
-__version__ = "0.1.0"
-__all__ = ["DeepResearch", "ResearchResult", "__version__"]
+__version__ = "1.0.0"
+__all__ = ["DeepResearch", "TaskResult", "__version__"]

@@ -106,7 +106,7 @@ class AgentPrompt:
         self,
         mcp_servers: list[Any],
         chinese_context: bool = False,
-        deep_research_cfg: dict | None = None,
+        task_engine_cfg: dict | None = None,
         extra_context: str = "",
         **kwargs,
     ) -> str:
@@ -116,7 +116,7 @@ class AgentPrompt:
         Args:
             mcp_servers: MCP 服务器配置列表
             chinese_context: 是否使用中文语境
-            deep_research_cfg: 深度研究配置
+            task_engine_cfg: 深度研究配置
             extra_context: 额外的上下文内容
             **kwargs: 其他参数
 
@@ -158,7 +158,9 @@ class AgentPrompt:
             if mcp_tools:
                 if default_tool_format:
                     parts.append(default_tool_format)
-                parts.append(f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}")
+                parts.append(
+                    f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
+                )
             return "\n\n".join(parts)
 
         # 1. 自定义模板覆盖整个主体，通过占位符按需引用默认模块
@@ -190,7 +192,9 @@ class AgentPrompt:
 
                 if default_tool_format:
                     parts.append(default_tool_format)
-                parts.append(f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}")
+                parts.append(
+                    f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
+                )
             else:
                 # 无工具：只保留日期时间，不注入工具相关描述
                 date_line = f"Today is: {formatted_date}. Current time: {formatted_time}."
@@ -203,13 +207,13 @@ class AgentPrompt:
         # 6. 预设模块
         effective_presets = list(self.presets)
 
-        # deep_research_cfg 转换为 presets
-        if deep_research_cfg and deep_research_cfg.get("enabled", False):
-            if "research" not in effective_presets:
-                effective_presets.append("research")
-            if deep_research_cfg.get("require_explicit_planning", False):
-                if "research_planning" not in effective_presets:
-                    effective_presets.append("research_planning")
+        # task_engine_cfg 转换为 presets
+        if task_engine_cfg and task_engine_cfg.get("enabled", False):
+            if "task_completion" not in effective_presets:
+                effective_presets.append("task_completion")
+            if task_engine_cfg.get("require_explicit_planning", False):
+                if "task_planning" not in effective_presets:
+                    effective_presets.append("task_planning")
 
         for preset in effective_presets:
             try:

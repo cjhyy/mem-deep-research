@@ -189,6 +189,7 @@ class TestNewHooks:
 
     def test_on_tool_filter(self, registry):
         """on_tool_filter 可修改工具调用列表"""
+
         def filter_hook(ctx, original_fn):
             # 过滤掉 tool_name == "blocked"
             return [c for c in ctx.tool_calls_batch if c.get("tool_name") != "blocked"]
@@ -229,6 +230,7 @@ class TestNewHooks:
 
     def test_on_reflection_build(self, registry):
         """on_reflection_build 可修改反思 prompt"""
+
         def reflection_hook(ctx, original_fn):
             return ctx.result + "\n\nFocus on data quality."
 

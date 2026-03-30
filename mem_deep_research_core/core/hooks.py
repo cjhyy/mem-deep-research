@@ -37,6 +37,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
+from mem_deep_research_core.exceptions import GuardrailError
+
 logger = logging.getLogger("mem_deep_research")
 
 T = TypeVar("T")
@@ -213,6 +215,8 @@ class HookRegistry:
             def chain_fn(c: HookContext):
                 try:
                     return current_hook(c, next_fn)
+                except (GuardrailError, KeyboardInterrupt, SystemExit):
+                    raise  # 护栏异常和系统异常不能被吞掉
                 except Exception as e:
                     hook_label = getattr(current_hook, "__name__", repr(current_hook))
                     logger.error(

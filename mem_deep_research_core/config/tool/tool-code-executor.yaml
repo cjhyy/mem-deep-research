@@ -1,0 +1,7 @@
+name: "tool-code-executor"
+transport: "inprocess"
+module: "mem_deep_research_core.tool.mcp_servers.code_executor_server"
+object: "mcp"
+# 环境变量配置：
+#   CODE_EXECUTOR_WORK_DIR: 代码执行工作目录（默认=当前工作目录）
+#   CODE_EXECUTOR_SHELL_WHITELIST: 允许的 shell 命令白名单，逗号分隔（默认=全部允许）

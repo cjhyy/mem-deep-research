@@ -14,12 +14,16 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable
 from typing import Any
 
 from omegaconf import DictConfig
 
 from mem_deep_research_core.core.answer_handler import post_process_final_answer
+from mem_deep_research_core.core.constants import (
+    DEFAULT_SCRAPE_MAX_LENGTH,
+    ensure_dict,
+    parse_bool_config,
+)
 from mem_deep_research_core.core.context_manager import ContextManager, ContextManagerConfig
 from mem_deep_research_core.core.hooks import HookContext, hooks
 from mem_deep_research_core.core.interceptor_config import InterceptorConfig, InterceptorPresets
@@ -28,12 +32,16 @@ from mem_deep_research_core.core.llm_call_handler import (
     SummaryHandler,
 )
 from mem_deep_research_core.core.main_loop import MainLoopRunner
-from mem_deep_research_core.core.prompt_builder import PromptBuilder
 from mem_deep_research_core.core.message_interceptor import MessageInterceptorHandler
+from mem_deep_research_core.core.message_utils import (
+    deduplicate_trailing_messages,
+    extract_recent_tool_names,
+)
 from mem_deep_research_core.core.monitoring import (
     ExecutionMonitor,
     MonitoringConfig,
 )
+from mem_deep_research_core.core.prompt_builder import PromptBuilder
 
 # 导入拆分后的模块
 from mem_deep_research_core.core.stream_handler import StreamHandler
@@ -48,18 +56,6 @@ from mem_deep_research_core.utils.external_loader import external_loader
 from mem_deep_research_core.utils.io_utils import OutputFormatter, process_input
 from mem_deep_research_core.utils.stream_parsing_utils import TextInterceptor
 from mem_deep_research_core.utils.tool_utils import expose_sub_agents_as_tools
-
-from mem_deep_research_core.core.constants import (
-    DEFAULT_SCRAPE_MAX_LENGTH,
-    ensure_dict,
-    generate_message_id,
-    parse_bool_config,
-)
-from mem_deep_research_core.core.message_utils import (
-    deduplicate_trailing_messages,
-    extract_recent_tool_names,
-)
-
 
 # ========== 默认钩子实现 ==========
 
@@ -223,9 +219,10 @@ class Orchestrator:
         if monitoring_cfg_dict:
             try:
                 from mem_deep_research_core.config_schema import MonitoringConfigSchema
+
                 monitoring_schema = MonitoringConfigSchema(**monitoring_cfg_dict)
                 monitoring_config = MonitoringConfig.from_schema(monitoring_schema)
-            except Exception as e:
+            except (TypeError, ValueError) as e:
                 logger.warning(f"[Orchestrator] Invalid monitoring config, using defaults: {e}")
                 monitoring_config = MonitoringConfig()
         else:
@@ -235,7 +232,8 @@ class Orchestrator:
             stream_reasoning_callback=self._stream_tool_reasoning,  # 保留：有自定义逻辑
         )
 
-        # 工具执行器
+        # 工具执行器（含自动重试配置）
+        retry_cfg = ensure_dict(self.cfg.main_agent.get("tool_retry", {}))
         self.tool_executor = ToolExecutor(
             tool_manager=self.main_agent_tool_manager,
             output_formatter=self.output_formatter,
@@ -244,12 +242,16 @@ class Orchestrator:
             stream_tool_call=self.stream_handler.stream_tool_call,
             stream_tool_reasoning=self._stream_tool_reasoning,  # 保留：有自定义逻辑
             stream_usage_info=self.stream_handler.stream_usage_info,
+            retry_max=retry_cfg.get("max_retries", 2) if retry_cfg.get("enabled", True) else 0,
+            retry_backoff_base=retry_cfg.get("backoff_base", 1.0),
         )
         # scrape_max_length: 优先从配置读，fallback 环境变量，最后默认 20000
         scrape_max_length = monitoring_cfg_dict.get("scrape_max_length", None)
         if scrape_max_length is None:
             try:
-                scrape_max_length = int(os.getenv("SCRAPE_MAX_LENGTH", str(DEFAULT_SCRAPE_MAX_LENGTH)))
+                scrape_max_length = int(
+                    os.getenv("SCRAPE_MAX_LENGTH", str(DEFAULT_SCRAPE_MAX_LENGTH))
+                )
             except (ValueError, TypeError):
                 scrape_max_length = DEFAULT_SCRAPE_MAX_LENGTH
         self.tool_executor.set_scrape_max_length(scrape_max_length)
@@ -297,7 +299,7 @@ class Orchestrator:
     def _init_skills_and_prompt(self):
         """初始化 Task Planner、Inline Skill Selector 和 Prompt Builder"""
         # Task Planner — 仅在 deep_research.enabled AND auto_planning 时启用
-        dr_cfg = self.cfg.main_agent.get("deep_research", {})
+        dr_cfg = self.cfg.main_agent.get("task_engine", {})
         planning_enabled = (
             dr_cfg and dr_cfg.get("enabled", False) and dr_cfg.get("auto_planning", False)
         )
@@ -305,6 +307,7 @@ class Orchestrator:
 
         # TodoTracker — enabled via todo_tracker.enabled or deep_research.enabled
         from mem_deep_research_core.core.todo_tracker import TodoTracker
+
         todo_enabled = self.cfg.main_agent.get("todo_tracker", {}).get("enabled", False)
         if not todo_enabled:
             # Fallback: enable with deep_research
@@ -350,6 +353,7 @@ class Orchestrator:
 
         # Long-term memory (optional, persists across sessions)
         from mem_deep_research_core.core.memory import LongTermMemory
+
         output_dir = self.cfg.get("output_dir", "logs/")
         memory_dir = os.path.join(output_dir, "memory")
         self.long_term_memory = LongTermMemory(storage_path=memory_dir)
@@ -518,7 +522,12 @@ class Orchestrator:
     # ========== 主 Agent 运行 ==========
 
     async def run_main_agent(
-        self, task_description, task_file_name=None, task_id="default_task", history=None
+        self,
+        task_description,
+        task_file_name=None,
+        task_id="default_task",
+        history=None,
+        resume_from: dict | None = None,
     ):
         """执行主 Agent 任务"""
         workflow_id = await self.stream_handler.stream_start_workflow(task_description, task_id)
@@ -551,13 +560,17 @@ class Orchestrator:
 
         # 4.5. LLM Skill 选择
         _perf_t0 = time.perf_counter()
-        selected_skill_names = await self.prompt_builder.select_skills(initial_user_content, tool_definitions)
+        selected_skill_names = await self.prompt_builder.select_skills(
+            initial_user_content, tool_definitions
+        )
         self.task_log.record_perf("skill_selection", time.perf_counter() - _perf_t0)
 
         # 5. 生成系统提示词
         _perf_t0 = time.perf_counter()
-        system_prompt, main_agent_prompt_instance, deep_research_cfg = self.prompt_builder.build_system_prompt(
-            tool_definitions, initial_user_content, selected_skill_names
+        system_prompt, main_agent_prompt_instance, task_engine_cfg = (
+            self.prompt_builder.build_system_prompt(
+                tool_definitions, initial_user_content, selected_skill_names
+            )
         )
         self.task_log.record_perf("system_prompt_build", time.perf_counter() - _perf_t0)
 
@@ -567,10 +580,11 @@ class Orchestrator:
             message_history=message_history,
             tool_definitions=tool_definitions,
             main_agent_prompt_instance=main_agent_prompt_instance,
-            deep_research_cfg=deep_research_cfg,
+            task_engine_cfg=task_engine_cfg,
             task_description=task_description,
             task_guidance=task_guidance,
             keep_tool_result=keep_tool_result,
+            resume_from=resume_from,
         )
 
         # 7. 后处理
@@ -637,7 +651,7 @@ class Orchestrator:
         from mem_deep_research_core.core.todo_tracker import TodoTracker
 
         effective_mode = self.cfg.main_agent.get("execution_mode", "auto")
-        if effective_mode != "flash":
+        if effective_mode != "quick":
             tool_definitions.append(_get_spawn_agent_tool_definition())
 
         if self.todo_tracker and self.todo_tracker.enabled:
@@ -688,10 +702,11 @@ class Orchestrator:
         message_history,
         tool_definitions,
         main_agent_prompt_instance,
-        deep_research_cfg,
+        task_engine_cfg,
         task_description,
         task_guidance,
         keep_tool_result,
+        resume_from=None,
     ):
         """运行主执行循环（委托给 MainLoopRunner）"""
         runner = self._create_main_loop_runner()
@@ -700,10 +715,11 @@ class Orchestrator:
             message_history=message_history,
             tool_definitions=tool_definitions,
             main_agent_prompt_instance=main_agent_prompt_instance,
-            deep_research_cfg=deep_research_cfg,
+            task_engine_cfg=task_engine_cfg,
             task_description=task_description,
             task_guidance=task_guidance,
             keep_tool_result=keep_tool_result,
+            resume_from=resume_from,
         )
         # 同步 current_agent_id（runner 内部会更新）
         self.current_agent_id = runner.current_agent_id

@@ -142,8 +142,8 @@ main_agent:
   max_tool_calls_per_turn: 10
   keep_tool_result: -1
 
-  # 深度研究协议
-  deep_research:
+  # 任务引擎（deep 模式）
+  task_engine:
     enabled: true
     reflection_interval: 3
     require_explicit_planning: true

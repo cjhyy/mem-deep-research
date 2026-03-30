@@ -20,9 +20,8 @@ Context 截断时 todo 状态不会丢失，每轮自动重新注入。
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
 
 logger = logging.getLogger("mem_deep_research")
 
@@ -36,6 +35,7 @@ class TodoStatus(StrEnum):
 @dataclass
 class TodoItem:
     """单个待办任务"""
+
     id: int
     task: str
     status: TodoStatus = TodoStatus.PENDING
@@ -164,7 +164,9 @@ class TodoTracker:
             return None
 
         lines = ["[TASK PROGRESS]", ""]
-        lines.append(f"Progress: {self.progress:.0%} ({sum(1 for i in self._items if i.status == TodoStatus.COMPLETED)}/{len(self._items)} completed)")
+        lines.append(
+            f"Progress: {self.progress:.0%} ({sum(1 for i in self._items if i.status == TodoStatus.COMPLETED)}/{len(self._items)} completed)"
+        )
         lines.append("")
         for item in self._items:
             lines.append(item.to_display())
@@ -179,7 +181,9 @@ class TodoTracker:
             lines.append(f"Next: #{pending[0].id} {pending[0].task}")
 
         lines.append("")
-        lines.append("Use the update_todo tool to update task status when you start or complete a task.")
+        lines.append(
+            "Use the update_todo tool to update task status when you start or complete a task."
+        )
 
         self._last_injected_turn = turn
 
@@ -240,7 +244,13 @@ class TodoTracker:
     def to_dict(self) -> dict:
         return {
             "items": [
-                {"id": i.id, "task": i.task, "status": i.status, "priority": i.priority, "result": i.result}
+                {
+                    "id": i.id,
+                    "task": i.task,
+                    "status": i.status,
+                    "priority": i.priority,
+                    "result": i.result,
+                }
                 for i in self._items
             ],
             "next_id": self._next_id,
@@ -250,14 +260,18 @@ class TodoTracker:
     def from_dict(cls, data: dict, enabled: bool = True) -> "TodoTracker":
         tracker = cls(enabled=enabled)
         for item_data in data.get("items", []):
-            tracker._items.append(TodoItem(
-                id=item_data["id"],
-                task=item_data["task"],
-                status=TodoStatus(item_data.get("status", "pending")),
-                priority=item_data.get("priority", "medium"),
-                result=item_data.get("result", ""),
-            ))
-        tracker._next_id = data.get("next_id", len(tracker._items) + 1)
+            tracker._items.append(
+                TodoItem(
+                    id=item_data["id"],
+                    task=item_data["task"],
+                    status=TodoStatus(item_data.get("status", "pending")),
+                    priority=item_data.get("priority", "medium"),
+                    result=item_data.get("result", ""),
+                )
+            )
+        tracker._next_id = data.get(
+            "next_id", max((item.id for item in tracker._items), default=0) + 1
+        )
         return tracker
 
     def reset(self):

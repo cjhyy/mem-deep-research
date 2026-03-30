@@ -2,3 +2,4 @@ name: "tool-calculator"
 transport: "inprocess"
 module: "mem_deep_research_core.tool.mcp_servers.calculator_server"
 object: "mcp"
+inject_context: false

@@ -135,7 +135,9 @@ async def extract_hints(
     ),
 )
 async def get_gaia_answer_type(
-    task_description: str, api_key: str, base_url: str = "https://api.openai.com/v1",
+    task_description: str,
+    api_key: str,
+    base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-4.1",
 ) -> str:
     client = AsyncOpenAI(api_key=api_key, timeout=_DEFAULT_UTIL_TIMEOUT, base_url=base_url)

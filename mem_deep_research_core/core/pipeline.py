@@ -38,6 +38,7 @@ async def execute_task_pipeline(
     context: dict[str, Any] | None = None,
     main_agent_llm_client: Any | None = None,
     sub_agent_llm_client: Any | None = None,
+    resume_from: dict | None = None,
 ) -> tuple[str, str, pathlib.Path]:
     """
     Executes the full pipeline for a single task.
@@ -134,6 +135,7 @@ async def execute_task_pipeline(
             task_file_name=task_file_name,
             task_id=task_id,
             history=history,
+            resume_from=resume_from,
         )
 
         task_log.final_boxed_answer = final_boxed_answer

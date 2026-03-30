@@ -227,7 +227,7 @@ class TestLLMSummarize:
             text = content[0]["text"]
         else:
             text = content
-        assert "[RESEARCH CONTEXT SUMMARY" in text
+        assert "[CONTEXT SUMMARY" in text
 
     @pytest.mark.asyncio
     async def test_async_apply_empty_response(self):

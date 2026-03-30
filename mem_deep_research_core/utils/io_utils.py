@@ -83,12 +83,12 @@ class OutputFormatter:
 
         while i < len(text):
             # Find the next \boxed{ pattern
-            boxed_start = text.find(r"\boxed{", i)
+            boxed_start = text.find("\\boxed{", i)
             if boxed_start == -1:
                 break
 
             # Start after the opening brace
-            content_start = boxed_start + 7  # len(r'\boxed{') = 7
+            content_start = boxed_start + len("\\boxed{")
             if content_start >= len(text):
                 break
 

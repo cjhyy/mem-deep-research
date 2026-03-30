@@ -72,7 +72,7 @@ PROVIDER_REGISTRY: dict[str, tuple[str, str, str]] = {
 
 
 @dataclass
-class ResearchResult:
+class TaskResult:
     """研究结果"""
 
     task_id: str
@@ -286,12 +286,17 @@ class DeepResearch:
             return "openrouter"  # default fallback
 
     def _validate_config(self) -> None:
-        """验证配置是否符合 schema，仅警告不阻断"""
+        """验证配置是否符合 schema，严重错误阻断，轻微问题仅警告"""
         try:
             from mem_deep_research_core.config_schema import validate_agent_config
 
             config_dict = OmegaConf.to_container(self._cfg, resolve=False)
             validate_agent_config(config_dict)
+        except (ValueError, TypeError) as e:
+            # Schema validation errors — log as error but don't block (may have optional fields)
+            logger.error(f"Config validation failed: {e}")
+        except ImportError as e:
+            logger.warning(f"Config validation skipped (schema not available): {e}")
         except Exception as e:
             logger.warning(f"Config validation warning: {e}")
 
@@ -388,7 +393,7 @@ class DeepResearch:
                 "max_tool_calls_per_turn": max_tool_calls_per_turn,
                 "keep_tool_result": -1,
                 "execution_mode": execution_mode,
-                "deep_research": {
+                "task_engine": {
                     "enabled": True,
                     "reflection_interval": 3,
                     "require_explicit_planning": True,
@@ -438,7 +443,7 @@ class DeepResearch:
         context: dict[str, Any] | None = None,
         on_progress: Callable[[str, Any], None] | None = None,
         stream_queue: Any | None = None,
-    ) -> ResearchResult:
+    ) -> TaskResult:
         """
         运行研究任务
 
@@ -449,7 +454,7 @@ class DeepResearch:
             stream_queue: 流式输出队列 (可选，asyncio.Queue)
 
         Returns:
-            ResearchResult: 研究结果
+            TaskResult: 研究结果
         """
         await self._ensure_initialized()
 
@@ -477,7 +482,7 @@ class DeepResearch:
             except Exception as e:
                 logger.debug(f"[DeepResearch] Failed to parse log metrics: {e}")
 
-        return ResearchResult(
+        return TaskResult(
             task_id=result.task_id,
             answer=result.final_answer,
             boxed_answer=result.boxed_answer,
@@ -492,11 +497,93 @@ class DeepResearch:
             checkpoints=_checkpoints if _checkpoints else None,
         )
 
+    async def resume(
+        self,
+        log_path: str | pathlib.Path,
+        context: dict[str, Any] | None = None,
+        stream_queue: Any | None = None,
+    ) -> TaskResult:
+        """从之前中断的任务恢复执行
+
+        Args:
+            log_path: 之前任务的日志文件路径
+            context: 用户上下文 (可选)
+            stream_queue: 流式输出队列 (可选)
+
+        Returns:
+            TaskResult: 恢复执行的结果
+        """
+        from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
+
+        tracer = TaskTracer.load_from_log(log_path)
+        state = tracer.get_resumable_state()
+
+        task_description = state.get("task_description", "")
+        if not task_description:
+            raise ValueError(f"Cannot resume: no task_description found in log {log_path}")
+
+        await self._ensure_initialized()
+
+        result = await self._factory.run(
+            task=task_description,
+            context=context,
+            stream_queue=stream_queue,
+            resume_from=state,
+        )
+
+        # Reuse the same result building logic
+        _perf = {}
+        _turns = 0
+        _tool_calls = 0
+        _checkpoints = []
+        if result.log_path and result.log_path.exists():
+            try:
+                import json
+
+                _log_data = json.loads(result.log_path.read_text())
+                _perf = _log_data.get("perf_metrics", {})
+                _turns = _perf.get("main_loop_turns", {}).get("value", 0)
+                _tool_calls = _perf.get("main_loop_tool_calls", {}).get("value", 0)
+                _checkpoints = _log_data.get("checkpoints", [])
+            except Exception as e:
+                logger.debug(f"[DeepResearch] Failed to parse log metrics: {e}")
+
+        return TaskResult(
+            task_id=result.task_id,
+            answer=result.final_answer,
+            boxed_answer=result.boxed_answer,
+            status=result.status,
+            duration_seconds=result.duration_seconds,
+            log_path=result.log_path,
+            error=result.error,
+            turns=_turns,
+            tool_calls=_tool_calls,
+            error_type=_classify_error(result.error) if result.error else None,
+            perf_metrics=_perf if _perf else None,
+            checkpoints=_checkpoints if _checkpoints else None,
+        )
+
+    def resume_sync(
+        self,
+        log_path: str | pathlib.Path,
+        context: dict[str, Any] | None = None,
+    ) -> TaskResult:
+        """同步恢复执行"""
+
+        async def _resume_and_close():
+            try:
+                return await self.resume(log_path, context)
+            finally:
+                await self.close()
+
+        self._initialized = False
+        return asyncio.run(_resume_and_close())
+
     def run_sync(
         self,
         task: str,
         context: dict[str, Any] | None = None,
-    ) -> ResearchResult:
+    ) -> TaskResult:
         """
         同步运行研究任务
 
@@ -505,7 +592,7 @@ class DeepResearch:
             context: 用户上下文 (可选)
 
         Returns:
-            ResearchResult: 研究结果
+            TaskResult: 研究结果
         """
 
         async def _run_and_close():
@@ -522,7 +609,7 @@ class DeepResearch:
         tasks: list[str],
         parallel: bool = False,
         max_concurrent: int = 3,
-    ) -> list[ResearchResult]:
+    ) -> list[TaskResult]:
         """
         批量运行研究任务
 
@@ -560,7 +647,7 @@ class DeepResearch:
                 except Exception as e:
                     logger.debug(f"[DeepResearch] Failed to parse log metrics: {e}")
             research_results.append(
-                ResearchResult(
+                TaskResult(
                     task_id=r.task_id,
                     answer=r.final_answer,
                     boxed_answer=r.boxed_answer,
@@ -596,11 +683,13 @@ class DeepResearch:
                 for tool in server.get("tools", []):
                     if "error" in tool:
                         continue
-                    tools.append({
-                        "server": server_name,
-                        "name": tool.get("name", ""),
-                        "description": tool.get("description", ""),
-                    })
+                    tools.append(
+                        {
+                            "server": server_name,
+                            "name": tool.get("name", ""),
+                            "description": tool.get("description", ""),
+                        }
+                    )
         return tools
 
     async def validate(self) -> dict:
@@ -647,7 +736,7 @@ class DeepResearch:
             self._initialized = False
 
     def __del__(self):
-        if hasattr(self, '_factory') and self._factory is not None and self._initialized:
+        if hasattr(self, "_factory") and self._factory is not None and self._initialized:
             logger.debug("DeepResearch was garbage collected without calling close()")
 
     async def __aenter__(self):

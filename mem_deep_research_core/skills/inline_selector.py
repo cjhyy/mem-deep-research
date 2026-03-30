@@ -126,9 +126,7 @@ class InlineSkillSelector:
             return []
         else:
             # 传统模式：用规则匹配，返回匹配到的 skill 名称
-            matched = self.matcher.match(
-                query=query, context=context, tools_to_use=tools
-            )
+            matched = self.matcher.match(query=query, context=context, tools_to_use=tools)
             return [s.name for s in matched]
 
     @staticmethod

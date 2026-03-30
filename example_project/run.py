@@ -10,7 +10,7 @@ Usage:
 
 Options:
     --deep      Force deep research mode (reflection + task tracking)
-    --flash     Force flash mode (single response, no tools)
+    --quick     Force quick mode (≤3 turns, tools enabled)
     --config    Config file name (default: agent)
     --verbose   Enable debug logging
 """
@@ -43,7 +43,7 @@ async def main():
     parser.add_argument("task", help="Task or question")
     parser.add_argument("--config", default="agent", help="Config name (default: agent)")
     parser.add_argument("--deep", action="store_true", help="Force deep research mode")
-    parser.add_argument("--flash", action="store_true", help="Force flash mode (no tools)")
+    parser.add_argument("--quick", action="store_true", help="Force quick mode (≤3 turns)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -51,16 +51,19 @@ async def main():
         logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
     else:
         log_level = os.environ.get("LOGGER_LEVEL", "INFO")
-        logging.basicConfig(level=getattr(logging, log_level), format="%(name)s %(levelname)s: %(message)s")
+        logging.basicConfig(
+            level=getattr(logging, log_level), format="%(name)s %(levelname)s: %(message)s"
+        )
+
+    from omegaconf import OmegaConf
 
     from mem_deep_research import DeepResearch
-    from omegaconf import OmegaConf
 
     dr = DeepResearch.from_project(PROJECT_DIR, config_name=args.config)
 
     # Override execution mode from CLI flags
-    if args.flash:
-        OmegaConf.update(dr._cfg, "main_agent.execution_mode", "flash")
+    if args.quick:
+        OmegaConf.update(dr._cfg, "main_agent.execution_mode", "quick")
     elif args.deep:
         OmegaConf.update(dr._cfg, "main_agent.execution_mode", "deep")
 

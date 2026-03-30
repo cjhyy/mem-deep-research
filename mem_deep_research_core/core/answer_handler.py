@@ -6,7 +6,6 @@
 """
 
 import logging
-import time
 from typing import Any
 
 from mem_deep_research_core.core.constants import FALLBACK_NO_ANSWER
@@ -52,8 +51,13 @@ async def post_process_final_answer(
 
     # 格式化输出
     task_log.log_step("format_output", "Formatting final output")
-    final_summary, final_boxed_answer = output_formatter.format_final_summary_and_log(
-        final_answer_text, llm_client
-    )
+    try:
+        final_summary, final_boxed_answer = output_formatter.format_final_summary_and_log(
+            final_answer_text, llm_client
+        )
+    except Exception as e:
+        logger.error(f"Failed to format final output: {e}", exc_info=True)
+        final_summary = final_answer_text
+        final_boxed_answer = ""
 
     return final_summary, final_boxed_answer

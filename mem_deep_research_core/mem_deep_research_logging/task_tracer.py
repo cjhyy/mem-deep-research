@@ -158,20 +158,81 @@ class TaskTracer(BaseModel):
         tool_calls_executed: int,
         last_assistant_text: str = "",
         task_failed: bool = False,
+        todo_state: dict | None = None,
+        session_memory_snapshot: str = "",
     ) -> None:
-        """Save a turn-level checkpoint for progress tracking.
+        """Save a turn-level checkpoint for progress tracking and resume.
 
-        Enables callers to see what was accomplished before a failure.
-        Each checkpoint captures the state at the end of a turn.
+        Each checkpoint captures state at the end of a turn, including
+        enough context to resume execution from this point.
         """
-        self.checkpoints.append({
-            "turn": turn,
-            "timestamp": datetime.now().isoformat(),
-            "message_count": message_count,
-            "tool_calls_executed": tool_calls_executed,
-            "last_assistant_preview": last_assistant_text[:200] if last_assistant_text else "",
-            "task_failed": task_failed,
-        })
+        self.checkpoints.append(
+            {
+                "turn": turn,
+                "timestamp": datetime.now().isoformat(),
+                "message_count": message_count,
+                "tool_calls_executed": tool_calls_executed,
+                "last_assistant_preview": last_assistant_text[:200] if last_assistant_text else "",
+                "task_failed": task_failed,
+                "todo_state": todo_state,
+                "session_memory_snapshot": session_memory_snapshot,
+            }
+        )
+
+    @classmethod
+    def load_from_log(cls, log_path: str | Path) -> "TaskTracer":
+        """Load a TaskTracer from a saved JSON log file for resume.
+
+        Args:
+            log_path: Path to the saved log JSON file.
+
+        Returns:
+            Reconstructed TaskTracer instance.
+
+        Raises:
+            FileNotFoundError: If log file does not exist.
+            ValueError: If log file cannot be parsed.
+        """
+        log_path = Path(log_path)
+        if not log_path.exists():
+            raise FileNotFoundError(f"Task log not found: {log_path}")
+        try:
+            import json
+
+            data = json.loads(log_path.read_text(encoding="utf-8"))
+            return cls(**{**data, "log_path": log_path})
+        except Exception as e:
+            raise ValueError(f"Failed to parse task log {log_path}: {e}") from e
+
+    def get_resumable_state(self) -> dict[str, Any]:
+        """Extract minimal state needed to resume execution.
+
+        Returns:
+            Dict with keys: task_description, system_prompt, message_history,
+            last_turn, todo_state, session_memory_snapshot.
+        """
+        task_description = ""
+        if self.input and isinstance(self.input, dict):
+            task_description = self.input.get("task_description", "")
+
+        system_prompt = ""
+        message_history = []
+        if self.main_agent_message_history:
+            system_prompt = self.main_agent_message_history.get("system_prompt", "")
+            message_history = self.main_agent_message_history.get("message_history", [])
+
+        last_checkpoint = self.checkpoints[-1] if self.checkpoints else {}
+
+        return {
+            "task_description": task_description,
+            "system_prompt": system_prompt,
+            "message_history": message_history,
+            "last_turn": last_checkpoint.get("turn", 0),
+            "tool_calls_executed": last_checkpoint.get("tool_calls_executed", 0),
+            "todo_state": last_checkpoint.get("todo_state"),
+            "session_memory_snapshot": last_checkpoint.get("session_memory_snapshot", ""),
+            "task_id": self.task_id,
+        }
 
     def save(self):
         """Persist TaskTracer to disk. used in a finally block, thus never raise Exception."""

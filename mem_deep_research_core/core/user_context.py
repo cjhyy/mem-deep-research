@@ -55,14 +55,10 @@ class UserContextBuilder:
 
         # Mirror mode: Direct identity - the AI IS the user
         if mode == "mirror":
-            return self._build_mirror_context(
-                user_id, user_name, meta_chat_history
-            )
+            return self._build_mirror_context(user_id, user_name, meta_chat_history)
 
         # Default mode: Service-oriented context
-        return self._build_default_context(
-            user_id, user_name, org_id, timezone, meta_chat_history
-        )
+        return self._build_default_context(user_id, user_name, org_id, timezone, meta_chat_history)
 
     def _build_mirror_context(
         self, user_id: str, user_name: str, meta_chat_history: list | None

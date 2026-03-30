@@ -5,6 +5,7 @@
 无状态、无副作用（除了直接修改传入的 message_history 列表）。
 """
 
+import hashlib
 import logging
 
 from mem_deep_research_core.core.constants import (
@@ -57,7 +58,9 @@ def deduplicate_trailing_messages(message_history: list) -> int:
             text = content
         else:
             text = str(content)
-        return hash(text[:500]) if text else 0
+        if not text:
+            return 0
+        return int(hashlib.md5(text[:500].encode("utf-8", errors="replace")).hexdigest(), 16)
 
     # 从末尾收集连续 assistant 消息的 hash
     i = len(message_history) - 1
@@ -74,14 +77,14 @@ def deduplicate_trailing_messages(message_history: list) -> int:
     if len(tail_hashes) < 2:
         return 0
 
-    # 找出重复 hash 的索引，保留最早的一个
-    seen_hashes = {}
+    # 找出重复 hash 的索引，保留最早出现的（最低索引 = 最老的消息）
+    seen_hashes: dict[int, int] = {}  # hash -> first index
     indices_to_remove = []
-    for idx, h in reversed(tail_hashes):  # 从前往后遍历
+    for idx, h in sorted(tail_hashes, key=lambda x: x[0]):  # 按索引从小到大
         if h in seen_hashes:
-            indices_to_remove.append(idx)
+            indices_to_remove.append(idx)  # 后续重复的标记删除
         else:
-            seen_hashes[h] = idx
+            seen_hashes[h] = idx  # 记录首次出现
 
     if not indices_to_remove:
         return 0

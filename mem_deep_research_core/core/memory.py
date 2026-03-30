@@ -23,6 +23,7 @@ logger = logging.getLogger("mem_deep_research")
 @dataclass
 class SourceRecord:
     """引用来源记录"""
+
     url: str = ""
     title: str = ""
     snippet: str = ""
@@ -52,21 +53,23 @@ class SessionMemory:
         if finding and finding not in self.key_findings:
             self.key_findings.append(finding)
             if len(self.key_findings) > self.max_findings:
-                self.key_findings = self.key_findings[-self.max_findings:]
+                self.key_findings = self.key_findings[-self.max_findings :]
 
     def add_strategy(self, strategy: str):
         """记录已尝试的策略（避免重复尝试）"""
         if strategy and strategy not in self.attempted_strategies:
             self.attempted_strategies.append(strategy)
             if len(self.attempted_strategies) > self.max_strategies:
-                self.attempted_strategies = self.attempted_strategies[-self.max_strategies:]
+                self.attempted_strategies = self.attempted_strategies[-self.max_strategies :]
 
     def add_source(self, url: str = "", title: str = "", snippet: str = "", tool_name: str = ""):
         """添加引用来源（按 URL 去重）"""
         if url and not any(s.url == url for s in self.sources):
-            self.sources.append(SourceRecord(url=url, title=title, snippet=snippet, tool_name=tool_name))
+            self.sources.append(
+                SourceRecord(url=url, title=title, snippet=snippet, tool_name=tool_name)
+            )
             if len(self.sources) > self.max_sources:
-                self.sources = self.sources[-self.max_sources:]
+                self.sources = self.sources[-self.max_sources :]
 
     def add_sub_agent_result(self, agent_name: str, result: str):
         """记录子 Agent 结果"""
@@ -129,6 +132,7 @@ class SessionMemory:
 @dataclass
 class MemoryEntry:
     """单条记忆条目"""
+
     key: str
     value: str
     metadata: dict = field(default_factory=dict)
@@ -181,20 +185,28 @@ class LongTermMemory:
         self._lock = threading.Lock()
 
     def _ensure_loaded(self):
-        """Lazy load from disk."""
+        """Lazy load from disk (thread-safe via _lock)."""
         if self._loaded:
             return
-        self._loaded = True
-        memory_file = self.storage_path / "memory.json"
-        if memory_file.exists():
-            try:
-                with open(memory_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self._entries = [MemoryEntry.from_dict(e) for e in data]
-                logger.debug(f"[LongTermMemory] Loaded {len(self._entries)} entries from {memory_file}")
-            except Exception as e:
-                logger.warning(f"[LongTermMemory] Failed to load: {e}")
-                self._entries = []
+        with self._lock:
+            if self._loaded:  # double-check after acquiring lock
+                return
+            memory_file = self.storage_path / "memory.json"
+            if memory_file.exists():
+                try:
+                    with open(memory_file, encoding="utf-8") as f:
+                        data = json.load(f)
+                    self._entries = [MemoryEntry.from_dict(e) for e in data]
+                    logger.debug(
+                        f"[LongTermMemory] Loaded {len(self._entries)} entries from {memory_file}"
+                    )
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(f"[LongTermMemory] Failed to load: {e}")
+                    self._entries = []
+                except Exception as e:
+                    logger.error(f"[LongTermMemory] Unexpected error loading: {e}")
+                    self._entries = []
+            self._loaded = True  # Set AFTER loading completes
 
     def _save(self):
         """Save to disk."""
@@ -233,12 +245,14 @@ class LongTermMemory:
             # Enforce max_entries (remove oldest)
             if len(self._entries) > self.max_entries:
                 self._entries.sort(key=lambda e: e.timestamp)
-                self._entries = self._entries[-self.max_entries:]
+                self._entries = self._entries[-self.max_entries :]
 
             self._save()
             logger.debug(f"[LongTermMemory] Stored: {key}")
 
-    def recall(self, query: str = "", top_k: int = 5, metadata_filter: dict | None = None) -> list[MemoryEntry]:
+    def recall(
+        self, query: str = "", top_k: int = 5, metadata_filter: dict | None = None
+    ) -> list[MemoryEntry]:
         """召回相关记忆
 
         简单关键词匹配（可通过 hook 替换为向量检索）。
@@ -253,12 +267,14 @@ class LongTermMemory:
         """
         self._ensure_loaded()
 
-        candidates = self._entries
+        with self._lock:
+            candidates = list(self._entries)  # Copy under lock to avoid race
 
         # Metadata filter
         if metadata_filter:
             candidates = [
-                e for e in candidates
+                e
+                for e in candidates
                 if all(e.metadata.get(k) == v for k, v in metadata_filter.items())
             ]
 
@@ -281,9 +297,11 @@ class LongTermMemory:
             candidates_sorted = sorted(candidates, key=lambda e: -e.timestamp)
             results = candidates_sorted[:top_k]
 
-        # Update access count
-        for entry in results:
-            entry.access_count += 1
+        # Update access count and persist
+        if results:
+            for entry in results:
+                entry.access_count += 1
+            self._save()
 
         return results
 
@@ -308,7 +326,8 @@ class LongTermMemory:
     def list_all(self) -> list[MemoryEntry]:
         """列出所有记忆"""
         self._ensure_loaded()
-        return list(self._entries)
+        with self._lock:
+            return list(self._entries)
 
     def deduplicate(self):
         """去重：合并 key 相同的条目，保留最新"""

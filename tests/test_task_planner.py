@@ -1,11 +1,11 @@
 """任务规划器单元测试
 
-覆盖: SubQuestion, ResearchPlan 数据结构, _parse_plan, TaskPlanner.enabled 守卫
+覆盖: SubQuestion, TaskPlan 数据结构, _parse_plan, TaskPlanner.enabled 守卫
 """
 
 import pytest
 
-from mem_deep_research_core.core.task_planner import ResearchPlan, SubQuestion, TaskPlanner
+from mem_deep_research_core.core.task_planner import SubQuestion, TaskPlan, TaskPlanner
 
 # ========== SubQuestion 测试 ==========
 
@@ -25,13 +25,13 @@ class TestSubQuestion:
         assert sq.status == "completed"
 
 
-# ========== ResearchPlan 测试 ==========
+# ========== TaskPlan 测试 ==========
 
 
-class TestResearchPlan:
+class TestTaskPlan:
     def test_to_context_string(self):
         """to_context_string 格式正确"""
-        plan = ResearchPlan(
+        plan = TaskPlan(
             main_question="What is AI?",
             sub_questions=[
                 SubQuestion(id=1, question="History of AI?", priority="high"),
@@ -48,12 +48,12 @@ class TestResearchPlan:
 
     def test_progress_empty(self):
         """空计划进度为 0"""
-        plan = ResearchPlan(main_question="test")
+        plan = TaskPlan(main_question="test")
         assert plan.get_progress() == 0.0
 
     def test_progress_partial(self):
         """部分完成进度计算"""
-        plan = ResearchPlan(
+        plan = TaskPlan(
             main_question="test",
             sub_questions=[
                 SubQuestion(id=1, question="Q1", status="completed"),
@@ -66,7 +66,7 @@ class TestResearchPlan:
 
     def test_progress_all_completed(self):
         """全部完成进度为 1.0"""
-        plan = ResearchPlan(
+        plan = TaskPlan(
             main_question="test",
             sub_questions=[
                 SubQuestion(id=1, question="Q1", status="completed"),

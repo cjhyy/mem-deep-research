@@ -37,7 +37,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from mem_deep_research_core.core.constants import COMPACT_MIN_CHARS, RESULT_BRIEF_LENGTH, SYSTEM_MESSAGE_KEYWORDS, TAG_RESEARCH_CONTEXT_SUMMARY
+from mem_deep_research_core.core.constants import (
+    COMPACT_MIN_CHARS,
+    SYSTEM_MESSAGE_KEYWORDS,
+    TAG_CONTEXT_SUMMARY,
+)
 
 logger = logging.getLogger("mem_deep_research")
 
@@ -374,7 +378,7 @@ class ObservationMaskingStrategy(WindowStrategy):
                     count = _count_results(record.result_full)
                     if count is not None:
                         parts.append(f"{count} results")
-                if record.result_brief:
+                if record.result_brief is not None:
                     preview = record.result_brief[:80].replace("\n", " ")
                     parts.append(f'preview="{preview}..."')
                 lines.append(f"[{' | '.join(parts)}]")
@@ -470,7 +474,7 @@ class LLMSummarizeStrategy(WindowStrategy):
                     text = content[0].get("text", "") if isinstance(content[0], dict) else ""
                 else:
                     text = str(content)
-                if text.startswith(TAG_RESEARCH_CONTEXT_SUMMARY):
+                if text.startswith(TAG_CONTEXT_SUMMARY):
                     messages.pop(1)
 
             # 插入新 summary
@@ -480,7 +484,7 @@ class LLMSummarizeStrategy(WindowStrategy):
                     {
                         "type": "text",
                         "text": (
-                            f"{TAG_RESEARCH_CONTEXT_SUMMARY} — turns 1-{cutoff_turn}]\n\n"
+                            f"{TAG_CONTEXT_SUMMARY} — turns 1-{cutoff_turn}]\n\n"
                             f"{summary}\n\n"
                             f"[End of summary. The detailed conversation continues below.]"
                         ),
@@ -524,7 +528,7 @@ class LLMSummarizeStrategy(WindowStrategy):
                 text = content
             else:
                 text = ""
-            if text.startswith(TAG_RESEARCH_CONTEXT_SUMMARY):
+            if text.startswith(TAG_CONTEXT_SUMMARY):
                 start_idx = 2
 
         old_messages = []
@@ -608,6 +612,10 @@ class BinaryReductionStrategy(WindowStrategy):
     """Level 3: 二分删除中间消息
 
     保留首条消息 + 最后 N 条，删除中间一半。最后手段。
+
+    .. warning::
+        ``apply()`` 会**原地修改**传入的 messages 列表。调用方如果需要
+        保留原始列表，应先传入副本：``strategy.apply(list(messages), ctx)``。
 
     Args:
         trigger_ratio: token 占比超过此值时触发（通常 0.95）
@@ -730,7 +738,7 @@ class WindowStrategyPipeline:
     ) -> bool:
         """执行异步 LLM 压缩（找到 LLMSummarizeStrategy 并调用）"""
         for strategy in self.strategies:
-            if hasattr(strategy, 'apply_async') and strategy.supports_async:
+            if hasattr(strategy, "apply_async") and strategy.supports_async:
                 result = await strategy.apply_async(messages, ctx, llm_call_fn)
                 return result.messages_affected > 0
         return False

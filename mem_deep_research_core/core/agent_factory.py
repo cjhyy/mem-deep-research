@@ -244,6 +244,7 @@ class AgentFactory:
         stream_queue: Any | None = None,
         history: list[dict[str, Any]] | None = None,
         on_progress: Callable[[str, Any], None] | None = None,
+        resume_from: dict | None = None,
     ) -> TaskResult:
         """
         执行任务
@@ -291,6 +292,7 @@ class AgentFactory:
                 stream_queue=stream_queue,
                 history=history,
                 context=context,
+                resume_from=resume_from,
             )
 
             duration = (datetime.now() - start_time).total_seconds()

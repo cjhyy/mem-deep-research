@@ -7,7 +7,6 @@ import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -345,7 +344,6 @@ def init_logging_for_benchmark_evaluation(print_task_logs=False):
         remove_all_console_handlers()
 
 
-@lru_cache
 def bootstrap_logger(
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] | int = "INFO",
     logger_name: str = "mem_deep_research",

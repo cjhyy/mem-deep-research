@@ -266,7 +266,13 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         if is_async:
             response = await self.client.chat.completions.create(**params)
         else:
-            response = self.client.chat.completions.create(**params)
+            # Run sync client in executor to avoid blocking the event loop
+            import functools
+
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None, functools.partial(self.client.chat.completions.create, **params)
+            )
 
         # If streaming is enabled, collect all chunks into a complete response
         if self.enable_streaming:
@@ -446,7 +452,7 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         estimated_tokens = self._estimate_tokens(total_text)
         token_limit = self.max_context_length
 
-        if estimated_tokens <= token_limit * threshold:
+        if token_limit <= 0 or estimated_tokens <= token_limit * threshold:
             return messages
 
         logger.warning(
@@ -515,14 +521,14 @@ class OpenAICompatibleClient(LLMProviderClientBase):
 
     def _estimate_tokens(self, text: str) -> int:
         """Use tiktoken to estimate token count of text."""
-        if not hasattr(self, "encoding"):
+        if not hasattr(self, "_encoding"):
             try:
-                self.encoding = tiktoken.get_encoding("o200k_base")
+                self._encoding = tiktoken.get_encoding("o200k_base")
             except Exception:
-                self.encoding = tiktoken.get_encoding("cl100k_base")
+                self._encoding = tiktoken.get_encoding("cl100k_base")
 
         try:
-            return len(self.encoding.encode(text))
+            return len(self._encoding.encode(text))
         except Exception:
             return len(text) // 4
 

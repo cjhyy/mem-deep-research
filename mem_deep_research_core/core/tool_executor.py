@@ -4,12 +4,15 @@
 处理工具调用的执行、结果收集和错误处理。
 """
 
+import asyncio
+import copy
 import datetime
 import logging
 import time
 from collections.abc import Callable
 from typing import Any
 
+from mem_deep_research_core.core.constants import TOOL_TRANSIENT_ERRORS
 from mem_deep_research_core.core.hooks import HookContext, hooks
 from mem_deep_research_core.core.secure_context import resolve_placeholders_in_args
 from mem_deep_research_core.core.tool_result_formatter import ToolResultFormatter
@@ -48,6 +51,8 @@ class ToolExecutor:
         stream_tool_call: Callable | None = None,
         stream_tool_reasoning: Callable | None = None,
         stream_usage_info: Callable | None = None,
+        retry_max: int = 2,
+        retry_backoff_base: float = 1.0,
     ):
         """
         初始化工具执行器
@@ -60,6 +65,8 @@ class ToolExecutor:
             stream_tool_call: 流式工具调用回调
             stream_tool_reasoning: 流式推理输出回调
             stream_usage_info: 流式使用信息回调
+            retry_max: 瞬态错误最大重试次数
+            retry_backoff_base: 重试退避基数(秒)
         """
         self.tool_manager = tool_manager
         self.output_formatter = output_formatter
@@ -68,6 +75,8 @@ class ToolExecutor:
         self.stream_tool_call = stream_tool_call
         self.stream_tool_reasoning = stream_tool_reasoning
         self.stream_usage_info = stream_usage_info
+        self.retry_max = retry_max
+        self.retry_backoff_base = retry_backoff_base
 
         # Scrape 结果最大长度
         self.scrape_max_length = 20000
@@ -96,6 +105,36 @@ class ToolExecutor:
         if "result" in tool_result and tool_name == "scrape":
             tool_result["result"] = self._get_scrape_result(tool_result["result"])
         return tool_result
+
+    async def _execute_with_retry(
+        self,
+        server_name: str,
+        tool_name: str,
+        arguments: dict,
+    ) -> dict[str, Any]:
+        """执行工具调用，瞬态错误自动重试（指数退避）"""
+        last_error: Exception | None = None
+        for attempt in range(1 + self.retry_max):
+            try:
+                return await self.tool_manager.execute_tool_call(
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    context=self.context,
+                )
+            except TOOL_TRANSIENT_ERRORS as e:
+                last_error = e
+                if attempt < self.retry_max:
+                    wait = self.retry_backoff_base * (2**attempt)
+                    logger.warning(
+                        f"[ToolExecutor] Transient error on {tool_name} (attempt {attempt + 1}/{1 + self.retry_max}), "
+                        f"retrying in {wait:.1f}s: {e}"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    raise  # Exhausted retries, let outer handler deal with it
+        # Should not reach here, but just in case
+        raise last_error  # type: ignore[misc]
 
     async def execute_single_tool(
         self,
@@ -136,7 +175,8 @@ class ToolExecutor:
             if self.stream_tool_call:
                 tool_call_id = await self.stream_tool_call(tool_name, arguments)
 
-            # Hook: on_tool_start — 可修改 arguments
+            # Hook: on_tool_start — 可修改 arguments（深拷贝防止污染原始记录）
+            arguments = copy.deepcopy(arguments)
             modified = hooks.call(
                 "on_tool_start",
                 HookContext(
@@ -153,13 +193,8 @@ class ToolExecutor:
             # SecureContext: 将 LLM 生成的 [SECURE:xxx] 占位符替换回真实值
             arguments = resolve_placeholders_in_args(arguments, self.context)
 
-            # 执行工具调用
-            tool_result = await self.tool_manager.execute_tool_call(
-                server_name=server_name,
-                tool_name=tool_name,
-                arguments=arguments,
-                context=self.context,
-            )
+            # 执行工具调用（含瞬态错误自动重试）
+            tool_result = await self._execute_with_retry(server_name, tool_name, arguments)
 
             # 后处理结果
             tool_result = self._post_process_tool_result(tool_name, tool_result)
@@ -276,6 +311,16 @@ class ToolExecutor:
                 call_id = call["id"]
             except (KeyError, TypeError) as e:
                 logger.error(f"[ToolExecutor] Malformed tool call, missing key: {e}. Call: {call}")
+                # Record the error so LLM knows this call failed
+                error_result = {
+                    "result": f"Malformed tool call (missing {e}). Please check your tool call format.",
+                    "server_name": "error",
+                    "tool_name": "error",
+                }
+                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                    error_result
+                )
+                tool_results_with_id.append((call.get("id", "MALFORMED"), tool_result_for_llm))
                 continue
 
             tool_result, call_duration_ms = await self.execute_single_tool(

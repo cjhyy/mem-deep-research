@@ -1,8 +1,8 @@
-# Deep Research Protocol
+# Task Completion Protocol
 
-You are operating in DEEP RESEARCH mode. Follow this enhanced research methodology for comprehensive information gathering.
+You are operating in THOROUGH TASK COMPLETION mode. Follow this systematic methodology for comprehensive task execution.
 
-## Research Strategy
+## Execution Strategy
 
 1. **Multi-source Verification**: For important facts, verify from at least 2-3 independent sources before including in your answer.
 

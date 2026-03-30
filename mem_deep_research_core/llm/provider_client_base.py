@@ -11,10 +11,6 @@ from typing import (
 )
 
 from omegaconf import DictConfig
-
-_temperature_override_var: contextvars.ContextVar[float | None] = contextvars.ContextVar(
-    '_temperature_override', default=None
-)
 from tenacity import (
     retry,
     retry_if_not_exception_type,
@@ -25,6 +21,10 @@ from tenacity import (
 
 from mem_deep_research_core.mem_deep_research_logging.logger import bootstrap_logger
 from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
+
+_temperature_override_var: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_temperature_override", default=None
+)
 
 LOGGER_LEVEL = os.getenv("LOGGER_LEVEL", "INFO")
 logger = bootstrap_logger(level=LOGGER_LEVEL)
@@ -275,9 +275,9 @@ class LLMProviderClientBase(ABC):
                 if asyncio.iscoroutinefunction(self.client.close):
                     # For async clients, try to run in event loop
                     try:
-                        asyncio.get_running_loop()
-                        # Schedule async close but don't wait
-                        asyncio.create_task(self._async_close())
+                        loop = asyncio.get_running_loop()
+                        # Schedule async close and ensure it completes
+                        loop.create_task(self._async_close())
                     except RuntimeError:
                         # No running event loop, create one temporarily
                         asyncio.run(self._async_close())
@@ -399,7 +399,9 @@ class LLMProviderClientBase(ABC):
             last_user_message = message_history.pop()
             content = last_user_message.get("content", "")
             if isinstance(content, list) and content:
-                text = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
+                text = (
+                    content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
+                )
             else:
                 text = str(content)
             return text + "\n\n-----------------\n\n" + summary_prompt
@@ -415,9 +417,8 @@ class LLMProviderClientBase(ABC):
         cached_messages = []
         user_turns_processed = 0
         for turn in reversed(messages):
-            should_process = (
-                (turn["role"] == "user" and user_turns_processed < 1)
-                or (include_system and turn["role"] == "system")
+            should_process = (turn["role"] == "user" and user_turns_processed < 1) or (
+                include_system and turn["role"] == "system"
             )
             if should_process:
                 new_content = []

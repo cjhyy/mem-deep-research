@@ -23,7 +23,7 @@ class StructuredTagExtractor:
 
     # Default tags that should be extracted as REASONING blocks
     DEFAULT_REASONING_TAGS = [
-        "research_plan",
+        "task_plan",
         "findings_update",
         "reflection_checkpoint",
         "thinking",

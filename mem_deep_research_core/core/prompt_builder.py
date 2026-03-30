@@ -66,7 +66,7 @@ class PromptBuilder:
                 hint_content=hint_content,
             )
         except Exception as e:
-            logger.error(f"Hint generation failed: {str(e)}")
+            logger.error(f"Hint generation failed: {e}", exc_info=True)
             return ""
 
     async def select_skills(
@@ -89,7 +89,8 @@ class PromptBuilder:
         """
         # inline 模式：不做额外 LLM 调用
         if self.inline_skill_selector:
-            if self.inline_skill_selector._first_turn and not self.inline_skill_selector.progressive:
+            first_turn = getattr(self.inline_skill_selector, "_first_turn", True)
+            if first_turn and not self.inline_skill_selector.progressive:
                 # 传统模式第一轮：用规则匹配返回 skill 名称
                 tool_names = [t.get("name", "") for t in tool_definitions if isinstance(t, dict)]
                 query_text = query if isinstance(query, str) else str(query)
@@ -125,10 +126,10 @@ class PromptBuilder:
         if hasattr(self.cfg.main_agent, "prompt") and self.cfg.main_agent.prompt:
             prompt_cfg = dict(self.cfg.main_agent.prompt)
 
-        # deep_research 配置转换为 presets
-        deep_research_cfg = getattr(self.cfg.main_agent, "deep_research", None)
-        if deep_research_cfg is not None:
-            deep_research_cfg = dict(deep_research_cfg)
+        # task_engine 配置转换为 presets
+        task_engine_cfg = getattr(self.cfg.main_agent, "task_engine", None)
+        if task_engine_cfg is not None:
+            task_engine_cfg = dict(task_engine_cfg)
 
         main_agent_prompt_instance = _load_agent_prompt(prompt_cfg)
 
@@ -138,7 +139,7 @@ class PromptBuilder:
             mcp_servers=tool_definitions,
             chinese_context=self.chinese_context,
             extra_context=extra_context,
-            deep_research_cfg=deep_research_cfg,
+            task_engine_cfg=task_engine_cfg,
         )
 
         # 注入 Skills（仅在 skill_selection.enabled 时）
@@ -158,9 +159,7 @@ class PromptBuilder:
                     base_prompt=system_prompt,
                     skill_names=selected_skill_names,
                 )
-                logger.debug(
-                    f"Inline legacy first-turn skills injected: {selected_skill_names}"
-                )
+                logger.debug(f"Inline legacy first-turn skills injected: {selected_skill_names}")
         else:
             skill_injector = external_loader.get_skill_injector()
             if skill_injector and initial_user_content:
@@ -185,12 +184,15 @@ class PromptBuilder:
                     logger.debug("Rule-matched skills injected into system prompt")
 
         # Hook: on_system_prompt_build — post-process system prompt
-        hook_result = hooks.call("on_system_prompt_build", HookContext(
-            hook_name="on_system_prompt_build",
-            context=self.context,
-            result=system_prompt,
-        ))
+        hook_result = hooks.call(
+            "on_system_prompt_build",
+            HookContext(
+                hook_name="on_system_prompt_build",
+                context=self.context,
+                result=system_prompt,
+            ),
+        )
         if isinstance(hook_result, str):
             system_prompt = hook_result
 
-        return system_prompt, main_agent_prompt_instance, deep_research_cfg
+        return system_prompt, main_agent_prompt_instance, task_engine_cfg

@@ -62,6 +62,10 @@ class GPTOpenAIClient(LLMProviderClientBase):
             or self.model_name.startswith("gpt-5")
         )
         logger.debug(f" Calling LLM ({'async' if self.async_client else 'sync'})")
+        # Avoid mutating the caller's message list (deep copy dicts to prevent side effects)
+        import copy
+
+        messages = [copy.copy(m) for m in messages]
         # put the system prompt in the first message since OpenAI API does not support system prompt in
         if system_prompt:
             target_role = "developer" if is_oai_new_model else "system"

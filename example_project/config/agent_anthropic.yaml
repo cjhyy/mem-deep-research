@@ -5,7 +5,7 @@ main_agent:
   prompt:
     agent_type: main
     tool_format: xml
-    presets: [research]
+    presets: [task_completion]
 
   llm:
     provider_class: "ClaudeAnthropicClient"
@@ -35,7 +35,7 @@ main_agent:
   todo_tracker:
     enabled: true
 
-  deep_research:
+  task_engine:
     enabled: true
     reflection_interval: 5
 
