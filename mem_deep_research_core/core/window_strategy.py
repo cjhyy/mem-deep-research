@@ -36,6 +36,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from mem_deep_research_core.core.constants import (
     COMPACT_MIN_CHARS,
@@ -71,6 +72,9 @@ class WindowContext:
 
     # token 估算函数
     estimate_tokens_fn: Callable[[str], int] | None = None
+
+    # Session memory（供 SessionMemoryCompactStrategy 使用）
+    session_memory: Any = None  # Optional[SessionMemory]
 
 
 @dataclass
@@ -403,6 +407,116 @@ class ObservationMaskingStrategy(WindowStrategy):
 
 
 # ============================================================
+# Strategy 1.5: Session Memory Compact（零 LLM 成本压缩）
+# ============================================================
+
+
+class SessionMemoryCompactStrategy(WindowStrategy):
+    """Level 1.5: 利用 SessionMemory 已有的 key_findings 生成零成本压缩摘要
+
+    在 LLMSummarize 之前尝试：如果 session_memory 有足够的 findings，
+    用它们替代旧消息，完全不需要 LLM 调用。
+
+    参考 Claude Code 的 trySessionMemoryCompaction：
+    先尝试零成本路径，失败了才回退到 LLM summarize。
+
+    Args:
+        trigger_ratio: token 占比超过此值时触发
+        keep_recent: 保留最近 N 轮
+        min_findings: 最少需要多少条 findings 才值得做 session memory compact
+    """
+
+    strategy_type = "session_memory_compact"
+
+    def __init__(
+        self,
+        trigger_ratio: float = 0.7,
+        keep_recent: int = 3,
+        min_findings: int = 2,
+    ):
+        self.trigger_ratio = trigger_ratio
+        self.keep_recent = keep_recent
+        self.min_findings = min_findings
+
+    def should_trigger(self, ctx: WindowContext) -> bool:
+        if ctx.max_tokens <= 0:
+            return False
+        if ctx.token_ratio < self.trigger_ratio:
+            return False
+        # 只在有足够 session memory 时触发
+        if ctx.session_memory is None:
+            return False
+        if hasattr(ctx.session_memory, "key_findings"):
+            return len(ctx.session_memory.key_findings) >= self.min_findings
+        return False
+
+    def apply(self, messages: list, ctx: WindowContext) -> CompressResult:
+        """用 session memory 的 findings 替换旧消息"""
+        if ctx.session_memory is None:
+            return CompressResult(action_label="session_memory_compact")
+
+        cutoff_turn = ctx.current_turn - self.keep_recent
+        if cutoff_turn <= 0:
+            return CompressResult(action_label="session_memory_compact")
+
+        # 生成基于 session memory 的摘要
+        memory_summary = ctx.session_memory.to_context_string()
+        if not memory_summary or len(memory_summary) < 50:
+            return CompressResult(action_label="session_memory_compact")
+
+        # 收集要替换的旧消息
+        old_indices = []
+        estimated_turn = 0
+        for i in range(1, len(messages)):
+            msg = messages[i]
+            role = msg.get("role", "")
+
+            if role == "assistant":
+                estimated_turn += 1
+
+            if estimated_turn > 0 and estimated_turn <= cutoff_turn:
+                if not _is_system_message(msg.get("content")):
+                    old_indices.append(i)
+            elif estimated_turn > cutoff_turn:
+                break
+
+        if not old_indices:
+            return CompressResult(action_label="session_memory_compact")
+
+        # 删除旧消息（从后往前）
+        for idx in sorted(old_indices, reverse=True):
+            if idx < len(messages):
+                messages.pop(idx)
+
+        # 插入 session memory 摘要
+        summary_msg = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"{TAG_CONTEXT_SUMMARY} — session memory compact, turns 1-{cutoff_turn}]\n\n"
+                        f"{memory_summary}\n\n"
+                        f"[End of session memory summary. The detailed conversation continues below.]"
+                    ),
+                }
+            ],
+        }
+        messages.insert(1, summary_msg)
+
+        logger.info(
+            f"[WINDOW] SessionMemoryCompact: replaced {len(old_indices)} messages "
+            f"with session memory summary (turns 1-{cutoff_turn})"
+        )
+
+        return CompressResult(
+            messages_affected=len(old_indices),
+            summary_text=memory_summary,
+            action_label="session_memory_compact",
+        )
+
+
+# ============================================================
 # Strategy 2: LLM Summarize（LLM 压缩）
 # ============================================================
 
@@ -713,9 +827,10 @@ class WindowStrategyPipeline:
 
     @staticmethod
     def default_strategies() -> list[WindowStrategy]:
-        """默认三级策略"""
+        """默认四级策略（L1 → L1.5 → L2 → L3）"""
         return [
             ObservationMaskingStrategy(trigger_ratio=0.6, keep_recent=3),
+            SessionMemoryCompactStrategy(trigger_ratio=0.7, keep_recent=3),
             LLMSummarizeStrategy(trigger_ratio=0.8, keep_recent=3),
             BinaryReductionStrategy(trigger_ratio=0.95),
         ]

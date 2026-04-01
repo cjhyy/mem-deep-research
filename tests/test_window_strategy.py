@@ -308,10 +308,11 @@ class TestBinaryReduction:
 class TestPipeline:
     def test_default_strategies(self):
         pipeline = WindowStrategyPipeline()
-        assert len(pipeline.strategies) == 3
+        assert len(pipeline.strategies) == 4
         assert isinstance(pipeline.strategies[0], ObservationMaskingStrategy)
-        assert isinstance(pipeline.strategies[1], LLMSummarizeStrategy)
-        assert isinstance(pipeline.strategies[2], BinaryReductionStrategy)
+        assert pipeline.strategies[1].strategy_type == "session_memory_compact"
+        assert isinstance(pipeline.strategies[2], LLMSummarizeStrategy)
+        assert isinstance(pipeline.strategies[3], BinaryReductionStrategy)
 
     def test_manage_returns_none_when_low(self):
         pipeline = WindowStrategyPipeline()

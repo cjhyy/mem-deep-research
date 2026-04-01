@@ -149,6 +149,15 @@ async def collect_openai_stream(
     if first_chunk is None:
         raise ContextLimitError("Stream was empty - likely context overflow")
 
+    # Normalize non-standard finish_reason values from providers like OpenRouter
+    # OpenAI ChatCompletion only accepts: stop, length, tool_calls, content_filter, function_call
+    _VALID_FINISH_REASONS = {"stop", "length", "tool_calls", "content_filter", "function_call"}
+    if finish_reason not in _VALID_FINISH_REASONS:
+        logger.warning(
+            f"[StreamCollect] Non-standard finish_reason '{finish_reason}', mapping to 'stop'"
+        )
+        finish_reason = "stop"
+
     # Create response structure
     response_dict = {
         "id": first_chunk.id,

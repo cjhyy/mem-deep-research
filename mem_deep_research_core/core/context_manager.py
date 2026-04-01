@@ -234,6 +234,9 @@ class ContextManager:
         # 窗口策略管道（可外部注入或从 config 自动构建）
         self._pipeline = pipeline or self._build_pipeline_from_config()
 
+        # Session memory 引用（由 MainLoopRunner 注入，供 SessionMemoryCompactStrategy 使用）
+        self._session_memory = None
+
         # Offload directory for large results
         self._offload_dir: str = ""
 
@@ -274,6 +277,10 @@ class ContextManager:
 
     def set_turn(self, turn: int) -> None:
         self._current_turn = turn
+
+    def set_session_memory(self, session_memory) -> None:
+        """注入 SessionMemory 引用（供 SessionMemoryCompactStrategy 使用）"""
+        self._session_memory = session_memory
 
     def set_offload_dir(self, path: str) -> None:
         """Set the directory for offloading large results."""
@@ -705,6 +712,7 @@ class ContextManager:
             call_registry=self._call_registry,
             compacted_turns=self._compacted_turns,
             estimate_tokens_fn=self._token_estimator,
+            session_memory=self._session_memory,
         )
 
     def manage_context(

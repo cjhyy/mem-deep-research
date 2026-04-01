@@ -76,6 +76,22 @@ BUILTIN_TOOL_SEARCH = "tool_search"
 # Maximum nesting depth for spawned agents (prevents exponential resource consumption)
 MAX_SPAWN_DEPTH = 2
 
+# Tools that are safe to execute concurrently (read-only, no side effects).
+# Matched by substring: if any pattern is contained in tool_name, it's concurrent-safe.
+CONCURRENT_SAFE_TOOL_PATTERNS = [
+    "search",
+    "scrape",
+    "fetch",
+    "read",
+    "get_",
+    "list_",
+    "query",
+    "lookup",
+    "wikipedia",
+    "calculate",
+    "unit_convert",
+]
+
 # ============================================================
 # Execution Modes
 # ============================================================
@@ -94,6 +110,11 @@ TOOL_TRANSIENT_ERRORS = (ConnectionError, TimeoutError, BrokenPipeError, EOFErro
 # ============================================================
 # Monitoring
 # ============================================================
+
+# Token budget defaults
+DEFAULT_TASK_TOKEN_BUDGET = 0  # 0 = unlimited (disabled by default)
+TOKEN_BUDGET_WARNING_RATIO = 0.8  # 80% 时注入催促
+TOKEN_BUDGET_HARD_RATIO = 1.0  # 100% 时强制终止
 
 # Default temperature boost on loop detection
 DEFAULT_TEMPERATURE_BOOST = 0.3
@@ -121,6 +142,7 @@ SYSTEM_MESSAGE_KEYWORDS = [
     "[CONTEXT NOTE",
     "[SESSION MEMORY",
     "[LONG-TERM MEMORY",
+    "[TOKEN BUDGET",
 ]
 
 # ============================================================

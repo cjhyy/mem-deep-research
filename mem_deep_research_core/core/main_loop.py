@@ -22,8 +22,12 @@ import json as _json
 from mem_deep_research_core.core.constants import (
     BUILTIN_TOOL_SEARCH,
     BUILTIN_TOOL_SPAWN_AGENT,
+    CONCURRENT_SAFE_TOOL_PATTERNS,
     CONTEXT_COMPRESSION_NOTICE,
     DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+    DEFAULT_TASK_TOKEN_BUDGET,
+    TOKEN_BUDGET_HARD_RATIO,
+    TOKEN_BUDGET_WARNING_RATIO,
     DEFAULT_TEMPERATURE_BOOST,
     DEFAULT_TEMPERATURE_BOOST_CAP,
     EXECUTION_MODE_AUTO,
@@ -133,6 +137,78 @@ def _get_spawn_agent_tool_definition() -> dict:
             }
         ],
     }
+
+
+class TokenBudgetTracker:
+    """Token 预算追踪器
+
+    跨轮次追踪总 token 消耗，接近预算时催促收尾，超预算时终止。
+    适用于所有 LLM provider（按 token 计费的场景）。
+
+    Args:
+        budget: 总 token 预算（0 = 不限制）
+        warning_ratio: 消耗达到此比例时注入催促（默认 0.8）
+        hard_ratio: 消耗达到此比例时强制终止（默认 1.0）
+    """
+
+    def __init__(
+        self,
+        budget: int = 0,
+        warning_ratio: float = TOKEN_BUDGET_WARNING_RATIO,
+        hard_ratio: float = TOKEN_BUDGET_HARD_RATIO,
+    ):
+        self.budget = budget
+        self.warning_ratio = warning_ratio
+        self.hard_ratio = hard_ratio
+        self._total_tokens_used: int = 0
+        self._warned: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.budget > 0
+
+    @property
+    def total_used(self) -> int:
+        return self._total_tokens_used
+
+    @property
+    def remaining(self) -> int:
+        if not self.enabled:
+            return -1
+        return max(0, self.budget - self._total_tokens_used)
+
+    @property
+    def usage_ratio(self) -> float:
+        if not self.enabled:
+            return 0.0
+        return self._total_tokens_used / self.budget
+
+    def record_usage(self, prompt_tokens: int = 0, completion_tokens: int = 0):
+        """记录一次 LLM 调用的 token 消耗"""
+        self._total_tokens_used += prompt_tokens + completion_tokens
+
+    def check(self) -> str | None:
+        """检查预算状态
+
+        Returns:
+            None — 正常
+            "warning" — 接近预算，应催促收尾
+            "exceeded" — 超预算，应终止
+        """
+        if not self.enabled:
+            return None
+
+        ratio = self.usage_ratio
+        if ratio >= self.hard_ratio:
+            return "exceeded"
+        if ratio >= self.warning_ratio and not self._warned:
+            self._warned = True
+            return "warning"
+        return None
+
+    def reset(self):
+        self._total_tokens_used = 0
+        self._warned = False
 
 
 class MainLoopRunner:
@@ -281,6 +357,13 @@ class MainLoopRunner:
         self.monitor.reset()
         self.context_manager.reset()
         self.session_memory = SessionMemory()  # Reset session memory between runs
+        self.context_manager.set_session_memory(self.session_memory)
+
+        # Token budget tracker
+        task_token_budget = self.cfg.main_agent.get("task_token_budget", DEFAULT_TASK_TOKEN_BUDGET)
+        token_budget = TokenBudgetTracker(budget=task_token_budget)
+        if token_budget.enabled:
+            logger.info(f"[{self.agent_name}] Token budget: {task_token_budget} tokens")
         if self.inline_skill_selector:
             self.inline_skill_selector.reset()
 
@@ -518,6 +601,41 @@ class MainLoopRunner:
             _perf_llm_elapsed = time.perf_counter() - _perf_llm_start
             _perf_total_llm_time += _perf_llm_elapsed
             self.task_log.append_perf("llm_call_durations", _perf_llm_elapsed)
+
+            # Token budget: 记录本轮消耗并检查
+            if token_budget.enabled:
+                usage = self.llm_client.get_usage()
+                # 用增量：总消耗 - 之前记录的
+                current_total = usage.get("total_tokens", 0)
+                if current_total > token_budget.total_used:
+                    increment = current_total - token_budget.total_used
+                    token_budget._total_tokens_used = current_total
+                budget_status = token_budget.check()
+                if budget_status == "exceeded":
+                    logger.warning(
+                        f"[{self.agent_name}] Token budget exceeded: "
+                        f"{token_budget.total_used}/{token_budget.budget} tokens"
+                    )
+                    task_failed = True
+                    break
+                elif budget_status == "warning":
+                    remaining_tokens = token_budget.remaining
+                    message_history.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"[TOKEN BUDGET WARNING] You have used {token_budget.usage_ratio:.0%} of your token budget "
+                                        f"({token_budget.total_used}/{token_budget.budget} tokens, ~{remaining_tokens} remaining). "
+                                        f"Please wrap up your research and provide a final answer soon."
+                                    ),
+                                }
+                            ],
+                        }
+                    )
+
             self._record_event("llm_response", {
                 "turn": turn_count,
                 "has_text": assistant_response_text is not None,
@@ -996,6 +1114,10 @@ class MainLoopRunner:
         self.task_log.record_perf("main_loop_total_tool_time", _perf_total_tool_time)
         self.task_log.record_perf("main_loop_turns", turn_counter.current_turn, unit="")
         self.task_log.record_perf("main_loop_tool_calls", total_tool_calls_executed, unit="")
+        if token_budget.enabled:
+            self.task_log.record_perf("token_budget_total", token_budget.budget, unit="tokens")
+            self.task_log.record_perf("token_budget_used", token_budget.total_used, unit="tokens")
+            self.task_log.record_perf("token_budget_ratio", round(token_budget.usage_ratio, 3), unit="")
 
         if is_simple_response:
             # 简单响应：跳过 summary LLM 调用，直接使用最后的 assistant 文本
@@ -1129,34 +1251,11 @@ class MainLoopRunner:
             else:
                 regular_calls.append(call)
 
-        # Execute regular tools sequentially
-        for call in regular_calls:
-            tool_result, _ = await self.tool_executor.execute_single_tool(
-                server_name=call["server_name"],
-                tool_name=call["tool_name"],
-                arguments=call["arguments"],
-                call_id=call["id"],
-                agent_name=self.agent_name,
-            )
-            tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
-
-            # Offload large results to filesystem
-            result_text = (
-                tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
-            )
-            if (
-                isinstance(result_text, str)
-                and self.context_manager.config.result_offload_threshold > 0
-            ):
-                shortened, file_path = self.context_manager.offload_large_result(
-                    result_text,
-                    tool_name=call["tool_name"],
-                    turn=self.context_manager._current_turn,
-                )
-                if file_path:
-                    tool_result_for_llm["text"] = shortened
-
-            all_tool_results_with_id.append((call["id"], tool_result_for_llm))
+        # Execute regular tools with concurrency awareness
+        # Concurrent-safe tools (search, scrape, read, etc.) run in parallel
+        # Non-concurrent tools run sequentially, waiting for previous batch to finish
+        regular_results = await self._execute_regular_tools_concurrent(regular_calls)
+        all_tool_results_with_id.extend(regular_results)
 
         # Execute agent calls in parallel
         if agent_calls:
@@ -1230,6 +1329,92 @@ class MainLoopRunner:
             all_tool_results_with_id.extend(failed_results)
 
         return all_tool_results_with_id
+
+    @staticmethod
+    def _is_concurrent_safe(tool_name: str) -> bool:
+        """判断工具是否可以安全并发执行（只读、无副作用）"""
+        name_lower = tool_name.lower()
+        return any(pattern in name_lower for pattern in CONCURRENT_SAFE_TOOL_PATTERNS)
+
+    async def _execute_one_regular_tool(self, call: dict) -> tuple[str, dict]:
+        """执行单个普通工具并返回 (call_id, formatted_result)"""
+        tool_result, _ = await self.tool_executor.execute_single_tool(
+            server_name=call["server_name"],
+            tool_name=call["tool_name"],
+            arguments=call["arguments"],
+            call_id=call["id"],
+            agent_name=self.agent_name,
+        )
+        tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
+
+        # Offload large results to filesystem
+        result_text = (
+            tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
+        )
+        if (
+            isinstance(result_text, str)
+            and self.context_manager.config.result_offload_threshold > 0
+        ):
+            shortened, file_path = self.context_manager.offload_large_result(
+                result_text,
+                tool_name=call["tool_name"],
+                turn=self.context_manager._current_turn,
+            )
+            if file_path:
+                tool_result_for_llm["text"] = shortened
+
+        return call["id"], tool_result_for_llm
+
+    async def _execute_regular_tools_concurrent(
+        self, regular_calls: list[dict],
+    ) -> list[tuple[str, dict]]:
+        """执行普通工具，concurrent-safe 工具并行，其他串行。
+
+        参考 Claude Code 的 StreamingToolExecutor 模式：
+        - 将工具分成连续的 batch：相邻的 concurrent-safe 工具合为一个并行 batch
+        - 遇到 non-concurrent 工具时，等前面的 batch 完成，再独占执行
+        - 结果按原始顺序返回
+        """
+        if not regular_calls:
+            return []
+
+        # 按并发安全性分 batch
+        batches: list[tuple[bool, list[dict]]] = []  # (is_concurrent, calls)
+        for call in regular_calls:
+            is_safe = self._is_concurrent_safe(call.get("tool_name", ""))
+            if batches and batches[-1][0] == is_safe:
+                batches[-1][1].append(call)
+            else:
+                batches.append((is_safe, [call]))
+
+        all_results: list[tuple[str, dict]] = []
+
+        for is_concurrent, batch_calls in batches:
+            if is_concurrent and len(batch_calls) > 1:
+                # 并行执行 concurrent-safe 工具
+                logger.info(
+                    f"[{self.agent_name}] Executing {len(batch_calls)} concurrent-safe tools in parallel: "
+                    f"{[c.get('tool_name', '?') for c in batch_calls]}"
+                )
+                tasks = [self._execute_one_regular_tool(c) for c in batch_calls]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        call = batch_calls[i]
+                        logger.error(f"Concurrent tool {call.get('tool_name')} failed: {result}")
+                        all_results.append((
+                            call["id"],
+                            {"type": "text", "text": f"[Tool Error] {str(result)[:500]}"},
+                        ))
+                    else:
+                        all_results.append(result)
+            else:
+                # 串行执行（non-concurrent 或单个 concurrent）
+                for call in batch_calls:
+                    result = await self._execute_one_regular_tool(call)
+                    all_results.append(result)
+
+        return all_results
 
     async def _run_spawned_agent(self, task_description: str, keep_tool_result: int) -> str:
         """Run a temporary spawned agent — delegates to SubAgentRunner.spawn()."""
