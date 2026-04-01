@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.1.0 (2026-04-01)
+
+### New Modules
+- **Deferred Tools** (`core/deferred_tools.py`): 工具数超阈值时延迟加载 schema，通过内置 `tool_search` 按需解析
+- **Transcript** (`core/transcript.py`): 结构化 JSONL 事件日志，支持 replay 和调试
+- **Input Compiler** (`core/input_compiler.py`): 查询预处理链（URL 提取、@file 展开、on_query_compile hook）
+- **File State Cache** (`core/file_state_cache.py`): LRU 文件内容缓存，父/子 Agent 共享
+
+### Context Management
+- **Microcompact**: 每轮零成本清理旧 tool_result（LLM 调用前）
+- **Session Memory Compaction (L1.5)**: 零 LLM 成本压缩，利用 SessionMemory findings
+- **Compact Circuit Breaker**: LLMSummarize 连续失败 3 次后自动跳过
+- **结构化卸载标记**: `[OFFLOADED:]` 标记防止二次压缩
+- **内容恢复**: resume 场景自动恢复已卸载文件
+
+### Tool Execution
+- **并发工具执行**: search/scrape/fetch/read/calc 类工具并行运行
+- **结果完整性检查**: 校验每个 tool_use 都有对应 tool_result
+- **原生工具调用**: 未解析的工具名生成错误反馈而非静默跳过
+
+### Cost Control
+- **Token Budget Tracker**: 每任务 token 限额，80% 警告 + 100% 硬停
+- **Provider Usage Tracking**: 真实 prompt/completion token 记录（`_record_usage()`）
+- **Prompt Caching**: system prompt 在 `__DYNAMIC_BOUNDARY__` 处拆分，静态部分缓存
+- **System Prompt Section Cache**: 静态段缓存，动态段重算
+
+### Resilience
+- **输出截断恢复**: `finish_reason=length` 时注入 continuation prompt
+- **非标准 finish_reason 规范化**: OpenRouter `"error"` 等映射为 `"stop"`
+- **子 Agent Prompt 复用**: spawn 子 Agent 复用父级渲染后的 system prompt
+
+### Config (New Fields)
+- `deferred_tools_threshold: 20` (0=禁用)
+- `transcript_enabled: true`
+- `task_token_budget: 0` (0=无限制)
+
 ## v1.0.5 (2026-03-31)
 
 ### Documentation Fixes (CRITICAL)
