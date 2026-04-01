@@ -188,7 +188,14 @@ class Orchestrator:
         self._init_context_manager()
         self._init_deferred_tools()
         self._init_transcript()
+        self._init_file_state_cache()
         self.current_agent_id: str | None = None
+
+    def _init_file_state_cache(self):
+        """初始化文件状态缓存"""
+        from mem_deep_research_core.core.file_state_cache import FileStateCache
+
+        self.file_state_cache = FileStateCache(max_size=100)
 
     def _init_deferred_tools(self):
         """初始化延迟工具加载管理器"""
@@ -763,6 +770,7 @@ class Orchestrator:
             hooks=hooks,
             deferred_tool_manager=self.deferred_tool_manager,
             transcript=self.transcript,
+            file_state_cache=self.file_state_cache,
         )
         return MainLoopRunner(ctx)
 

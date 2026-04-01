@@ -175,7 +175,8 @@ class PromptBuilder:
             main_agent_prompt_instance = self._cached_prompt_instance
             task_engine_cfg = self._cached_task_engine_cfg
 
-        system_prompt = static_prompt
+        # Insert dynamic boundary between static and dynamic sections
+        system_prompt = static_prompt + f"\n{self._DYNAMIC_BOUNDARY}\n"
 
         # === 动态段：skill 注入（每次重算） ===
         skill_cfg = self.cfg.main_agent.get("skill_selection", {})

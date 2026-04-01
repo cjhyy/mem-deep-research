@@ -110,6 +110,9 @@ class MainLoopContext:
     # Transcript instance (optional, for event logging)
     transcript: Any = None
 
+    # FileStateCache instance (optional, shared file content LRU cache)
+    file_state_cache: Any = None
+
 
 def _get_spawn_agent_tool_definition() -> dict:
     """Built-in spawn_agent tool — MCP server format for system prompt rendering."""
@@ -253,6 +256,7 @@ class MainLoopRunner:
         self.hooks = ctx.hooks or _default_hooks
         self.deferred_tool_manager = ctx.deferred_tool_manager
         self.transcript = ctx.transcript
+        self.file_state_cache = ctx.file_state_cache
 
         # Session memory (within-run structured memory, survives context compression)
         self.session_memory = SessionMemory()
@@ -502,6 +506,7 @@ class MainLoopRunner:
 
         # Built-in tools (spawn_agent, update_todo) are already injected by Orchestrator._get_tool_definitions
         self._current_tool_definitions = list(tool_definitions)
+        self._current_system_prompt = system_prompt  # For sub-agent prompt sharing
 
         total_tool_calls_executed = 0
         last_assistant_text = ""
@@ -647,6 +652,35 @@ class MainLoopRunner:
             last_assistant_text = assistant_response_text or ""
             if assistant_response_text is not None:
                 _context_limit_retries = 0
+
+            # max_output_tokens 续写恢复：output 被截断时注入续写提示
+            _output_truncated = getattr(self.llm_client, '_output_truncated_flag', None)
+            if _output_truncated is True:
+                self.llm_client._output_truncated_flag = False
+            if _output_truncated is True and assistant_response_text and not tool_calls:
+                logger.info(
+                    f"[{self.agent_name}] Output truncated (finish_reason=length), "
+                    f"injecting continuation prompt (turn {turn_count})"
+                )
+                message_history.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "[OUTPUT TRUNCATED] Your previous response was cut off due to length limits. "
+                                    "Please continue from where you left off. Do not repeat what you already said."
+                                ),
+                            }
+                        ],
+                    }
+                )
+                self._record_event("llm_response", {
+                    "turn": turn_count, "truncated": True,
+                    "recovery": "continuation_prompt",
+                }, turn=turn_count)
+                continue  # retry with continuation prompt
 
             # 清除温度覆盖（无论 LLM 调用成功与否）
             self.llm_client.clear_temperature_override()
@@ -1338,6 +1372,12 @@ class MainLoopRunner:
 
     async def _execute_one_regular_tool(self, call: dict) -> tuple[str, dict]:
         """执行单个普通工具并返回 (call_id, formatted_result)"""
+        # Stream progress: tool execution started
+        tool_name = call.get("tool_name", "")
+        await self.stream_handler.stream_reasoning(
+            self.agent_name, f"[TOOL_PROGRESS] Executing {tool_name}..."
+        ) if hasattr(self.stream_handler, "stream_reasoning") else None
+
         tool_result, _ = await self.tool_executor.execute_single_tool(
             server_name=call["server_name"],
             tool_name=call["tool_name"],
@@ -1470,6 +1510,7 @@ class MainLoopRunner:
             keep_tool_result=keep_tool_result,
             spawn_depth=next_depth,
             hooks_instance=self.hooks,
+            parent_system_prompt=getattr(self, '_current_system_prompt', None),
         )
 
     async def _context_summarize_call(

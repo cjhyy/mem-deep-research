@@ -84,6 +84,9 @@ class LLMProviderClientBase(ABC):
             f"disable_cache_control config value: {disable_cache_control_val} (type: {type(disable_cache_control_val)}) -> parsed as: {self.disable_cache_control}"
         )
 
+        # Usage tracking: accumulated across all API calls
+        self._usage_records: list[dict] = []
+
         self.client = self._create_client(self.cfg)
 
         logger.info(
@@ -461,12 +464,34 @@ class LLMProviderClientBase(ABC):
                 cached_messages.append(turn)
         return list(reversed(cached_messages))
 
+    def _record_usage(self, response) -> None:
+        """Extract and record usage from an API response.
+
+        Works with both OpenAI and Anthropic response formats.
+        Called automatically from _post_response_hook in subclasses.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+
+        record = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+        }
+        # Anthropic uses input_tokens / output_tokens
+        if record["prompt_tokens"] == 0:
+            record["prompt_tokens"] = getattr(usage, "input_tokens", 0) or 0
+        if record["completion_tokens"] == 0:
+            record["completion_tokens"] = getattr(usage, "output_tokens", 0) or 0
+        if record["total_tokens"] == 0:
+            record["total_tokens"] = record["prompt_tokens"] + record["completion_tokens"]
+
+        self._usage_records.append(record)
+
     def get_usage(self) -> dict[str, Any]:
         """
-        Get usage statistics for this LLM client.
-
-        Default implementation returns an empty result indicating usage tracking is not supported.
-        Subclasses should override this method to provide actual usage statistics.
+        Get accumulated usage statistics for this LLM client.
 
         :return: Dictionary containing usage statistics with keys:
             - records: List of all usage records (each with prompt_tokens, completion_tokens, total_tokens)
@@ -475,10 +500,12 @@ class LLMProviderClientBase(ABC):
             - total_tokens: Sum of all total tokens
             - request_count: Number of API requests made
         """
+        total_prompt = sum(r.get("prompt_tokens", 0) for r in self._usage_records)
+        total_completion = sum(r.get("completion_tokens", 0) for r in self._usage_records)
         return {
-            "records": [],
-            "total_prompt_tokens": 0,
-            "total_completion_tokens": 0,
-            "total_tokens": 0,
-            "request_count": 0,
+            "records": list(self._usage_records),
+            "total_prompt_tokens": total_prompt,
+            "total_completion_tokens": total_completion,
+            "total_tokens": total_prompt + total_completion,
+            "request_count": len(self._usage_records),
         }

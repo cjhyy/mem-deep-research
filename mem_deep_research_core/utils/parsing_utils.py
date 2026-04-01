@@ -598,7 +598,11 @@ def parse_llm_response_for_tool_calls(
                 raw_name = item.get("name", "")
                 resolved = _resolve_native_tool_name(raw_name, name_map)
                 if not resolved:
-                    logger.warning(f"[Parse] Skipping function_call with invalid name: {raw_name}")
+                    logger.warning(f"[Parse] Cannot resolve function_call name: {raw_name}")
+                    bad_tool_calls.append({
+                        "error": f"Unknown tool '{raw_name}'. Check tool name format.",
+                        "id": item.get("call_id", "UNKNOWN"),
+                    })
                     continue
                 server_name, tool_name = resolved
                 arguments_str = item.get("arguments")
@@ -644,7 +648,11 @@ def parse_llm_response_for_tool_calls(
             raw_name = getattr(tool_call.function, "name", "") or ""
             resolved = _resolve_native_tool_name(raw_name, name_map)
             if not resolved:
-                logger.warning(f"[Parse] Skipping tool_call with invalid name: {raw_name}")
+                logger.warning(f"[Parse] Cannot resolve native tool name: {raw_name}")
+                bad_tool_calls.append({
+                    "error": f"Unknown tool '{raw_name}'. Check tool name format (expected 'server--tool').",
+                    "id": getattr(tool_call, "id", "UNKNOWN"),
+                })
                 continue
             server_name, tool_name = resolved
             arguments_str = tool_call.function.arguments

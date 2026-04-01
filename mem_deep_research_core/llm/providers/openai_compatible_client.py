@@ -102,8 +102,8 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         return self._CONTEXT_LIMIT_PATTERNS
 
     def _post_response_hook(self, response, messages_copy: list = None) -> None:
-        """Post-response processing hook. Override for logging, usage tracking, etc."""
-        pass
+        """Post-response processing hook. Records usage automatically."""
+        self._record_usage(response)
 
     def _use_cache_control(self) -> bool:
         """Whether to use cache control. Override to disable."""
@@ -139,22 +139,28 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         """Send message to OpenAI-compatible API."""
         logger.debug(f" Calling LLM ({'async' if self.async_client else 'sync'})")
 
-        # Inject system prompt
+        # Inject system prompt (with optional cache boundary splitting)
         if system_prompt:
             target_role = "system"
-            if messages and messages[0]["role"] in ["system", "developer"]:
-                messages[0] = {
-                    "role": target_role,
-                    "content": [{"type": "text", "text": system_prompt}],
-                }
+            # Split at dynamic boundary for cache optimization:
+            # Static prefix gets cache_control, dynamic suffix does not
+            from mem_deep_research_core.core.prompt_builder import PromptBuilder
+
+            boundary = PromptBuilder._DYNAMIC_BOUNDARY
+            if boundary in system_prompt:
+                static_part, dynamic_part = system_prompt.split(boundary, 1)
+                content_blocks = [
+                    {"type": "text", "text": static_part.rstrip(), "cache_control": {"type": "ephemeral"}},
+                ]
+                if dynamic_part.strip():
+                    content_blocks.append({"type": "text", "text": dynamic_part.lstrip()})
             else:
-                messages.insert(
-                    0,
-                    {
-                        "role": target_role,
-                        "content": [{"type": "text", "text": system_prompt}],
-                    },
-                )
+                content_blocks = [{"type": "text", "text": system_prompt}]
+
+            if messages and messages[0]["role"] in ["system", "developer"]:
+                messages[0] = {"role": target_role, "content": content_blocks}
+            else:
+                messages.insert(0, {"role": target_role, "content": content_blocks})
 
         messages_copy = self._remove_tool_result_from_messages(messages, keep_tool_result)
 
@@ -218,9 +224,12 @@ class OpenAICompatibleClient(LLMProviderClientBase):
                 raise Exception(f"LLM call failed [rare case]: response = {response}")
 
             if response.choices and response.choices[0].finish_reason == "length":
-                logger.debug("LLM finish_reason is 'length', triggering ContextLimitError")
-                raise ContextLimitError(
-                    "(finish_reason=length) Response truncated due to maximum context length"
+                # Output truncated by max_tokens — NOT a context limit error.
+                # Mark the response so the main loop can attempt continuation.
+                response._output_truncated = True
+                logger.info(
+                    "LLM finish_reason is 'length': output truncated by max_tokens, "
+                    "response will be returned for continuation recovery"
                 )
 
             # Check for empty content on 'stop'
@@ -238,6 +247,9 @@ class OpenAICompatibleClient(LLMProviderClientBase):
 
             # Post-response hook for subclass customization
             self._post_response_hook(response, messages_copy)
+
+            # Propagate truncation flag to client instance for main loop recovery
+            self._output_truncated_flag = getattr(response, '_output_truncated', False)
 
             return response
         except asyncio.CancelledError:

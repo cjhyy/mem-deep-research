@@ -340,6 +340,7 @@ class SubAgentRunner:
         keep_tool_result: int = -1,
         spawn_depth: int = 0,
         hooks_instance=None,
+        parent_system_prompt: str | None = None,
     ) -> str:
         """Spawn a temporary agent inheriting parent's LLM client and tools.
 
@@ -356,6 +357,7 @@ class SubAgentRunner:
             keep_tool_result: Number of recent tool results to keep.
             spawn_depth: Current nesting depth for the spawned agent.
             hooks_instance: HookRegistry instance (defaults to module-level singleton).
+            parent_system_prompt: Reuse parent's rendered system prompt (cache optimization).
         """
         from omegaconf import OmegaConf
 
@@ -408,10 +410,15 @@ class SubAgentRunner:
         from mem_deep_research_core.utils.tool_utils import _load_agent_prompt
 
         prompt_instance = _load_agent_prompt({"agent_type": "worker", "tool_format": "xml"})
-        system_prompt = prompt_instance.generate_system_prompt_with_mcp_tools(
-            mcp_servers=parent_tool_definitions,
-            chinese_context=self.chinese_context,
-        )
+        # Reuse parent's system prompt for cache optimization (byte-exact hit)
+        if parent_system_prompt:
+            system_prompt = parent_system_prompt
+            logger.debug(f"[Spawn] Reusing parent system prompt ({len(system_prompt)} chars)")
+        else:
+            system_prompt = prompt_instance.generate_system_prompt_with_mcp_tools(
+                mcp_servers=parent_tool_definitions,
+                chinese_context=self.chinese_context,
+            )
 
         ctx = MainLoopContext(
             cfg=spawn_cfg,

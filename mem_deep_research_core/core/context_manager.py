@@ -335,6 +335,56 @@ class ContextManager:
         logger.info(f"[Context] Offloaded {len(result_text)} chars to {file_path}")
         return summary, file_path
 
+    def restore_offloaded_content(self, message_history: list) -> int:
+        """从文件恢复 offloaded 内容（resume 场景使用）。
+
+        扫描 message_history 中的 [OFFLOADED:filename|chars] 标记，
+        从 offload 目录读取原始内容并替换回来。
+
+        Returns:
+            恢复的消息数
+        """
+        import os
+
+        offload_dir = self._offload_dir or self.config.result_offload_dir
+        if not offload_dir:
+            return 0
+
+        restored = 0
+        for msg in message_history:
+            content = msg.get("content")
+            if not isinstance(content, list) or not content:
+                continue
+            first = content[0] if isinstance(content[0], dict) else {}
+            text = first.get("text", "")
+            if not text.startswith(TAG_OFFLOADED):
+                continue
+
+            # Parse [OFFLOADED:filename|chars]
+            try:
+                marker_end = text.index("]")
+                marker_body = text[len(TAG_OFFLOADED):marker_end]
+                file_name = marker_body.split("|")[0]
+            except (ValueError, IndexError):
+                continue
+
+            file_path = os.path.join(offload_dir, file_name)
+            if not os.path.isfile(file_path):
+                logger.debug(f"[Context] Offloaded file not found: {file_path}")
+                continue
+
+            try:
+                with open(file_path, encoding="utf-8") as f:
+                    original_content = f.read()
+                msg["content"] = [{"type": "text", "text": original_content}]
+                restored += 1
+            except Exception as e:
+                logger.warning(f"[Context] Failed to restore offloaded content: {e}")
+
+        if restored > 0:
+            logger.info(f"[Context] Restored {restored} offloaded messages from {offload_dir}")
+        return restored
+
     # ============================================================
     # Microcompact: 每轮自动清理旧 tool_result（零 LLM 成本）
     # ============================================================
