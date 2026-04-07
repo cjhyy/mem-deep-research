@@ -53,6 +53,8 @@ class ConfigLoader:
         self._llm_skill_selector: Any | None = None
         self._llm_skill_selector_initialized = False
         self._project_dir: Path | None = None
+        self._extra_skill_dirs: list[str] = []
+        self._skill_commands: dict = {}
 
     def reset(self) -> None:
         """Reset all cached state for a fresh start."""
@@ -61,6 +63,8 @@ class ConfigLoader:
         self._llm_skill_selector = None
         self._llm_skill_selector_initialized = False
         self._project_dir = None
+        self._extra_skill_dirs = []
+        self._skill_commands = {}
 
     def set_project_dir(self, project_dir: str | Path | None) -> None:
         """设置项目目录，用于加载项目级别的工具配置
@@ -207,12 +211,15 @@ class ConfigLoader:
         """
         获取 Skill 注入器。
 
-        加载顺序：
-        1. 框架内置 skills (config/skills/)
-        2. 项目目录 skills (project_dir/config/skills/) — 合并到同一个 matcher
+        加载顺序（通过 SkillLoader 统一扫描）：
+        1. 框架内置 config/skills/definitions/ (legacy)
+        2. 项目 config/skills/definitions/ (legacy)
+        3. 项目 .claude/skills/ (Claude Code)
+        4. 用户 ~/.claude/skills/ (Claude Code)
+        5. 额外目录 (Claude Code)
 
         Returns:
-            SkillInjector 实例，如果 skills 目录存在的话
+            SkillInjector 实例，如果有 skills 的话
         """
         if self._skill_injector_initialized:
             return self._skill_injector
@@ -221,31 +228,25 @@ class ConfigLoader:
 
         try:
             from mem_deep_research_core.skills import SkillInjector, SkillMatcher
+            from mem_deep_research_core.skills.skill_loader import SkillLoader
 
-            matcher = None
+            # 使用 SkillLoader 统一扫描所有目录
+            loader = SkillLoader(
+                framework_dir=CONFIG_DIR.parent,
+                project_dir=self._project_dir,
+                extra_dirs=[Path(d) for d in self._extra_skill_dirs],
+            )
+            skill_commands = loader.load_all()
+            self._skill_commands = skill_commands
 
-            # 1. 加载框架内置 skills
+            # 创建 SkillMatcher（用框架 skills 目录初始化，合并 Claude Code skills）
             framework_skills_dir = CONFIG_DIR / "skills"
-            if framework_skills_dir.exists() and (framework_skills_dir / "definitions").exists():
-                matcher = SkillMatcher(framework_skills_dir)
-                logger.info(
-                    f"Loaded {len(matcher.skills)} framework skills from {framework_skills_dir}"
-                )
+            matcher = SkillMatcher(
+                framework_skills_dir,
+                extra_skill_commands=skill_commands,
+            )
 
-            # 2. 加载项目目录 skills（合并）
-            if self._project_dir is not None:
-                project_skills_dir = self._project_dir / "config" / "skills"
-                if project_skills_dir.exists() and (project_skills_dir / "definitions").exists():
-                    if matcher is None:
-                        matcher = SkillMatcher(project_skills_dir)
-                    else:
-                        project_matcher = SkillMatcher(project_skills_dir)
-                        matcher.skills.update(project_matcher.skills)
-                    logger.info(
-                        f"Loaded project skills from {project_skills_dir}, total: {len(matcher.skills)}"
-                    )
-
-            if matcher and matcher.skills:
+            if matcher.skills:
                 self._skill_injector = SkillInjector(matcher)
                 return self._skill_injector
 
@@ -253,6 +254,12 @@ class ConfigLoader:
             logger.warning(f"Failed to load skill injector: {e}")
 
         return None
+
+    def get_skill_commands(self) -> dict:
+        """获取统一格式的 SkillCommand 字典"""
+        if not self._skill_injector_initialized:
+            self.get_skill_injector()
+        return getattr(self, "_skill_commands", {})
 
     def get_llm_skill_selector(self, cfg) -> Any | None:
         """
@@ -338,6 +345,9 @@ class ConfigLoader:
             if skill_selection_cfg.get("method", "rules") != "inline":
                 return None
 
+            # Pass extra skill dirs from config
+            self._extra_skill_dirs = list(skill_selection_cfg.get("claude_code_skills_dirs", []))
+
             injector = self.get_skill_injector()
             if not injector:
                 return None
@@ -345,10 +355,21 @@ class ConfigLoader:
             from mem_deep_research_core.skills import InlineSkillSelector
 
             progressive = skill_selection_cfg.get("progressive", True)
+            catalog_budget_pct = skill_selection_cfg.get("catalog_budget_pct", 0.01)
+            description_max_chars = skill_selection_cfg.get("description_max_chars", 250)
+            # Estimate budget in chars (default 200k context * 4 chars/token * 1%)
+            max_context = cfg.main_agent.get("llm", {}).get("max_context_length", 200000)
+            if max_context <= 0:
+                max_context = 200000
+            catalog_budget_chars = int(max_context * 4 * catalog_budget_pct)
+
             selector = InlineSkillSelector(
                 matcher=injector.matcher,
                 chinese=chinese,
                 progressive=progressive,
+                skill_commands=self.get_skill_commands(),
+                catalog_budget_chars=catalog_budget_chars,
+                description_max_chars=description_max_chars,
             )
             logger.info(
                 f"[ConfigLoader] Inline skill selector initialized (progressive={progressive})"

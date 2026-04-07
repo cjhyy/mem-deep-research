@@ -20,10 +20,18 @@ class GPT5OpenRouterClient(OpenAICompatibleClient):
                 f"Invalid model_name '{self.model_name}'. Must be one of: {valid_models}"
             )
 
+    def _auto_thinking_params(self) -> dict:
+        return {"reasoning_effort": self.reasoning_effort}
+
+    def _fixed_thinking_params(self) -> dict:
+        return {"reasoning_effort": self.reasoning_effort}
+
     def _customize_params(self, params: dict) -> dict:
         # GPT-5 uses max_completion_tokens instead of max_tokens
         params["max_completion_tokens"] = params.pop("max_tokens")
-        params["reasoning_effort"] = self.reasoning_effort
+        # Inject reasoning_effort from thinking config
+        thinking = self.get_thinking_params()
+        params["reasoning_effort"] = thinking.get("reasoning_effort", self.reasoning_effort)
         params["stream"] = False
         return params
 

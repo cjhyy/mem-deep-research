@@ -123,6 +123,9 @@ class HookRegistry:
         "on_context_compact",  # context 压缩时 (可标记保护消息、观察压缩行为)
         # 反思
         "on_reflection_build",  # 反思 prompt 生成 (可修改反思内容)
+        # 路由
+        "on_route_classify",  # 任务复杂度分类 (可覆盖返回 "quick"/"standard"/"deep" 或 dict)
+        "on_route_apply",  # 路由结果应用 (可修改 mode + reasoning_effort)
     ]
 
     def __init__(self):

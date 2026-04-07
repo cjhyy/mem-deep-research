@@ -1,5 +1,51 @@
 # Changelog
 
+## v1.1.1 (2026-04-07)
+
+### New Features
+
+#### Claude Code Skill 兼容
+- **SkillCommand** (`skills/skill_command.py`): 统一 Skill 数据模型，兼容 Claude Code `SKILL.md` frontmatter + 遗留格式
+  - `$ARGUMENTS/$0/$name` 参数替换（复刻 Claude Code `argumentSubstitution.ts`）
+  - `${CLAUDE_SKILL_DIR}` 模板变量
+  - `` !`cmd` `` 动态内容预处理
+  - `paths:` glob 条件激活
+  - `context: fork` 子 agent 隔离执行
+  - `allowed-tools` 工具限制
+  - Budget-aware catalog（1% context window, 250 char/skill）
+- **SkillLoader** (`skills/skill_loader.py`): 多源扫描 `.claude/skills/` + `config/skills/definitions/`，后覆盖前去重
+- **Meta message 注入**: `injection_mode: meta_message` 通过 hidden user message 注入 skill 内容（Claude Code 模式）
+
+#### Auto 模式 + Adaptive Thinking
+- **LLMRouter** (`core/llm_router.py`): 统一路由入口，结构信号 → hook → LLM 分类 → 默认
+  - `on_route_classify` hook: 覆盖分类逻辑
+  - `on_route_apply` hook: 覆盖应用逻辑（mode + reasoning_effort + thinking_params）
+  - Hook 修改 effort 后自动重新生成 thinking_params
+- **Claude Adaptive Thinking**: `thinking={"type": "adaptive"}` + `output_config={"effort": "low/medium/high"}`
+  - auto 模式: quick→low, standard→medium, deep→high
+  - fixed 模式: `budget_tokens`（兼容旧模型）
+  - none 模式: 不注入 thinking
+- **GPT-5 reasoning_effort**: 通过 `get_thinking_params()` 统一注入
+- **Provider 抽象**: `supports_adaptive_thinking()` / `get_thinking_params()` 方法，子类覆盖
+
+### Config (New Fields)
+```yaml
+main_agent:
+  llm:
+    thinking_mode: auto          # auto | adaptive | fixed | none
+    reasoning_effort: medium     # low | medium | high
+    router_model: null           # LLM 分类模型（可选）
+  skill_selection:
+    injection_mode: system_prompt  # system_prompt | meta_message
+    catalog_budget_pct: 0.01
+    description_max_chars: 250
+    claude_code_skills_dirs: []
+```
+
+### Hooks (New)
+- `on_route_classify`: 任务复杂度分类
+- `on_route_apply`: 路由结果应用（mode + reasoning_effort）
+
 ## v1.1.0 (2026-04-01)
 
 ### New Modules

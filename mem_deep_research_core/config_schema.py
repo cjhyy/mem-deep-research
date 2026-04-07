@@ -51,6 +51,28 @@ class LLMConfig(BaseModel):
     # Tool handling
     oai_tool_thinking: bool = Field(default=False, description="OpenAI 工具思考模式")
 
+    # Thinking / Reasoning
+    thinking_mode: Literal["auto", "adaptive", "fixed", "none"] = Field(
+        default="auto",
+        description=(
+            "推理模式: "
+            "auto=根据 provider 自动选择最优策略; "
+            "adaptive=模型自决定推理深度(仅 Claude 支持); "
+            "fixed=使用 reasoning_effort 固定值; "
+            "none=不启用 extended thinking"
+        ),
+    )
+    reasoning_effort: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="推理强度(仅 thinking_mode=fixed 或不支持 adaptive 的模型生效)",
+    )
+
+    # Router（auto 模式 + 不支持 adaptive 时的 LLM 分类器）
+    router_model: str | None = Field(
+        default=None,
+        description="路由分类模型（如 gpt-4o-mini），为 None 时仅用结构信号路由",
+    )
+
     # Context management
     max_context_length: int = Field(
         default=-1, description="模型最大上下文长度(tokens)，-1 表示不限制"
@@ -143,6 +165,36 @@ class SkillSelectionConfig(BaseModel):
 
     # 通用配置
     max_skills: int = Field(default=3, ge=0, le=10, description="最大选择 Skill 数量")
+
+    # 注入模式
+    injection_mode: Literal["system_prompt", "meta_message"] = Field(
+        default="system_prompt",
+        description=(
+            "Skill 内容注入方式: "
+            "system_prompt=修改 system prompt（传统模式）; "
+            "meta_message=通过 hidden user message 注入（Claude Code 模式）"
+        ),
+    )
+
+    # Budget 控制
+    catalog_budget_pct: float = Field(
+        default=0.01,
+        ge=0.001,
+        le=0.1,
+        description="Skill catalog 占 context window 的比例（默认 1%）",
+    )
+    description_max_chars: int = Field(
+        default=250,
+        ge=20,
+        le=1000,
+        description="Catalog 中每个 Skill 描述的最大字符数",
+    )
+
+    # Claude Code skill 目录
+    claude_code_skills_dirs: list[str] = Field(
+        default_factory=list,
+        description="额外扫描的 Claude Code 格式 skill 目录（{name}/SKILL.md）",
+    )
 
 
 class MonitoringConfigSchema(BaseModel):

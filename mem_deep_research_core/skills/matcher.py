@@ -34,6 +34,8 @@ from typing import Any
 
 import yaml
 
+from mem_deep_research_core.skills.skill_command import SkillCommand
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,16 +65,36 @@ class MatchedSkill:
 class SkillMatcher:
     """Skill 情境匹配器"""
 
-    def __init__(self, skills_dir: Path):
+    def __init__(
+        self, skills_dir: Path, extra_skill_commands: dict[str, SkillCommand] | None = None
+    ):
         """
         初始化 Skill 匹配器。
 
         Args:
             skills_dir: Skills 目录路径，应包含 definitions/ 子目录
+            extra_skill_commands: 额外的 SkillCommand 对象（如 Claude Code 格式）
         """
         self.skills_dir = Path(skills_dir)
         self.skills: dict[str, dict] = {}
+        self._skill_commands: dict[str, SkillCommand] = {}
         self._load_skills()
+
+        # Merge extra SkillCommand objects
+        if extra_skill_commands:
+            for name, sc in extra_skill_commands.items():
+                self._skill_commands[name] = sc
+                # Also add to self.skills for backward compat with match()
+                if name not in self.skills:
+                    self.skills[name] = {
+                        "name": name,
+                        "description": sc.description,
+                        "when_to_use": sc.when_to_use,
+                        "type": sc.skill_type,
+                        "triggers": sc.triggers,
+                        "metadata": sc.metadata,
+                        "content": sc.raw_content,
+                    }
 
     def _load_skills(self) -> None:
         """加载所有 Skill 定义 (Markdown 格式)"""
@@ -317,6 +339,15 @@ class SkillMatcher:
             )
         return summaries
 
+    def get_skill_commands(self) -> dict[str, SkillCommand]:
+        """返回所有 skill 的统一 SkillCommand 表示"""
+        # Lazily convert legacy skills to SkillCommand
+        for name, skill_dict in self.skills.items():
+            if name not in self._skill_commands:
+                source_path = self.skills_dir / "definitions" / f"{name}.md"
+                self._skill_commands[name] = SkillCommand.from_legacy(name, skill_dict, source_path)
+        return dict(self._skill_commands)
+
 
 class SkillInjector:
     """Skill 内容注入器"""
@@ -456,6 +487,42 @@ class SkillInjector:
 
         sections.append("---")
         return "\n".join(sections)
+
+    def build_meta_message(
+        self,
+        skill_names: list[str],
+        skill_commands: dict[str, SkillCommand] | None = None,
+    ) -> dict | None:
+        """构建 isMeta user message 用于 skill 内容注入（Claude Code 模式）。
+
+        Args:
+            skill_names: 要注入的 skill 名称列表
+            skill_commands: SkillCommand 字典（如果提供则优先使用）
+
+        Returns:
+            isMeta user message dict, 或 None
+        """
+        contents = []
+        for name in skill_names:
+            # 优先从 skill_commands 获取
+            sc = (skill_commands or {}).get(name)
+            if sc:
+                contents.append(f"## Skill: {name}\n\n{sc.raw_content}")
+            elif name in self.matcher.skills:
+                skill = self.matcher.skills[name]
+                contents.append(f"## Skill: {name}\n\n{skill.get('content', '')}")
+            else:
+                logger.warning(f"[SkillInjector] Skill '{name}' not found for meta message")
+
+        if not contents:
+            return None
+
+        text = "\n\n---\n\n".join(contents)
+        return {
+            "role": "user",
+            "content": [{"type": "text", "text": text}],
+            "_meta": {"is_skill": True, "skill_names": skill_names},
+        }
 
     def _inject_section(self, base_prompt: str, skills_section: str) -> str:
         """将 Skills 部分注入到提示词中"""

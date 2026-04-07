@@ -27,6 +27,29 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
     def __post_init__(self):
         super().__post_init__()
 
+    def supports_adaptive_thinking(self) -> bool:
+        return True
+
+    def _auto_thinking_params(self) -> dict:
+        # Claude 4.6: adaptive thinking + effort 控制深度
+        # 模型自己判断是否需要 thinking，effort 控制上限
+        return {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": self.reasoning_effort},
+        }
+
+    def _adaptive_thinking_params(self) -> dict:
+        return {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": self.reasoning_effort},
+        }
+
+    def _fixed_thinking_params(self) -> dict:
+        # fixed 模式：使用 budget_tokens 精确控制（兼容旧模型）
+        budget_map = {"low": 2000, "medium": 5000, "high": 10000}
+        budget = budget_map.get(self.reasoning_effort, 5000)
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+
     def _create_client(self, config: DictConfig):
         """Create Anthropic client"""
         api_key = self.cfg.llm.anthropic_api_key
@@ -101,40 +124,44 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
 
     async def _create_completion(self, system_prompt, processed_messages):
         """Helper to create a completion, handling async and sync calls."""
+        # Build thinking params if configured
+        thinking_params = self.get_thinking_params()
+        thinking_arg = thinking_params.get("thinking", NOT_GIVEN)
+        output_config_arg = thinking_params.get("output_config", NOT_GIVEN)
+
+        # When thinking is enabled (non-adaptive), temperature must be 1
+        temperature = self.get_effective_temperature()
+        if thinking_arg is not NOT_GIVEN:
+            thinking_type = thinking_arg.get("type") if isinstance(thinking_arg, dict) else None
+            if thinking_type == "enabled":
+                # budget_tokens 模式要求 temperature=1
+                temperature = 1
+
+        kwargs = {
+            "model": self.model_name,
+            "temperature": temperature,
+            "top_p": self.top_p if self.top_p != 1.0 else NOT_GIVEN,
+            "top_k": self.top_k if self.top_k != -1 else NOT_GIVEN,
+            "max_tokens": self.max_tokens,
+            "system": [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": processed_messages,
+            "stream": self.enable_streaming,
+        }
+        if thinking_arg is not NOT_GIVEN:
+            kwargs["thinking"] = thinking_arg
+        if output_config_arg is not NOT_GIVEN:
+            kwargs["output_config"] = output_config_arg
+
         if self.async_client:
-            return await self.client.messages.create(
-                model=self.model_name,
-                temperature=self.get_effective_temperature(),
-                top_p=self.top_p if self.top_p != 1.0 else NOT_GIVEN,
-                top_k=self.top_k if self.top_k != -1 else NOT_GIVEN,
-                max_tokens=self.max_tokens,
-                system=[
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=processed_messages,
-                stream=self.enable_streaming,
-            )
+            return await self.client.messages.create(**kwargs)
         else:
-            return self.client.messages.create(
-                model=self.model_name,
-                temperature=self.get_effective_temperature(),
-                top_p=self.top_p if self.top_p != 1.0 else NOT_GIVEN,
-                top_k=self.top_k if self.top_k != -1 else NOT_GIVEN,
-                max_tokens=self.max_tokens,
-                system=[
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=processed_messages,
-                stream=self.enable_streaming,
-            )
+            return self.client.messages.create(**kwargs)
 
     def process_llm_response(
         self, llm_response, message_history, agent_type="main"

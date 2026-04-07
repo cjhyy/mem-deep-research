@@ -35,5 +35,5 @@ CLI:
 
 from mem_deep_research_core.deep_research import DeepResearch, TaskResult
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __all__ = ["DeepResearch", "TaskResult", "__version__"]

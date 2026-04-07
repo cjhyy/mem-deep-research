@@ -10,14 +10,13 @@
 """
 
 import asyncio
+import json as _json
 import logging
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
-
-import json as _json
 
 from mem_deep_research_core.core.constants import (
     BUILTIN_TOOL_SEARCH,
@@ -26,8 +25,6 @@ from mem_deep_research_core.core.constants import (
     CONTEXT_COMPRESSION_NOTICE,
     DEFAULT_MAX_CONCURRENT_SUBAGENTS,
     DEFAULT_TASK_TOKEN_BUDGET,
-    TOKEN_BUDGET_HARD_RATIO,
-    TOKEN_BUDGET_WARNING_RATIO,
     DEFAULT_TEMPERATURE_BOOST,
     DEFAULT_TEMPERATURE_BOOST_CAP,
     EXECUTION_MODE_AUTO,
@@ -40,6 +37,8 @@ from mem_deep_research_core.core.constants import (
     SUB_AGENT_PREFIX,
     TAG_COLLECTED_SOURCES,
     TAG_TASK_PLAN,
+    TOKEN_BUDGET_HARD_RATIO,
+    TOKEN_BUDGET_WARNING_RATIO,
     generate_message_id,
 )
 from mem_deep_research_core.core.hooks import HookContext
@@ -112,6 +111,9 @@ class MainLoopContext:
 
     # FileStateCache instance (optional, shared file content LRU cache)
     file_state_cache: Any = None
+
+    # Skill commands registry (optional, unified SkillCommand dict)
+    skill_commands: dict = field(default_factory=dict)
 
 
 def _get_spawn_agent_tool_definition() -> dict:
@@ -257,6 +259,7 @@ class MainLoopRunner:
         self.deferred_tool_manager = ctx.deferred_tool_manager
         self.transcript = ctx.transcript
         self.file_state_cache = ctx.file_state_cache
+        self.skill_commands = ctx.skill_commands
 
         # Session memory (within-run structured memory, survives context compression)
         self.session_memory = SessionMemory()
@@ -431,11 +434,14 @@ class MainLoopRunner:
         )
 
         # Transcript: agent start
-        self._record_event("agent_start", {
-            "agent_name": self.agent_name,
-            "execution_mode": self.execution_mode,
-            "task": task_description[:200],
-        })
+        self._record_event(
+            "agent_start",
+            {
+                "agent_name": self.agent_name,
+                "execution_mode": self.execution_mode,
+                "task": task_description[:200],
+            },
+        )
 
         # Auto-detect response language from query (hook can override via on_agent_start)
         if self.response_language == "auto":
@@ -463,13 +469,28 @@ class MainLoopRunner:
                 )
 
         # Resolve execution mode
-        # auto mode: let the main LLM self-adapt via system prompt instructions (no extra routing call)
+        # Auto 模式统一走 LLMRouter：结构信号 → hook → LLM 分类 → 默认
+        # Router 内部自动处理 adaptive thinking / reasoning_effort 注入
         effective_mode = self.execution_mode
         if effective_mode == EXECUTION_MODE_AUTO:
-            if task_engine_cfg and task_engine_cfg.get("enabled"):
-                effective_mode = EXECUTION_MODE_DEEP
-            else:
-                effective_mode = EXECUTION_MODE_STANDARD
+            from mem_deep_research_core.core.llm_router import LLMRouter
+
+            router = LLMRouter(hooks=self.hooks, llm_client=self.llm_client)
+            route_result = await router.route(
+                query=task_description,
+                tool_count=sum(
+                    len(s.get("tools", [])) for s in tool_definitions if isinstance(s, dict)
+                ),
+                has_sub_agents=bool(getattr(self.cfg, "sub_agents", None)),
+                task_engine_enabled=bool(task_engine_cfg and task_engine_cfg.get("enabled")),
+                context=self.context,
+            )
+            effective_mode = route_result.mode
+            logger.info(
+                f"[{self.agent_name}] Auto route: {effective_mode} "
+                f"(effort={route_result.reasoning_effort}, source={route_result.source}, "
+                f"thinking={bool(route_result.thinking_params)})"
+            )
 
         logger.info(
             f"[{self.agent_name}] Execution mode: {effective_mode} (config={self.execution_mode})"
@@ -585,15 +606,18 @@ class MainLoopRunner:
                 break
 
             # Microcompact: 每轮 LLM 调用前清理旧 tool_result（零成本）
-            self.context_manager.microcompact(
-                message_history, turn_count, keep_recent=3
-            )
+            self.context_manager.microcompact(message_history, turn_count, keep_recent=3)
 
             # LLM 调用
             _perf_llm_start = time.perf_counter()
-            _llm_event_id = self._record_event("llm_call", {
-                "turn": turn_count, "message_count": len(message_history),
-            }, turn=turn_count)
+            _llm_event_id = self._record_event(
+                "llm_call",
+                {
+                    "turn": turn_count,
+                    "message_count": len(message_history),
+                },
+                turn=turn_count,
+            )
             assistant_response_text, should_break, tool_calls = await self._handle_llm_call(
                 system_prompt,
                 message_history,
@@ -641,20 +665,25 @@ class MainLoopRunner:
                         }
                     )
 
-            self._record_event("llm_response", {
-                "turn": turn_count,
-                "has_text": assistant_response_text is not None,
-                "has_tool_calls": bool(tool_calls and tool_calls != "context_limit"),
-                "should_break": should_break,
-            }, turn=turn_count, ref_event_id=_llm_event_id,
-                duration_ms=int(_perf_llm_elapsed * 1000))
+            self._record_event(
+                "llm_response",
+                {
+                    "turn": turn_count,
+                    "has_text": assistant_response_text is not None,
+                    "has_tool_calls": bool(tool_calls and tool_calls != "context_limit"),
+                    "should_break": should_break,
+                },
+                turn=turn_count,
+                ref_event_id=_llm_event_id,
+                duration_ms=int(_perf_llm_elapsed * 1000),
+            )
 
             last_assistant_text = assistant_response_text or ""
             if assistant_response_text is not None:
                 _context_limit_retries = 0
 
             # max_output_tokens 续写恢复：output 被截断时注入续写提示
-            _output_truncated = getattr(self.llm_client, '_output_truncated_flag', None)
+            _output_truncated = getattr(self.llm_client, "_output_truncated_flag", None)
             if _output_truncated is True:
                 self.llm_client._output_truncated_flag = False
             if _output_truncated is True and assistant_response_text and not tool_calls:
@@ -676,10 +705,15 @@ class MainLoopRunner:
                         ],
                     }
                 )
-                self._record_event("llm_response", {
-                    "turn": turn_count, "truncated": True,
-                    "recovery": "continuation_prompt",
-                }, turn=turn_count)
+                self._record_event(
+                    "llm_response",
+                    {
+                        "turn": turn_count,
+                        "truncated": True,
+                        "recovery": "continuation_prompt",
+                    },
+                    turn=turn_count,
+                )
                 continue  # retry with continuation prompt
 
             # 清除温度覆盖（无论 LLM 调用成功与否）
@@ -723,8 +757,50 @@ class MainLoopRunner:
                     assistant_response_text
                 )
                 if next_skills:
-                    system_prompt = self.inline_skill_selector.inject_pending_skills(system_prompt)
-                    logger.info(f"[InlineSkill] Injected skills for next turn: {next_skills}")
+                    # 检查 injection mode: meta_message 或 system_prompt
+                    injection_mode = self.cfg.main_agent.get("skill_selection", {}).get(
+                        "injection_mode", "system_prompt"
+                    )
+                    if injection_mode == "meta_message" and self.skill_commands:
+                        # Claude Code 模式: 分流 fork 和 inline
+                        for skill_name in next_skills:
+                            sc = self.skill_commands.get(skill_name)
+                            if not sc:
+                                continue
+                            if sc.context_mode == "fork":
+                                # Fork: spawn 子 agent 执行
+                                fork_result = await self._run_fork_skill(sc)
+                                message_history.append(
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": f"[Skill Result: {skill_name}]\n{fork_result}",
+                                            }
+                                        ],
+                                    }
+                                )
+                                logger.info(f"[InlineSkill] Fork skill '{skill_name}' completed")
+                            else:
+                                # Inline: 渲染 prompt，注入 meta message
+                                rendered = await sc.get_prompt()
+                                message_history.append(
+                                    {
+                                        "role": "user",
+                                        "content": [{"type": "text", "text": rendered}],
+                                        "_meta": True,
+                                    }
+                                )
+                                logger.info(
+                                    f"[InlineSkill] Injected meta message for skill '{skill_name}'"
+                                )
+                    else:
+                        # 传统模式: 修改 system prompt
+                        system_prompt = self.inline_skill_selector.inject_pending_skills(
+                            system_prompt
+                        )
+                    logger.info(f"[InlineSkill] Processed skills for next turn: {next_skills}")
 
             # 处理 LLM 响应
             if assistant_response_text is not None:
@@ -841,11 +917,15 @@ class MainLoopRunner:
                 # Transcript: record each tool_use
                 _tool_event_ids = {}
                 for call in to_execute:
-                    eid = self._record_event("tool_use", {
-                        "tool_name": call.get("tool_name", ""),
-                        "server_name": call.get("server_name", ""),
-                        "arguments_preview": str(call.get("arguments", ""))[:200],
-                    }, turn=turn_count)
+                    eid = self._record_event(
+                        "tool_use",
+                        {
+                            "tool_name": call.get("tool_name", ""),
+                            "server_name": call.get("server_name", ""),
+                            "arguments_preview": str(call.get("arguments", ""))[:200],
+                        },
+                        turn=turn_count,
+                    )
                     if eid:
                         _tool_event_ids[call.get("id", "")] = eid
 
@@ -861,11 +941,20 @@ class MainLoopRunner:
 
                 # Transcript: record tool_results
                 for call_id, result in all_tool_results_with_id:
-                    result_text = result.get("text", "")[:100] if isinstance(result, dict) else str(result)[:100]
-                    self._record_event("tool_result", {
-                        "call_id": call_id,
-                        "result_preview": result_text,
-                    }, turn=turn_count, ref_event_id=_tool_event_ids.get(call_id))
+                    result_text = (
+                        result.get("text", "")[:100]
+                        if isinstance(result, dict)
+                        else str(result)[:100]
+                    )
+                    self._record_event(
+                        "tool_result",
+                        {
+                            "call_id": call_id,
+                            "result_preview": result_text,
+                        },
+                        turn=turn_count,
+                        ref_event_id=_tool_event_ids.get(call_id),
+                    )
 
                 # Deferred tools: 如果 tool_search 发现了新工具，更新 tool_definitions
                 # 注意：XML tool format 下工具描述在 system prompt 中，mid-run 发现新工具
@@ -891,7 +980,10 @@ class MainLoopRunner:
                 )
                 for mid in missing_ids:
                     all_tool_results_with_id.append(
-                        (mid, {"type": "text", "text": "[Tool result missing due to internal error]"})
+                        (
+                            mid,
+                            {"type": "text", "text": "[Tool result missing due to internal error]"},
+                        )
                     )
 
             # 注册 tool results
@@ -955,10 +1047,14 @@ class MainLoopRunner:
 
             # Transcript: record compression
             if action and action != "none":
-                self._record_event("compact", {
-                    "action": action,
-                    "message_count": len(message_history),
-                }, turn=turn_count)
+                self._record_event(
+                    "compact",
+                    {
+                        "action": action,
+                        "message_count": len(message_history),
+                    },
+                    turn=turn_count,
+                )
 
             # Hook: on_context_compact — 压缩发生后通知业务层
             if action is not None:
@@ -1056,11 +1152,14 @@ class MainLoopRunner:
                 logger.debug(f"[Deep Research] Reflection checkpoint injected at turn {turn_count}")
 
         # Transcript: agent end
-        self._record_event("agent_end", {
-            "task_failed": task_failed,
-            "turns_used": turn_counter.current_turn,
-            "total_tool_calls": total_tool_calls_executed,
-        })
+        self._record_event(
+            "agent_end",
+            {
+                "task_failed": task_failed,
+                "turns_used": turn_counter.current_turn,
+                "total_tool_calls": total_tool_calls_executed,
+            },
+        )
 
         # Hook: on_agent_end
         self.hooks.call(
@@ -1151,7 +1250,9 @@ class MainLoopRunner:
         if token_budget.enabled:
             self.task_log.record_perf("token_budget_total", token_budget.budget, unit="tokens")
             self.task_log.record_perf("token_budget_used", token_budget.total_used, unit="tokens")
-            self.task_log.record_perf("token_budget_ratio", round(token_budget.usage_ratio, 3), unit="")
+            self.task_log.record_perf(
+                "token_budget_ratio", round(token_budget.usage_ratio, 3), unit=""
+            )
 
         if is_simple_response:
             # 简单响应：跳过 summary LLM 调用，直接使用最后的 assistant 文本
@@ -1230,13 +1331,16 @@ class MainLoopRunner:
                         )
                     result_text = (
                         f"Found {len(results)} matching tools. "
-                        f"You can now call these tools directly:\n\n"
-                        + "\n\n".join(result_lines)
+                        f"You can now call these tools directly:\n\n" + "\n\n".join(result_lines)
                     )
                 else:
                     result_text = f"No tools found matching '{query}'. Try different keywords."
                 tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
-                    {"server_name": "builtin", "tool_name": BUILTIN_TOOL_SEARCH, "result": result_text}
+                    {
+                        "server_name": "builtin",
+                        "tool_name": BUILTIN_TOOL_SEARCH,
+                        "result": result_text,
+                    }
                 )
                 builtin_results.append((call["id"], tool_result_for_llm))
             elif call["tool_name"] == "update_todo" and self.todo_tracker:
@@ -1406,7 +1510,8 @@ class MainLoopRunner:
         return call["id"], tool_result_for_llm
 
     async def _execute_regular_tools_concurrent(
-        self, regular_calls: list[dict],
+        self,
+        regular_calls: list[dict],
     ) -> list[tuple[str, dict]]:
         """执行普通工具，concurrent-safe 工具并行，其他串行。
 
@@ -1442,10 +1547,12 @@ class MainLoopRunner:
                     if isinstance(result, Exception):
                         call = batch_calls[i]
                         logger.error(f"Concurrent tool {call.get('tool_name')} failed: {result}")
-                        all_results.append((
-                            call["id"],
-                            {"type": "text", "text": f"[Tool Error] {str(result)[:500]}"},
-                        ))
+                        all_results.append(
+                            (
+                                call["id"],
+                                {"type": "text", "text": f"[Tool Error] {str(result)[:500]}"},
+                            )
+                        )
                     else:
                         all_results.append(result)
             else:
@@ -1510,8 +1617,15 @@ class MainLoopRunner:
             keep_tool_result=keep_tool_result,
             spawn_depth=next_depth,
             hooks_instance=self.hooks,
-            parent_system_prompt=getattr(self, '_current_system_prompt', None),
+            parent_system_prompt=getattr(self, "_current_system_prompt", None),
         )
+
+    async def _run_fork_skill(self, skill_command) -> str:
+        """Run a fork-mode skill as a spawned sub-agent with filtered tools."""
+        # Render the skill prompt
+        rendered_prompt = await skill_command.get_prompt()
+
+        return await self._run_spawned_agent(rendered_prompt, -1)
 
     async def _context_summarize_call(
         self,

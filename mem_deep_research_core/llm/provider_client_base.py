@@ -51,6 +51,7 @@ class LLMProviderClientBase(ABC):
         self.min_p: float = self.cfg.llm.min_p
         self.top_k: int = self.cfg.llm.top_k
         self.reasoning_effort: str = self.cfg.llm.get("reasoning_effort", "medium")
+        self.thinking_mode: str = self.cfg.llm.get("thinking_mode", "auto")
         self.repetition_penalty: float = self.cfg.llm.get("repetition_penalty", 1.0)
         self.max_tokens: int = self.cfg.llm.max_tokens
         self.max_context_length: int = self.cfg.llm.get("max_context_length", -1)
@@ -92,6 +93,51 @@ class LLMProviderClientBase(ABC):
         logger.info(
             f"LLMClient (class={self.__class__.__name__},provider={self.provider_class},model_name={self.model_name},timeout={self.timeout}) initialized"
         )
+
+    def supports_adaptive_thinking(self) -> bool:
+        """是否支持 adaptive thinking（模型自决定推理深度）。
+
+        子类覆盖：Claude → True，其他 → False。
+        """
+        return False
+
+    def get_thinking_params(self) -> dict[str, Any]:
+        """获取当前 thinking 配置参数，用于注入 API 调用。
+
+        子类覆盖以返回 provider 特定的参数格式。
+        默认返回空 dict（不注入 thinking 参数）。
+
+        Returns:
+            provider 特定的 thinking 参数 dict，如：
+            - Claude: {"thinking": {"type": "adaptive"}}
+            - GPT-5: {"reasoning_effort": "medium"}
+        """
+        mode = self.thinking_mode
+        if mode == "none":
+            return {}
+        if mode == "auto":
+            # auto 模式下由子类决定最优策略
+            return self._auto_thinking_params()
+        if mode == "adaptive":
+            if self.supports_adaptive_thinking():
+                return self._adaptive_thinking_params()
+            # 不支持 adaptive，fallback 到 fixed
+            return self._fixed_thinking_params()
+        if mode == "fixed":
+            return self._fixed_thinking_params()
+        return {}
+
+    def _auto_thinking_params(self) -> dict[str, Any]:
+        """auto 模式的默认实现：不注入参数。子类覆盖。"""
+        return {}
+
+    def _adaptive_thinking_params(self) -> dict[str, Any]:
+        """adaptive thinking 参数。子类覆盖。"""
+        return {}
+
+    def _fixed_thinking_params(self) -> dict[str, Any]:
+        """fixed thinking 参数。子类覆盖。"""
+        return {}
 
     def get_retry_decorator(self, exception_to_skip=None):
         """

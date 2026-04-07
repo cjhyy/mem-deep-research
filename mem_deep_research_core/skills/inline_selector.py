@@ -29,8 +29,12 @@ Inline Skill 选择器
 
 import logging
 import re
+from typing import TYPE_CHECKING
 
 from mem_deep_research_core.skills.matcher import SkillInjector, SkillMatcher
+
+if TYPE_CHECKING:
+    from mem_deep_research_core.skills.skill_command import SkillCommand
 
 logger = logging.getLogger(__name__)
 
@@ -52,37 +56,86 @@ class InlineSkillSelector:
     # <next_skills> 标签名，用于 StructuredTagExtractor 提取
     TAG_NAME = "next_skills"
 
-    def __init__(self, matcher: SkillMatcher, chinese: bool = False, progressive: bool = True):
+    def __init__(
+        self,
+        matcher: SkillMatcher,
+        chinese: bool = False,
+        progressive: bool = True,
+        skill_commands: "dict[str, SkillCommand] | None" = None,
+        catalog_budget_chars: int = 8000,
+        description_max_chars: int = 250,
+    ):
         """
         Args:
             matcher: SkillMatcher 实例
             chinese: 是否使用中文提示
             progressive: 是否启用渐进加载（默认 True）。
-                True: 第一轮仅注入 catalog，LLM 按需声明后再加载完整内容。
-                False: 第一轮用规则匹配注入完整 skill 内容（传统模式）。
+            skill_commands: 统一格式的 SkillCommand 字典（优先于 matcher）
+            catalog_budget_chars: catalog 总字符预算（默认 8000，约 context 1%）
+            description_max_chars: 单个 skill 描述最大字符数
         """
         self.matcher = matcher
         self.injector = SkillInjector(matcher)
         self.chinese = chinese
         self.progressive = progressive
+        self._skill_commands = skill_commands or {}
+        self._catalog_budget_chars = catalog_budget_chars
+        self._description_max_chars = description_max_chars
         # 当前轮 LLM 声明的下一轮 skill 名称
         self._pending_skills: list[str] = []
         # 跟踪是否为第一轮（尚未收到任何 LLM 回复）
         self._first_turn = True
+        # 条件激活: 已触碰的文件列表
+        self._touched_files: list[str] = []
+
+    def set_touched_files(self, files: list[str]) -> None:
+        """更新已触碰文件列表，用于条件激活 paths 匹配"""
+        self._touched_files = files
+
+    def _get_visible_skills(self) -> list[tuple[str, str]]:
+        """获取当前可见的 skill 列表: [(name, description), ...]
+
+        优先使用 SkillCommand（支持 paths 条件激活和 disable_model_invocation），
+        回退到 matcher summaries。
+        """
+        if self._skill_commands:
+            entries = []
+            for name, sc in self._skill_commands.items():
+                if sc.disable_model_invocation:
+                    continue
+                if not sc.matches_paths(self._touched_files):
+                    continue
+                desc = sc.get_catalog_entry(self._description_max_chars)
+                entries.append((name, desc))
+            return entries
+
+        # Fallback: use matcher summaries
+        summaries = self.matcher.get_skill_summaries()
+        return [(s.name, s.description[: self._description_max_chars]) for s in summaries]
 
     def build_skill_catalog_prompt(self) -> str:
         """
         构建 skill catalog 段落，追加到 system prompt 中。
 
-        告诉 LLM 有哪些可用 skill，并指导它用 <next_skills> 声明。
+        Budget-aware: 总字符不超过 catalog_budget_chars，单个描述不超过 description_max_chars。
         """
-        summaries = self.matcher.get_skill_summaries()
-        if not summaries:
+        entries = self._get_visible_skills()
+        if not entries:
             return ""
 
+        # Budget-aware: 如果总描述超过预算，截断描述
         lines = []
-        for s in summaries:
-            lines.append(f"- **{s.name}**: {s.description}")
+        total_chars = 0
+        for name, desc in entries:
+            line = f"- **{name}**: {desc}"
+            if total_chars + len(line) > self._catalog_budget_chars:
+                # 超出预算，只显示名称
+                line = f"- **{name}**"
+                if total_chars + len(line) > self._catalog_budget_chars:
+                    break  # 连名称都放不下了
+            total_chars += len(line) + 1  # +1 for newline
+            lines.append(line)
+
         catalog = "\n".join(lines)
 
         if self.chinese:
@@ -177,12 +230,13 @@ class InlineSkillSelector:
             解析出的 skill 名称列表（仅存在于 matcher 中的）
         """
         raw_names = self.parse_next_skills(response_text)
-        valid_names = [n for n in raw_names if n in self.matcher.skills]
+        all_known = set(self.matcher.skills.keys()) | set(self._skill_commands.keys())
+        valid_names = [n for n in raw_names if n in all_known]
 
         if raw_names and not valid_names:
             logger.warning(
                 f"[InlineSkill] LLM requested skills {raw_names} but none are valid. "
-                f"Available: {list(self.matcher.skills.keys())}"
+                f"Available: {sorted(all_known)}"
             )
         elif valid_names:
             logger.info(f"[InlineSkill] Next turn skills: {valid_names}")

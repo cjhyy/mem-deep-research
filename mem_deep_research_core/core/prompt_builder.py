@@ -233,6 +233,23 @@ class PromptBuilder:
 
         return system_prompt, main_agent_prompt_instance, task_engine_cfg
 
+    def build_skill_meta_message(
+        self, skill_names: list[str], skill_commands: dict | None = None
+    ) -> dict | None:
+        """构建 isMeta user message 用于 skill 内容注入（Claude Code 模式）。
+
+        Args:
+            skill_names: 要注入的 skill 名称列表
+            skill_commands: SkillCommand 字典
+
+        Returns:
+            isMeta user message dict, 或 None
+        """
+        injector = getattr(self.inline_skill_selector, "injector", None)
+        if injector:
+            return injector.build_meta_message(skill_names, skill_commands)
+        return None
+
     def invalidate_cache(self):
         """手动使缓存失效（工具定义变更等场景使用）"""
         self._cached_static_prompt = None

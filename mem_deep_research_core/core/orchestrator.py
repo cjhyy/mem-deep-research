@@ -25,7 +25,7 @@ from mem_deep_research_core.core.constants import (
     parse_bool_config,
 )
 from mem_deep_research_core.core.context_manager import ContextManager, ContextManagerConfig
-from mem_deep_research_core.core.deferred_tools import BUILTIN_TOOL_SEARCH, DeferredToolManager
+from mem_deep_research_core.core.deferred_tools import DeferredToolManager
 from mem_deep_research_core.core.hooks import HookContext, hooks
 from mem_deep_research_core.core.interceptor_config import InterceptorConfig, InterceptorPresets
 from mem_deep_research_core.core.llm_call_handler import (
@@ -352,6 +352,9 @@ class Orchestrator:
                 current_tags.append(InlineSkillSelector.TAG_NAME)
                 self.key_message_interceptor.set_reasoning_tags(current_tags)
 
+        # Skill Commands — 统一格式，传递给 MainLoopContext
+        self.skill_commands = external_loader.get_skill_commands()
+
         # Prompt Builder
         self.prompt_builder = PromptBuilder(
             cfg=self.cfg,
@@ -588,10 +591,12 @@ class Orchestrator:
         # 注入文件附件内容到 user content
         for attachment in compile_result.attachments:
             if attachment.get("type") == "file" and attachment.get("content"):
-                initial_user_content.append({
-                    "type": "text",
-                    "text": f"\n\n--- File: {attachment['path']} ---\n{attachment['content']}",
-                })
+                initial_user_content.append(
+                    {
+                        "type": "text",
+                        "text": f"\n\n--- File: {attachment['path']} ---\n{attachment['content']}",
+                    }
+                )
 
         # 2. 生成提示词（如果启用）
         hint_notes = await self.prompt_builder.generate_hints(task_description)
@@ -771,6 +776,7 @@ class Orchestrator:
             deferred_tool_manager=self.deferred_tool_manager,
             transcript=self.transcript,
             file_state_cache=self.file_state_cache,
+            skill_commands=self.skill_commands,
         )
         return MainLoopRunner(ctx)
 
