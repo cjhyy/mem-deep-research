@@ -126,6 +126,9 @@ class HookRegistry:
         # 路由
         "on_route_classify",  # 任务复杂度分类 (可覆盖返回 "quick"/"standard"/"deep" 或 dict)
         "on_route_apply",  # 路由结果应用 (可修改 mode + reasoning_effort)
+        # 存储
+        "on_result_offload",  # 大结果卸载 (可覆盖存储后端: 文件/内存/S3/Redis)
+        "on_result_restore",  # 卸载结果恢复 (可覆盖读取后端)
     ]
 
     def __init__(self):

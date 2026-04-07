@@ -289,7 +289,14 @@ class ContextManager:
     def offload_large_result(
         self, result_text: str, tool_name: str, turn: int
     ) -> tuple[str, str | None]:
-        """Offload large tool results to filesystem.
+        """Offload large tool results.
+
+        默认写本地文件系统。可通过 on_result_offload hook 覆盖存储后端。
+
+        Hook 签名:
+            on_result_offload(ctx, original_fn) -> dict | None
+            ctx.extra = {"result_text": str, "tool_name": str, "turn": int, "file_name": str}
+            返回 {"summary": str, "ref": str} 覆盖默认行为，返回 None 走默认。
 
         Args:
             result_text: Full result text
@@ -297,13 +304,39 @@ class ContextManager:
             turn: Current turn number
 
         Returns:
-            (text_for_context, file_path) — shortened text + file path if offloaded, or (original, None)
+            (text_for_context, ref) — shortened text + storage ref if offloaded, or (original, None)
         """
         threshold = self.config.result_offload_threshold
         if threshold <= 0 or len(result_text) <= threshold:
             return result_text, None
 
-        # Determine offload directory
+        file_name = f"turn{turn}_{tool_name}_{len(result_text)}chars.txt"
+        preview = result_text[:500].replace("\n", " ")
+
+        # Hook: on_result_offload — 用户可覆盖存储后端（S3/Redis/内存等）
+        from mem_deep_research_core.core.hooks import HookContext, hooks
+
+        if hooks.has_hooks("on_result_offload"):
+            hook_result = hooks.call(
+                "on_result_offload",
+                HookContext(
+                    hook_name="on_result_offload",
+                    extra={
+                        "result_text": result_text,
+                        "tool_name": tool_name,
+                        "turn": turn,
+                        "file_name": file_name,
+                        "preview": preview,
+                    },
+                ),
+            )
+            if isinstance(hook_result, dict) and "summary" in hook_result:
+                logger.info(
+                    f"[Context] Offloaded {len(result_text)} chars via hook"
+                )
+                return hook_result["summary"], hook_result.get("ref")
+
+        # 默认：写本地文件系统
         offload_dir = self._offload_dir or self.config.result_offload_dir
         if not offload_dir:
             return result_text, None
@@ -312,8 +345,6 @@ class ContextManager:
 
         os.makedirs(offload_dir, exist_ok=True)
 
-        # Write full result to file
-        file_name = f"turn{turn}_{tool_name}_{len(result_text)}chars.txt"
         file_path = os.path.join(offload_dir, file_name)
         try:
             with open(file_path, "w", encoding="utf-8") as f:
@@ -322,10 +353,6 @@ class ContextManager:
             logger.warning(f"[Context] Failed to offload result: {e}")
             return result_text, None
 
-        # Create structured offload marker for context
-        # Format: [OFFLOADED:<file>|<chars>] — recognized by microcompact/compression
-        # to avoid double-compacting already-offloaded content.
-        preview = result_text[:500].replace("\n", " ")
         summary = (
             f"{TAG_OFFLOADED}{file_name}|{len(result_text)}]\n"
             f"Preview: {preview}...\n"
@@ -336,19 +363,23 @@ class ContextManager:
         return summary, file_path
 
     def restore_offloaded_content(self, message_history: list) -> int:
-        """从文件恢复 offloaded 内容（resume 场景使用）。
+        """恢复 offloaded 内容（resume 场景使用）。
 
-        扫描 message_history 中的 [OFFLOADED:filename|chars] 标记，
-        从 offload 目录读取原始内容并替换回来。
+        默认从本地文件读取。可通过 on_result_restore hook 覆盖读取后端。
+
+        Hook 签名:
+            on_result_restore(ctx, original_fn) -> str | None
+            ctx.extra = {"file_name": str, "marker_text": str}
+            返回原始内容字符串覆盖默认行为，返回 None 走默认文件读取。
 
         Returns:
             恢复的消息数
         """
         import os
 
+        from mem_deep_research_core.core.hooks import HookContext, hooks
+
         offload_dir = self._offload_dir or self.config.result_offload_dir
-        if not offload_dir:
-            return 0
 
         restored = 0
         for msg in message_history:
@@ -363,23 +394,40 @@ class ContextManager:
             # Parse [OFFLOADED:filename|chars]
             try:
                 marker_end = text.index("]")
-                marker_body = text[len(TAG_OFFLOADED):marker_end]
+                marker_body = text[len(TAG_OFFLOADED) : marker_end]
                 file_name = marker_body.split("|")[0]
             except (ValueError, IndexError):
                 continue
 
-            file_path = os.path.join(offload_dir, file_name)
-            if not os.path.isfile(file_path):
-                logger.debug(f"[Context] Offloaded file not found: {file_path}")
-                continue
+            # Hook: on_result_restore — 用户可覆盖读取后端
+            original_content = None
+            if hooks.has_hooks("on_result_restore"):
+                hook_result = hooks.call(
+                    "on_result_restore",
+                    HookContext(
+                        hook_name="on_result_restore",
+                        extra={"file_name": file_name, "marker_text": text},
+                    ),
+                )
+                if isinstance(hook_result, str):
+                    original_content = hook_result
 
-            try:
-                with open(file_path, encoding="utf-8") as f:
-                    original_content = f.read()
+            # 默认：从本地文件读取
+            if original_content is None and offload_dir:
+                file_path = os.path.join(offload_dir, file_name)
+                if not os.path.isfile(file_path):
+                    logger.debug(f"[Context] Offloaded file not found: {file_path}")
+                    continue
+                try:
+                    with open(file_path, encoding="utf-8") as f:
+                        original_content = f.read()
+                except Exception as e:
+                    logger.warning(f"[Context] Failed to restore offloaded content: {e}")
+                    continue
+
+            if original_content is not None:
                 msg["content"] = [{"type": "text", "text": original_content}]
                 restored += 1
-            except Exception as e:
-                logger.warning(f"[Context] Failed to restore offloaded content: {e}")
 
         if restored > 0:
             logger.info(f"[Context] Restored {restored} offloaded messages from {offload_dir}")
