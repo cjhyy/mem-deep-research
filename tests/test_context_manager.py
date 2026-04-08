@@ -170,15 +170,18 @@ class TestRegisterToolResults:
 class TestCompact:
     def _build_history(self, num_turns):
         """构建模拟消息历史"""
+        from mem_deep_research_core.core.constants import MT
+
         history = [
             {"role": "user", "content": [{"type": "text", "text": "initial task" * 50}]},
         ]
         for t in range(num_turns):
             history.append({"role": "assistant", "content": f"assistant response turn {t + 1}"})
-            # 模拟 tool result（长文本）
+            # 模拟 tool result（长文本，标记为 TOOL_RESULT）
             history.append(
                 {
                     "role": "user",
+                    "_type": MT.TOOL_RESULT,
                     "content": [{"type": "text", "text": "x" * 500}],
                 }
             )
@@ -232,6 +235,8 @@ class TestCompact:
 
     def test_token_aware_compact(self):
         """Token-aware compact 在达到目标 ratio 后停止"""
+        from mem_deep_research_core.core.constants import MT
+
         cm = ContextManager(
             ContextManagerConfig(
                 compact_at_ratio=0.5,
@@ -244,7 +249,7 @@ class TestCompact:
         ]
         for t in range(10):
             history.append({"role": "assistant", "content": f"response {t + 1}" * 100})
-            history.append({"role": "user", "content": [{"type": "text", "text": "x" * 2000}]})
+            history.append({"role": "user", "_type": MT.TOOL_RESULT, "content": [{"type": "text", "text": "x" * 2000}]})
 
         compacted = cm.apply_compact(
             history,
@@ -261,6 +266,8 @@ class TestCompact:
 class TestObservationMaskingCompat:
     def _build_history(self, num_turns):
         """构建模拟消息历史"""
+        from mem_deep_research_core.core.constants import MT
+
         history = [
             {"role": "user", "content": [{"type": "text", "text": "initial task" * 50}]},
         ]
@@ -269,6 +276,7 @@ class TestObservationMaskingCompat:
             history.append(
                 {
                     "role": "user",
+                    "_type": MT.TOOL_RESULT,
                     "content": [{"type": "text", "text": "x" * 500}],
                 }
             )
@@ -537,7 +545,9 @@ class TestSourceRegistry:
 class TestMicrocompact:
     @staticmethod
     def _build_history(num_turns, content_size=500):
-        """构建模拟消息历史（assistant + user 交替）"""
+        """构建模拟消息历史（assistant + user tool_result 交替）"""
+        from mem_deep_research_core.core.constants import MT
+
         history = [
             {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
         ]
@@ -546,6 +556,7 @@ class TestMicrocompact:
             history.append(
                 {
                     "role": "user",
+                    "_type": MT.TOOL_RESULT,
                     "content": [{"type": "text", "text": "x" * content_size}],
                 }
             )
@@ -589,59 +600,67 @@ class TestMicrocompact:
             final_text = final_content
         assert final_text == original_text
 
-    def test_skips_system_messages(self):
-        """microcompact 跳过系统注入消息"""
+    def test_skips_non_tool_result_messages(self):
+        """microcompact 只清理 TOOL_RESULT，跳过用户输入和系统注入"""
+        from mem_deep_research_core.core.constants import MT
+
         cm = ContextManager(ContextManagerConfig())
         history = [
             {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
             {"role": "assistant", "content": "response 1"},
+            # 系统消息（无 _type，旧格式）
             {
                 "role": "user",
                 "content": [{"type": "text", "text": "[REFLECTION CHECKPOINT] " + "x" * 500}],
             },
             {"role": "assistant", "content": "response 2"},
-            {"role": "user", "content": [{"type": "text", "text": "y" * 500}]},
+            # 用户输入（有 _type=USER_INPUT）— 不应被清理
+            {
+                "role": "user",
+                "_type": MT.USER_INPUT,
+                "content": [{"type": "text", "text": "y" * 500}],
+            },
+            {"role": "assistant", "content": "response 3"},
+            # 无 _type 的长消息 — 保守保留
+            {"role": "user", "content": [{"type": "text", "text": "z" * 500}]},
         ]
 
         cleaned = cm.microcompact(history, current_turn=5, keep_recent=1)
+        assert cleaned == 0  # 没有 TOOL_RESULT，不清理任何消息
 
-        # 系统消息 ([REFLECTION CHECKPOINT]) 应保持不变
-        reflection_msg = history[2]
-        content = reflection_msg["content"]
-        if isinstance(content, list):
-            text = content[0]["text"]
-        else:
-            text = content
-        assert "[REFLECTION CHECKPOINT]" in text
-        assert "[microcompact]" not in text
+        # 所有消息应保持不变
+        assert "[REFLECTION CHECKPOINT]" in history[2]["content"][0]["text"]
+        assert history[4]["content"][0]["text"] == "y" * 500
+        assert history[6]["content"][0]["text"] == "z" * 500
 
     def test_skips_already_offloaded(self):
-        """microcompact 跳过已卸载的内容"""
+        """microcompact 跳过已卸载的 TOOL_RESULT"""
+        from mem_deep_research_core.core.constants import MT
+
         cm = ContextManager(ContextManagerConfig())
         history = [
             {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
             {"role": "assistant", "content": "response 1"},
             {
                 "role": "user",
+                "_type": MT.TOOL_RESULT,
                 "content": [
                     {"type": "text", "text": "[OFFLOADED:/tmp/result.json|5000] summary here"}
                 ],
             },
             {"role": "assistant", "content": "response 2"},
-            {"role": "user", "content": [{"type": "text", "text": "z" * 500}]},
+            {"role": "user", "_type": MT.TOOL_RESULT, "content": [{"type": "text", "text": "z" * 500}]},
         ]
 
         cleaned = cm.microcompact(history, current_turn=5, keep_recent=1)
 
         # 已卸载消息应保持不变
         offloaded_msg = history[2]
-        content = offloaded_msg["content"]
-        if isinstance(content, list):
-            text = content[0]["text"]
-        else:
-            text = content
+        text = offloaded_msg["content"][0]["text"]
         assert "[OFFLOADED:" in text
         assert "[microcompact]" not in text
+        # 非卸载的 TOOL_RESULT 应被清理
+        assert cleaned >= 1
 
     def test_no_cleanup_when_cutoff_zero(self):
         """current_turn <= keep_recent 时不清理"""
@@ -652,14 +671,16 @@ class TestMicrocompact:
         assert cleaned == 0
 
     def test_skips_short_messages(self):
-        """短消息不被清理"""
+        """短消息不被清理（即使是 TOOL_RESULT）"""
+        from mem_deep_research_core.core.constants import MT
+
         cm = ContextManager(ContextManagerConfig())
         history = [
             {"role": "user", "content": [{"type": "text", "text": "initial task"}]},
             {"role": "assistant", "content": "resp 1"},
-            {"role": "user", "content": [{"type": "text", "text": "short"}]},  # too short
+            {"role": "user", "_type": MT.TOOL_RESULT, "content": [{"type": "text", "text": "short"}]},  # too short
             {"role": "assistant", "content": "resp 2"},
-            {"role": "user", "content": [{"type": "text", "text": "z" * 500}]},
+            {"role": "user", "_type": MT.TOOL_RESULT, "content": [{"type": "text", "text": "z" * 500}]},
         ]
 
         cleaned = cm.microcompact(history, current_turn=5, keep_recent=1)

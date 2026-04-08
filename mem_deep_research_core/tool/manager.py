@@ -86,6 +86,7 @@ def _default_env_inject(ctx) -> Any:
 def update_server_params_with_context(
     server_params: StdioServerParameters,
     context: dict[str, Any] | None = None,
+    hook_registry=None,
 ) -> StdioServerParameters:
     """
     Update the server params with the task context and user context.
@@ -96,11 +97,12 @@ def update_server_params_with_context(
     Args:
         server_params: The server parameters to update
         context: User context dict — all string-valued fields are injected as env vars
+        hook_registry: HookRegistry instance (None uses global)
     """
-    from mem_deep_research_core.core.hooks import HookContext, hooks
+    from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 
-    # 设置默认实现
-    hooks.set_default("on_env_inject", _default_env_inject)
+    if hook_registry is None:
+        raise ValueError("hook_registry is required for update_server_params_with_context")
 
     # 创建上下文并调用钩子
     ctx = HookContext(
@@ -109,7 +111,7 @@ def update_server_params_with_context(
         context=context,
     )
 
-    return hooks.call("on_env_inject", ctx)
+    return hook_registry.call("on_env_inject", ctx)
 
 
 def with_timeout(timeout_s: float = 300.0):
@@ -145,7 +147,7 @@ class ToolManager(ToolManagerProtocol):
     _CACHE_TTL_SECONDS: float = 300.0  # 5 minutes cache TTL
     _TOOL_CALL_TIMEOUT: float = 900.0  # Tool call timeout in seconds
 
-    def __init__(self, server_configs, tool_blacklist=None, cache_ttl: float = 300.0):
+    def __init__(self, server_configs, tool_blacklist=None, cache_ttl: float = 300.0, hook_registry=None):
         """
         Initialize ToolManager.
         :param server_configs: List returned by create_server_parameters()
@@ -157,6 +159,7 @@ class ToolManager(ToolManagerProtocol):
                "module": "...", "object": "mcp"}  # 进程内，无子进程
         :param tool_blacklist: Set of (server_name, tool_name) tuples to blacklist
         :param cache_ttl: Tool definitions cache TTL in seconds (default: 300)
+        :param hook_registry: HookRegistry instance for env injection hooks
         """
         self._tool_definitions_cache: dict[str, tuple[float, list]] = {}
         self.server_configs = server_configs
@@ -183,6 +186,7 @@ class ToolManager(ToolManagerProtocol):
         }
         self.browser_session = None
         self._context: dict[str, Any] = {}  # User context for MCP tool calls
+        self._hook_registry = hook_registry  # HookRegistry for env injection
         self.tool_blacklist = tool_blacklist if tool_blacklist else set()
         self._cache_ttl = cache_ttl
 
@@ -304,7 +308,7 @@ class ToolManager(ToolManagerProtocol):
 
             try:
                 if isinstance(server_params, StdioServerParameters):
-                    updated_params = update_server_params_with_context(server_params, self._context)
+                    updated_params = update_server_params_with_context(server_params, self._context, hook_registry=self._hook_registry)
                     transport_ctx = stdio_client(updated_params)
                     read, write = await self._exit_stack.enter_async_context(transport_ctx)
                 elif isinstance(server_params, str) and server_params.startswith(
@@ -333,9 +337,15 @@ class ToolManager(ToolManagerProtocol):
                 )
                 return session, False
 
-            except Exception as e:
+            except (ConnectionError, OSError, TimeoutError, RuntimeError, ValueError) as e:
                 logger.error(
                     f"[ToolManager] Failed to create persistent session for '{server_name}': {e}"
+                )
+                raise
+            except Exception as e:
+                logger.error(
+                    f"[ToolManager] Unexpected error creating session for '{server_name}': "
+                    f"{type(e).__name__}: {e}"
                 )
                 raise
 
@@ -458,7 +468,7 @@ class ToolManager(ToolManagerProtocol):
                     if tool.name == tool_name:
                         servers_with_tool.append(server_name)
                         break
-            except Exception as e:
+            except (ConnectionError, OSError, TimeoutError, RuntimeError) as e:
                 logger.error(f"Error finding tool '{tool_name}' in server '{server_name}': {e}")
                 continue
 
@@ -673,7 +683,8 @@ class ToolManager(ToolManagerProtocol):
                     "tool_name": tool_name,
                     "result": tool_result,
                 }
-            except Exception as e:
+            except (TimeoutError, RuntimeError, ValueError, ConnectionError, OSError) as e:
+                logger.warning(f"[ToolManager] Playwright tool '{tool_name}' failed: {e}")
                 return {
                     "server_name": server_name,
                     "tool_name": tool_name,
@@ -737,7 +748,7 @@ class ToolManager(ToolManagerProtocol):
                             result_content = self._extract_tool_result(
                                 tool_name, tool_result, arguments
                             )
-                        except Exception as retry_err:
+                        except (ConnectionError, OSError, TimeoutError, RuntimeError, EOFError) as retry_err:
                             logger.error(
                                 f"Retry also failed for '{server_name}/{tool_name}': {retry_err}"
                             )
@@ -796,13 +807,17 @@ class ToolManager(ToolManagerProtocol):
                     "result": result_content,  # Return extracted text content
                 }
 
-            except Exception as outer_e:  # Rename this to outer_e to avoid shadowing
+            except Exception as outer_e:
+                # Safety net: catch unexpected errors not handled by inner blocks.
+                # Log with traceback to aid debugging — this should rarely trigger.
                 logger.error(
-                    f"Error: Failed to call tool '{tool_name}' (server: '{server_name}'): {outer_e}"
+                    f"Unexpected error calling tool '{tool_name}' (server: '{server_name}'): "
+                    f"{type(outer_e).__name__}: {outer_e}",
+                    exc_info=True,
                 )
 
                 return {
                     "server_name": server_name,
                     "tool_name": tool_name,
-                    "error": f"Tool call failed: {str(outer_e)}",
+                    "error": f"Tool call failed: {type(outer_e).__name__}: {outer_e}",
                 }

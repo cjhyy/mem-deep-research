@@ -211,16 +211,13 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
     ):
         """Update message history with tool calls data (llm client specific)"""
 
+        from mem_deep_research_core.core.constants import make_tool_result_msg
+
         merged_text = "\n".join(
             [item[1]["text"] for item in tool_call_info if item[1]["type"] == "text"]
         )
 
-        message_history.append(
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": merged_text}],
-            }
-        )
+        message_history.append(make_tool_result_msg(merged_text))
 
         return message_history
 

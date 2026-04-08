@@ -21,6 +21,7 @@ import pytest
 
 from mem_deep_research_core.core.constants import BUILTIN_TOOL_SEARCH
 from mem_deep_research_core.core.deferred_tools import DeferredToolManager
+from mem_deep_research_core.core.hooks import HookRegistry
 from mem_deep_research_core.core.input_compiler import CompileResult, InputCompiler
 from mem_deep_research_core.core.transcript import EventType, Transcript, TranscriptEvent
 
@@ -484,41 +485,41 @@ class TestTranscriptEvent:
 
 class TestInputCompilerURLExtraction:
     def test_single_url(self):
-        result = InputCompiler().compile("Check https://example.com for info")
+        result = InputCompiler(hooks=HookRegistry()).compile("Check https://example.com for info")
         assert result.extracted_urls == ["https://example.com"]
 
     def test_multiple_urls(self):
-        result = InputCompiler().compile("Compare https://a.com and http://b.com/page?q=1")
+        result = InputCompiler(hooks=HookRegistry()).compile("Compare https://a.com and http://b.com/page?q=1")
         assert len(result.extracted_urls) == 2
 
     def test_duplicate_urls_deduped(self):
-        result = InputCompiler().compile("Visit https://x.com then https://x.com again")
+        result = InputCompiler(hooks=HookRegistry()).compile("Visit https://x.com then https://x.com again")
         assert len(result.extracted_urls) == 1
 
     def test_no_urls(self):
-        result = InputCompiler().compile("Just a simple question")
+        result = InputCompiler(hooks=HookRegistry()).compile("Just a simple question")
         assert result.extracted_urls == []
 
     def test_url_extraction_disabled(self):
-        result = InputCompiler(enable_url_extraction=False).compile("Check https://example.com")
+        result = InputCompiler(hooks=HookRegistry(), enable_url_extraction=False).compile("Check https://example.com")
         assert result.extracted_urls == []
 
 
 class TestInputCompilerFileRef:
     def test_simple_file_ref(self):
-        result = InputCompiler().compile("Read @data.csv and analyze")
+        result = InputCompiler(hooks=HookRegistry()).compile("Read @data.csv and analyze")
         assert "data.csv" in result.file_refs
 
     def test_quoted_file_ref(self):
-        result = InputCompiler().compile('Read @"my file.txt" for context')
+        result = InputCompiler(hooks=HookRegistry()).compile('Read @"my file.txt" for context')
         assert "my file.txt" in result.file_refs
 
     def test_no_file_refs(self):
-        result = InputCompiler().compile("Just a simple question")
+        result = InputCompiler(hooks=HookRegistry()).compile("Just a simple question")
         assert result.file_refs == []
 
     def test_file_ref_disabled(self):
-        result = InputCompiler(enable_file_refs=False).compile("Read @data.csv")
+        result = InputCompiler(hooks=HookRegistry(), enable_file_refs=False).compile("Read @data.csv")
         assert result.file_refs == []
 
     def test_existing_file_creates_attachment(self):
@@ -527,7 +528,7 @@ class TestInputCompilerFileRef:
             f.flush()
             filepath = f.name
         try:
-            result = InputCompiler().compile(f"Analyze @{filepath}")
+            result = InputCompiler(hooks=HookRegistry()).compile(f"Analyze @{filepath}")
             assert len(result.attachments) == 1
             assert result.attachments[0]["content"] == "file content here"
             assert f"[attached: {filepath}]" in result.query
@@ -535,7 +536,7 @@ class TestInputCompilerFileRef:
             Path(filepath).unlink(missing_ok=True)
 
     def test_nonexistent_file_no_attachment(self):
-        result = InputCompiler().compile("Read @/nonexistent/path/file.xyz")
+        result = InputCompiler(hooks=HookRegistry()).compile("Read @/nonexistent/path/file.xyz")
         assert "/nonexistent/path/file.xyz" in result.file_refs
         assert len(result.attachments) == 0
 
@@ -543,7 +544,7 @@ class TestInputCompilerFileRef:
 class TestInputCompilerPassThrough:
     def test_no_urls_no_refs(self):
         query = "What is the meaning of life?"
-        result = InputCompiler().compile(query)
+        result = InputCompiler(hooks=HookRegistry()).compile(query)
         assert result.query == query
         assert result.original_query == query
         assert result.extracted_urls == []

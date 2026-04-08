@@ -16,6 +16,7 @@ from typing import Any
 
 from omegaconf import DictConfig
 
+from mem_deep_research_core.core.agent_runtime import AgentRuntime
 from mem_deep_research_core.utils.external_loader import load_env_file, load_yaml_config
 
 logger = logging.getLogger("mem_deep_research")
@@ -84,6 +85,7 @@ class AgentFactory:
         self,
         agent_config: AgentConfig,
         auto_load_env: bool = True,
+        runtime: AgentRuntime | None = None,
     ):
         """
         初始化 Agent 工厂
@@ -91,8 +93,10 @@ class AgentFactory:
         Args:
             agent_config: Agent 配置
             auto_load_env: 是否自动加载 .env 文件
+            runtime: AgentRuntime 实例 (多实例隔离)
         """
         self.agent_config = agent_config
+        self.runtime = runtime or AgentRuntime()
 
         # 确保日志目录存在
         self.agent_config.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -183,6 +187,7 @@ class AgentFactory:
         cfg: DictConfig,
         logs_dir: str | pathlib.Path = "logs",
         prompts_dir: str | pathlib.Path | None = None,
+        runtime: AgentRuntime | None = None,
     ) -> "AgentFactory":
         """
         从已有的 OmegaConf 配置创建 AgentFactory
@@ -191,6 +196,7 @@ class AgentFactory:
             cfg: OmegaConf 配置对象
             logs_dir: 日志目录
             prompts_dir: 提示词模板目录（可选）
+            runtime: AgentRuntime 实例 (可选)
         """
         logs_dir = pathlib.Path(logs_dir)
 
@@ -201,7 +207,7 @@ class AgentFactory:
             cfg=cfg,
         )
 
-        return cls(agent_config, auto_load_env=False)
+        return cls(agent_config, auto_load_env=False, runtime=runtime)
 
     async def initialize(self) -> None:
         """
@@ -226,7 +232,7 @@ class AgentFactory:
             self._main_agent_tool_manager,
             self._sub_agent_tool_managers,
             self._output_formatter,
-        ) = create_pipeline_components(cfg, logs_dir)
+        ) = create_pipeline_components(cfg, logs_dir, runtime=self.runtime)
 
         # 获取工具定义
         logger.info("Loading tool definitions...")
@@ -297,6 +303,7 @@ class AgentFactory:
                 history=history,
                 context=context,
                 resume_from=resume_from,
+                runtime=self.runtime,
             )
 
             duration = (datetime.now() - start_time).total_seconds()

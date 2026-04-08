@@ -16,7 +16,7 @@ from mem_deep_research_core.core.constants import (
     TAG_TASK_PLAN,
 )
 from mem_deep_research_core.core.context_manager import ContextManager
-from mem_deep_research_core.core.hooks import hooks
+from mem_deep_research_core.core.hooks import HookRegistry, hooks
 from mem_deep_research_core.core.main_loop import MainLoopContext, MainLoopRunner
 from mem_deep_research_core.core.monitoring import ExecutionMonitor, MonitoringConfig
 from mem_deep_research_core.core.task_planner import SubQuestion, TaskPlan, TaskPlanner
@@ -169,6 +169,7 @@ class TestMainLoopRunnerIntegration:
             extract_recent_tool_names=lambda history, lookback=6: [],
             deduplicate_trailing_messages=lambda history: 0,
             response_language="auto",
+            hooks=HookRegistry(),
         )
         runner = MainLoopRunner(ctx)
         return runner, call_log
@@ -311,6 +312,7 @@ class TestHookIntegration:
             extract_recent_tool_names=lambda h, lookback=6: [],
             deduplicate_trailing_messages=lambda h: 0,
             response_language="English",
+            hooks=hooks,
         )
 
         runner = MainLoopRunner(ctx)
@@ -376,6 +378,7 @@ class TestLanguageDetection:
             extract_recent_tool_names=lambda h, lookback=6: [],
             deduplicate_trailing_messages=lambda h: 0,
             response_language="auto",
+            hooks=hooks,
         )
 
         runner = MainLoopRunner(ctx)
@@ -435,6 +438,7 @@ class TestLanguageDetection:
             extract_recent_tool_names=lambda h, lookback=6: [],
             deduplicate_trailing_messages=lambda h: 0,
             response_language="auto",
+            hooks=hooks,
         )
 
         runner = MainLoopRunner(ctx)

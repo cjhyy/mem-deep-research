@@ -22,8 +22,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from mem_deep_research_core.core.hooks import HookContext
-from mem_deep_research_core.core.hooks import hooks as _default_hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 
 logger = logging.getLogger("mem_deep_research")
 
@@ -64,11 +63,12 @@ class InputCompiler:
 
     def __init__(
         self,
-        hooks=None,
+        *,
+        hooks: HookRegistry,
         enable_url_extraction: bool = True,
         enable_file_refs: bool = True,
     ):
-        self.hooks = hooks or _default_hooks
+        self.hooks = hooks
         self.enable_url_extraction = enable_url_extraction
         self.enable_file_refs = enable_file_refs
 

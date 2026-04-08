@@ -9,7 +9,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.interceptor_config import InterceptorConfig, InterceptorPresets
 from mem_deep_research_core.utils.stream_parsing_utils import ReasoningBlock, TextInterceptor
 
@@ -22,9 +22,6 @@ logger = logging.getLogger("mem_deep_research")
 def _default_on_message_intercept(ctx: HookContext):
     """消息拦截 - 默认实现，返回原始拦截结果"""
     return ctx.extra.get("intercept_result")
-
-
-hooks.set_default("on_message_intercept", _default_on_message_intercept)
 
 
 class MessageInterceptorHandler:
@@ -45,6 +42,8 @@ class MessageInterceptorHandler:
         stream_tool_call_callback: Callable | None = None,
         stream_message_callback: Callable | None = None,
         context: dict = None,
+        *,
+        hooks: HookRegistry,
     ):
         """
         初始化消息拦截处理器
@@ -56,6 +55,7 @@ class MessageInterceptorHandler:
             stream_tool_call_callback: 发送 tool_call 事件的回调
             stream_message_callback: 发送 message 事件的回调
             context: 用户上下文，注入到所有 hook 调用中
+            hooks: HookRegistry 实例（必传）
         """
         # 配置处理
         if config is not None:
@@ -75,6 +75,9 @@ class MessageInterceptorHandler:
         self.stream_reasoning_callback = stream_reasoning_callback
         self.stream_tool_call_callback = stream_tool_call_callback
         self.stream_message_callback = stream_message_callback
+
+        # Hooks
+        self._hooks = hooks
 
         # 创建拦截器
         self._create_interceptors()
@@ -165,7 +168,7 @@ class MessageInterceptorHandler:
             result, reasoning_blocks = self.key_message_interceptor.process(message, is_last)
 
             # Hook: on_message_intercept
-            hook_result = hooks.call(
+            hook_result = self._hooks.call(
                 "on_message_intercept",
                 HookContext(
                     hook_name="on_message_intercept",

@@ -84,17 +84,16 @@ class SkillMatcher:
         if extra_skill_commands:
             for name, sc in extra_skill_commands.items():
                 self._skill_commands[name] = sc
-                # Also add to self.skills for backward compat with match()
-                if name not in self.skills:
-                    self.skills[name] = {
-                        "name": name,
-                        "description": sc.description,
-                        "when_to_use": sc.when_to_use,
-                        "type": sc.skill_type,
-                        "triggers": sc.triggers,
-                        "metadata": sc.metadata,
-                        "content": sc.raw_content,
-                    }
+                # 覆盖 self.skills（extra_skill_commands 优先级更高）
+                self.skills[name] = {
+                    "name": name,
+                    "description": sc.description,
+                    "when_to_use": sc.when_to_use,
+                    "type": sc.skill_type,
+                    "triggers": sc.triggers,
+                    "metadata": sc.metadata,
+                    "content": sc.raw_content,
+                }
 
     def _load_skills(self) -> None:
         """加载所有 Skill 定义 (Markdown 格式)"""

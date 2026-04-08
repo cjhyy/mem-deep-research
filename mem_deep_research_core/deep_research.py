@@ -35,6 +35,7 @@ from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
+from mem_deep_research_core.core.agent_runtime import AgentRuntime
 from mem_deep_research_core.utils.external_loader import load_env_file, load_yaml_config
 
 logger = logging.getLogger("mem_deep_research")
@@ -130,6 +131,8 @@ class DeepResearch:
         execution_mode: str = "auto",
         # 高级配置
         config: DictConfig | None = None,
+        # 运行时隔离
+        runtime: AgentRuntime | None = None,
     ):
         """
         初始化 DeepResearch
@@ -189,6 +192,9 @@ class DeepResearch:
         # 验证配置
         self._validate_config()
 
+        # 运行时隔离：每个实例持有独立的 hooks + config_loader
+        self._runtime = runtime or AgentRuntime()
+
         # 延迟初始化的组件
         self._factory = None
         self._initialized = False
@@ -200,6 +206,7 @@ class DeepResearch:
         config_name: str = "agent",
         logs_dir: str | pathlib.Path | None = None,
         env_file: str | pathlib.Path | None = None,
+        runtime: AgentRuntime | None = None,
     ) -> "DeepResearch":
         """
         从配置目录加载
@@ -209,6 +216,7 @@ class DeepResearch:
             config_name: 配置文件名 (不含 .yaml 后缀)
             logs_dir: 日志目录 (默认: config_dir/../logs)
             env_file: .env 文件路径 (可选，默认查找 config_dir/../.env)
+            runtime: AgentRuntime 实例 (可选)
 
         Returns:
             DeepResearch 实例
@@ -230,7 +238,7 @@ class DeepResearch:
         if logs_dir is None:
             logs_dir = config_dir.parent / "logs"
 
-        return cls(config=cfg, logs_dir=logs_dir)
+        return cls(config=cfg, logs_dir=logs_dir, runtime=runtime)
 
     @classmethod
     def from_project(
@@ -238,6 +246,7 @@ class DeepResearch:
         project_dir: str | pathlib.Path,
         config_name: str = "agent",
         logs_dir: str | pathlib.Path | None = None,
+        runtime: AgentRuntime | None = None,
     ) -> "DeepResearch":
         """
         从项目目录加载
@@ -252,6 +261,7 @@ class DeepResearch:
             project_dir: 项目目录
             config_name: 配置文件名
             logs_dir: 日志目录 (默认: project_dir/logs/)
+            runtime: AgentRuntime 实例 (可选，多实例时传入独立 runtime)
 
         Returns:
             DeepResearch 实例
@@ -261,17 +271,23 @@ class DeepResearch:
         if logs_dir is None:
             logs_dir = project_dir / "logs"
 
-        # 设置项目目录，用于加载项目级别的工具配置
+        # 创建独立 runtime（如果未提供）
+        rt = runtime or AgentRuntime()
+
+        # 设置项目目录到实例级 config_loader
+        rt.set_project_dir(str(project_dir))
+
+        # 加载项目钩子到实例级 hook_registry
+        from mem_deep_research_core.core.hooks import load_project_hooks
+
+        load_project_hooks(str(project_dir), hook_registry=rt.hooks)
+
+        # 同时更新全局单例以保持向后兼容（单实例场景）
         from mem_deep_research_core.utils.external_loader import external_loader
 
         external_loader.set_project_dir(project_dir)
 
-        # 加载项目钩子
-        from mem_deep_research_core.core.hooks import load_project_hooks
-
-        load_project_hooks(str(project_dir))
-
-        return cls.from_config_dir(config_dir, config_name, logs_dir)
+        return cls.from_config_dir(config_dir, config_name, logs_dir, runtime=rt)
 
     @staticmethod
     def _detect_provider(api_key: str) -> str:
@@ -433,6 +449,7 @@ class DeepResearch:
         self._factory = AgentFactory.from_config(
             cfg=self._cfg,
             logs_dir=self.logs_dir,
+            runtime=self._runtime,
         )
         await self._factory.initialize()
         self._initialized = True

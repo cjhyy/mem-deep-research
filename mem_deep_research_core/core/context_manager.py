@@ -26,7 +26,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from mem_deep_research_core.core.constants import (
+    MT,
     MICROCOMPACT_MIN_CHARS,
+    PROTECTED_MESSAGE_TYPES,
     RESULT_BRIEF_LENGTH,
     SYSTEM_MESSAGE_KEYWORDS,
     TAG_OFFLOADED,
@@ -211,8 +213,10 @@ class ContextManager:
         self,
         config: ContextManagerConfig | None = None,
         pipeline: WindowStrategyPipeline | None = None,
+        hooks=None,
     ):
         self.config = config or ContextManagerConfig()
+        self._hooks = hooks
         self._max_dedup_cache_size = self.config.max_dedup_cache_size
         self._current_turn: int = 0
 
@@ -314,10 +318,10 @@ class ContextManager:
         preview = result_text[:500].replace("\n", " ")
 
         # Hook: on_result_offload — 用户可覆盖存储后端（S3/Redis/内存等）
-        from mem_deep_research_core.core.hooks import HookContext, hooks
+        from mem_deep_research_core.core.hooks import HookContext
 
-        if hooks.has_hooks("on_result_offload"):
-            hook_result = hooks.call(
+        if self._hooks is not None and self._hooks.has_hooks("on_result_offload"):
+            hook_result = self._hooks.call(
                 "on_result_offload",
                 HookContext(
                     hook_name="on_result_offload",
@@ -377,7 +381,7 @@ class ContextManager:
         """
         import os
 
-        from mem_deep_research_core.core.hooks import HookContext, hooks
+        from mem_deep_research_core.core.hooks import HookContext
 
         offload_dir = self._offload_dir or self.config.result_offload_dir
 
@@ -401,8 +405,8 @@ class ContextManager:
 
             # Hook: on_result_restore — 用户可覆盖读取后端
             original_content = None
-            if hooks.has_hooks("on_result_restore"):
-                hook_result = hooks.call(
+            if self._hooks is not None and self._hooks.has_hooks("on_result_restore"):
+                hook_result = self._hooks.call(
                     "on_result_restore",
                     HookContext(
                         hook_name="on_result_restore",
@@ -471,30 +475,23 @@ class ContextManager:
                 estimated_turn += 1
                 continue
 
-            # 只清理 user 角色的 tool_result 消息（旧轮次 + 非系统消息）
-            if role != "user" or estimated_turn == 0 or estimated_turn > cutoff_turn:
+            # 只清理旧轮次、显式标记为 TOOL_RESULT 的消息
+            # role 可以是 "user"（Anthropic/OpenRouter）或 "tool"（GPT native）
+            if estimated_turn == 0 or estimated_turn > cutoff_turn:
+                continue
+            if msg.get("_type") != MT.TOOL_RESULT:
                 continue
 
             content = msg.get("content", "")
-            # 跳过系统注入消息
+
+            # 计算字符数
             if isinstance(content, str):
-                if any(kw in content for kw in SYSTEM_MESSAGE_KEYWORDS):
-                    continue
                 char_count = len(content)
             elif isinstance(content, list):
-                text_parts = []
-                is_system = False
-                for item in content:
-                    if isinstance(item, dict):
-                        t = item.get("text", "")
-                        text_parts.append(t)
-                        if any(kw in t for kw in SYSTEM_MESSAGE_KEYWORDS):
-                            is_system = True
-                    elif isinstance(item, str):
-                        text_parts.append(item)
-                if is_system:
-                    continue
-                char_count = sum(len(t) for t in text_parts)
+                char_count = sum(
+                    len(item.get("text", "") if isinstance(item, dict) else str(item))
+                    for item in content
+                )
             else:
                 continue
 
@@ -502,13 +499,13 @@ class ContextManager:
             if char_count <= MICROCOMPACT_MIN_CHARS:
                 continue
 
-            # 跳过已卸载的内容（结构化卸载标记）
+            # 跳过已卸载的内容（OFFLOADED 标记可能在 content 中）
             if isinstance(content, list) and content:
                 first_text = content[0].get("text", "") if isinstance(content[0], dict) else ""
-                if "[OFFLOADED:" in first_text:
+                if first_text.startswith(TAG_OFFLOADED):
                     continue
 
-            # 替换为简短占位符
+            # 构建占位符（有工具记录时用详细摘要，否则用通用占位符）
             turn_records = [r for r in self._call_registry if r.turn == estimated_turn]
             if turn_records:
                 placeholders = []

@@ -18,7 +18,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX
 from mem_deep_research_core.core.context_manager import ContextManager
-from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.llm_call_handler import LLMCallHandler, SummaryHandler
 from mem_deep_research_core.core.main_loop import MainLoopContext, MainLoopRunner
 from mem_deep_research_core.core.monitoring import ExecutionMonitor, MonitoringConfig
@@ -27,7 +27,7 @@ from mem_deep_research_core.core.tool_result_formatter import ToolResultFormatte
 from mem_deep_research_core.llm.provider_client_base import LLMProviderClientBase
 from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
 from mem_deep_research_core.tool.manager import ToolManager
-from mem_deep_research_core.utils.external_loader import external_loader
+from mem_deep_research_core.utils.external_loader import ConfigLoader
 from mem_deep_research_core.utils.io_utils import OutputFormatter
 from mem_deep_research_core.utils.tool_utils import _load_agent_prompt
 
@@ -56,6 +56,10 @@ class SubAgentRunner:
         # 消息拦截回调
         intercept_key_message: Callable | None = None,
         streaming_final_message: Callable | None = None,
+        *,
+        # 运行时依赖（必传）
+        hooks: HookRegistry,
+        config_loader: ConfigLoader,
     ):
         self.sub_agent_tool_managers = sub_agent_tool_managers
         self.sub_agent_llm_client = sub_agent_llm_client
@@ -72,6 +76,8 @@ class SubAgentRunner:
         self.handle_summary = handle_summary
         self.intercept_key_message = intercept_key_message
         self.streaming_final_message = streaming_final_message
+        self._hooks = hooks
+        self._config_loader = config_loader
 
         self._cached_tool_definitions: dict[str, list[dict]] | None = None
 
@@ -127,7 +133,7 @@ class SubAgentRunner:
         )
 
         # Inject skills
-        skill_injector = external_loader.get_skill_injector()
+        skill_injector = self._config_loader.get_skill_injector()
         if skill_injector and task_description:
             tools_to_use = [t.get("name", "") for t in tool_definitions if isinstance(t, dict)]
             system_prompt = skill_injector.inject_skills(
@@ -138,7 +144,7 @@ class SubAgentRunner:
             )
 
         # Hook: on_system_prompt_build
-        hook_result = hooks.call(
+        hook_result = self._hooks.call(
             "on_system_prompt_build",
             HookContext(
                 hook_name="on_system_prompt_build",
@@ -234,7 +240,7 @@ class SubAgentRunner:
                 tool_executor = ToolExecutor(
                     tool_manager=tool_manager,
                     output_formatter=self.output_formatter,
-                    tool_result_formatter=ToolResultFormatter(self.context),
+                    tool_result_formatter=ToolResultFormatter(self.context, hooks=self._hooks),
                     context=self.context,
                     stream_tool_call=self.stream_handler.stream_tool_call
                     if self.stream_handler
@@ -243,6 +249,7 @@ class SubAgentRunner:
                     stream_usage_info=self.stream_handler.stream_usage_info
                     if self.stream_handler
                     else None,
+                    hook_registry=self._hooks,
                 )
 
             llm_handler = LLMCallHandler(
@@ -250,6 +257,7 @@ class SubAgentRunner:
                 task_log=self.task_log,
                 add_message_id=False,
                 keep_tool_result=effective_keep,
+                hooks=self._hooks,
             )
 
             summary_handler = SummaryHandler(
@@ -294,6 +302,7 @@ class SubAgentRunner:
                 stream_tool_reasoning=self.stream_tool_reasoning or _noop_async,
                 extract_recent_tool_names=extract_recent_tool_names,
                 deduplicate_trailing_messages=deduplicate_trailing_messages,
+                hooks=self._hooks,
             )
 
             runner = MainLoopRunner(ctx)
@@ -387,6 +396,7 @@ class SubAgentRunner:
             task_log=self.task_log,
             add_message_id=False,
             keep_tool_result=keep_tool_result,
+            hooks=hooks_instance or self._hooks,
         )
 
         summary_handler = SummaryHandler(
@@ -446,7 +456,7 @@ class SubAgentRunner:
             extract_recent_tool_names=extract_recent_tool_names,
             deduplicate_trailing_messages=deduplicate_trailing_messages,
             spawn_depth=spawn_depth,
-            hooks=hooks_instance,
+            hooks=hooks_instance or self._hooks,
         )
 
         message_history = [

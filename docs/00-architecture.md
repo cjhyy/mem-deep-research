@@ -109,3 +109,7 @@ DeepResearch
 | **可插拔策略** | WindowStrategy、LLM Provider、Skill 选择等均支持替换 |
 | **MCP 优先** | 工具系统完全基于 MCP 协议，支持 stdio/HTTP/SSE 三种传输 |
 | **配置驱动** | Pydantic 校验 + OmegaConf 运行时配置，YAML 声明式定义 |
+
+## 后续演进
+
+下一阶段技术演进规划见 [15-technical-roadmap.md](./15-technical-roadmap.md)。

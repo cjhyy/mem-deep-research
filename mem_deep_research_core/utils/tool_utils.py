@@ -9,7 +9,7 @@ from omegaconf import DictConfig, OmegaConf
 from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX
 from mem_deep_research_core.mem_deep_research_logging.logger import bootstrap_logger
 from mem_deep_research_core.prompts import AgentPrompt
-from mem_deep_research_core.utils.external_loader import external_loader
+from mem_deep_research_core.utils.external_loader import ConfigLoader
 
 LOGGER_LEVEL = os.getenv("LOGGER_LEVEL", "INFO")
 logger = bootstrap_logger(level=LOGGER_LEVEL)
@@ -17,7 +17,7 @@ logger = bootstrap_logger(level=LOGGER_LEVEL)
 
 # MCP server configuration generation function
 def create_mcp_server_parameters(
-    cfg: DictConfig, agent_cfg: DictConfig, logs_dir: str | None = None
+    cfg: DictConfig, agent_cfg: DictConfig, logs_dir: str | None = None, config_loader=None
 ):
     """Define and return MCP server configuration list
 
@@ -50,6 +50,9 @@ def create_mcp_server_parameters(
     object: "mcp"
     ```
     """
+    if config_loader is None:
+        raise ValueError("config_loader is required for create_mcp_server_parameters")
+    _loader = config_loader
     configs = []
 
     if agent_cfg.get("tool_config", None) is not None:
@@ -58,7 +61,7 @@ def create_mcp_server_parameters(
                 # 优先从外部加载工具配置
                 tool_cfg_resolved = None
                 with contextlib.suppress(ValueError):
-                    tool_cfg_resolved = external_loader.load_tool_config(tool)
+                    tool_cfg_resolved = _loader.load_tool_config(tool)
 
                 # 回退到框架内置配置
                 if tool_cfg_resolved is None:

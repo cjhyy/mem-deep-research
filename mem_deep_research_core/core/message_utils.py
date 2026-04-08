@@ -70,9 +70,13 @@ def deduplicate_trailing_messages(message_history: list) -> int:
         i -= 1
         # 跳过中间的 user 消息（如 INJECT_HINT）
         if i >= 0 and message_history[i].get("role") == "user":
-            content_str = str(message_history[i].get("content", ""))
-            if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
+            msg_type = message_history[i].get("_type")
+            if msg_type is not None and msg_type != "user_input":
                 i -= 1
+            else:
+                content_str = str(message_history[i].get("content", ""))
+                if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
+                    i -= 1
 
     if len(tail_hashes) < 2:
         return 0
@@ -97,9 +101,13 @@ def deduplicate_trailing_messages(message_history: list) -> int:
             if 0 <= neighbor < len(message_history) and neighbor not in all_remove:
                 msg = message_history[neighbor]
                 if msg.get("role") == "user":
-                    content_str = str(msg.get("content", ""))
-                    if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
+                    msg_type = msg.get("_type")
+                    if msg_type is not None and msg_type != "user_input":
                         all_remove.add(neighbor)
+                    else:
+                        content_str = str(msg.get("content", ""))
+                        if any(kw in content_str for kw in SYSTEM_MESSAGE_KEYWORDS):
+                            all_remove.add(neighbor)
 
     # 按索引从大到小移除
     for idx in sorted(all_remove, reverse=True):
@@ -109,9 +117,12 @@ def deduplicate_trailing_messages(message_history: list) -> int:
     removed = len(all_remove)
     if removed > 0:
         # 追加引导消息，帮助摘要 LLM 生成有效输出
+        from mem_deep_research_core.core.constants import MT
+
         message_history.append(
             {
                 "role": "user",
+                "_type": MT.LOOP_HINT,
                 "content": [
                     {
                         "type": "text",

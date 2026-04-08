@@ -1,0 +1,114 @@
+# Deep Research Configuration — Sonnet 4.6
+#
+# 专为深度研究任务优化：更多轮次、更频繁反思、更积极的上下文管理。
+# 适用场景：技术调研、竞品分析、论文综述、多源信息对比等需要长时间深入搜索的任务。
+#
+# Usage:
+#   python run.py "研究 AI Agent 框架的最新进展和技术对比" --config agent_deep_research
+#   python run.py "综述 2025-2026 量子纠错领域的突破性进展" --config agent_deep_research
+#
+# 与 agent.yaml 的主要区别：
+#   - execution_mode: deep（强制深度模式）
+#   - max_turns: 80（允许更长的研究过程）
+#   - reflection_interval: 3（更频繁反思，及时修正方向）
+#   - max_concurrent_subagents: 5（更多并发子 agent）
+#   - thinking_mode: adaptive + effort 由框架自动管理
+#   - 更激进的上下文压缩策略（腾出空间给更多搜索结果）
+#   - max_total_time: 3600（1 小时）
+
+main_agent:
+  prompt:
+    agent_type: main
+    tool_format: xml
+    presets: [task_completion]
+
+  llm:
+    provider_class: "ClaudeOpenRouterClient"
+    model_name: "anthropic/claude-sonnet-4.6"
+    async_client: true
+    temperature: 0.3
+    top_p: 1.0
+    min_p: 0.0
+    top_k: -1
+    max_tokens: 64000              # Sonnet 4.6 支持 64k output
+    timeout: 600                   # 单次 API 调用 10 分钟超时
+    retry_max_attempts: 5          # 更多重试（长任务中断成本高）
+    retry_strategy: "exponential"
+    retry_multiplier: 2
+    retry_wait_seconds: 5
+    openrouter_api_key: "${oc.env:OPENROUTER_API_KEY}"
+    openrouter_base_url: "${oc.env:OPENROUTER_BASE_URL,https://openrouter.ai/api/v1}"
+    openrouter_provider: ""
+    enable_streaming: true
+    disable_cache_control: false
+    keep_tool_result: 5
+    oai_tool_thinking: false
+
+    # Adaptive Thinking — 模型根据任务复杂度自动调整推理深度
+    # deep 模式下框架自动设置 effort=high
+    thinking_mode: auto
+
+  # ─── 工具 ───
+  # 搜索 + 文件系统 + 计算器
+  # 框架自动提供 spawn_agent + update_todo 内置工具
+  tool_config:
+    - tool-calculator
+    - tool-filesystem
+    - tool-searching-serper
+
+  keep_tool_result: -1             # 保留全部工具结果（压缩策略会自动清理旧的）
+
+  # ─── 执行策略 ───
+  execution_mode: deep             # 强制深度模式
+  max_turns: 80                    # 允许长程研究（80 轮）
+  max_tool_calls_per_turn: 20      # 每轮更多工具调用（并发搜索多个关键词）
+  max_concurrent_subagents: 5      # 更多并发子 agent（并行调研不同子话题）
+
+  # ─── 语言 ───
+  response_language: auto          # 自动检测
+
+  # ─── 任务追踪 ───
+  todo_tracker:
+    enabled: true                  # 维护任务列表，追踪研究进度
+
+  # ─── 深度研究引擎 ───
+  task_engine:
+    enabled: true                  # 启用反思 + 规划
+    reflection_interval: 3         # 每 3 轮反思一次（更频繁，及时修正搜索方向）
+    auto_planning: true            # 自动任务分解（将大研究拆成子问题）
+
+  # ─── Skill 系统 ───
+  skill_selection:
+    enabled: true
+    method: inline
+    max_skills: 5                  # 允许加载更多 skill（研究可能需要多种指导）
+    progressive: true
+
+  # ─── 上下文管理（更激进的压缩策略）───
+  context_manager:
+    enable_dedup: true             # 工具调用去重（避免重复搜索）
+    enable_compact: true
+    compact_at_ratio: 0.5          # 50% 就开始压缩（比默认 0.6 更早，腾空间）
+    summarize_at_ratio: 0.7        # 70% 触发 LLM 摘要（比默认 0.8 更早）
+    compact_keep_recent: 5         # 保留最近 5 轮完整（比默认 3 更多，保留更多上下文）
+    result_offload_threshold: 3000 # 3000 字符就卸载（更积极，搜索结果通常很大）
+
+  # ─── 执行监控 ───
+  monitoring:
+    enable_loop_detection: true
+    loop_escalation_terminate_threshold: 5  # 更宽容（研究可能需要重复类似搜索）
+    max_total_time: 3600.0         # 1 小时上限
+    max_consecutive_empty_turns: 5 # 更宽容（等待复杂搜索返回）
+
+  # ─── 处理 ───
+  input_process:
+    hint_generation: false
+  output_process:
+    final_answer_extraction: false
+
+  interceptor:
+    preset: default
+
+  add_message_id: true
+
+output_dir: logs/

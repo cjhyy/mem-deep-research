@@ -36,6 +36,9 @@ class SessionMemory:
 
     在 MainLoopRunner 每轮结束时更新，context 压缩时保留。
     用于追踪关键发现、已尝试策略和引用来源。
+
+    线程安全：所有读写操作通过 threading.Lock 保护，
+    支持主 Agent 和并发子 Agent 安全访问。
     """
 
     key_findings: list[str] = field(default_factory=list)
@@ -48,58 +51,72 @@ class SessionMemory:
     max_strategies: int = 15
     max_sources: int = 30
 
+    # Threading lock (not included in repr/eq/hash)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+
     def add_finding(self, finding: str):
-        """添加关键发现（去重）"""
-        if finding and finding not in self.key_findings:
-            self.key_findings.append(finding)
-            if len(self.key_findings) > self.max_findings:
-                self.key_findings = self.key_findings[-self.max_findings :]
+        """添加关键发现（去重，线程安全）"""
+        with self._lock:
+            if finding and finding not in self.key_findings:
+                self.key_findings.append(finding)
+                if len(self.key_findings) > self.max_findings:
+                    self.key_findings = self.key_findings[-self.max_findings :]
 
     def add_strategy(self, strategy: str):
-        """记录已尝试的策略（避免重复尝试）"""
-        if strategy and strategy not in self.attempted_strategies:
-            self.attempted_strategies.append(strategy)
-            if len(self.attempted_strategies) > self.max_strategies:
-                self.attempted_strategies = self.attempted_strategies[-self.max_strategies :]
+        """记录已尝试的策略（避免重复尝试，线程安全）"""
+        with self._lock:
+            if strategy and strategy not in self.attempted_strategies:
+                self.attempted_strategies.append(strategy)
+                if len(self.attempted_strategies) > self.max_strategies:
+                    self.attempted_strategies = self.attempted_strategies[-self.max_strategies :]
 
     def add_source(self, url: str = "", title: str = "", snippet: str = "", tool_name: str = ""):
-        """添加引用来源（按 URL 去重）"""
-        if url and not any(s.url == url for s in self.sources):
-            self.sources.append(
-                SourceRecord(url=url, title=title, snippet=snippet, tool_name=tool_name)
-            )
-            if len(self.sources) > self.max_sources:
-                self.sources = self.sources[-self.max_sources :]
+        """添加引用来源（按 URL 去重，线程安全）"""
+        with self._lock:
+            if url and not any(s.url == url for s in self.sources):
+                self.sources.append(
+                    SourceRecord(url=url, title=title, snippet=snippet, tool_name=tool_name)
+                )
+                if len(self.sources) > self.max_sources:
+                    self.sources = self.sources[-self.max_sources :]
 
     def add_sub_agent_result(self, agent_name: str, result: str):
-        """记录子 Agent 结果"""
-        self.sub_agent_results[agent_name] = result
+        """记录子 Agent 结果（线程安全）"""
+        with self._lock:
+            self.sub_agent_results[agent_name] = result
 
     def to_context_string(self) -> str:
-        """生成可注入到消息历史的记忆摘要"""
+        """生成可注入到消息历史的记忆摘要（线程安全快照）"""
+        with self._lock:
+            # 在锁内取快照，锁外构建字符串
+            findings = list(self.key_findings)
+            strategies = list(self.attempted_strategies)
+            sources = list(self.sources)
+            sub_results = dict(self.sub_agent_results)
+
         sections = []
 
-        if self.key_findings:
-            findings = "\n".join(f"- {f}" for f in self.key_findings)
-            sections.append(f"## Key Findings So Far\n{findings}")
+        if findings:
+            text = "\n".join(f"- {f}" for f in findings)
+            sections.append(f"## Key Findings So Far\n{text}")
 
-        if self.attempted_strategies:
-            strategies = "\n".join(f"- {s}" for s in self.attempted_strategies)
-            sections.append(f"## Attempted Strategies\n{strategies}")
+        if strategies:
+            text = "\n".join(f"- {s}" for s in strategies)
+            sections.append(f"## Attempted Strategies\n{text}")
 
-        if self.sources:
-            sources = "\n".join(
+        if sources:
+            text = "\n".join(
                 f"- [{s.title or s.url}]({s.url})" + (f" — {s.snippet[:100]}" if s.snippet else "")
-                for s in self.sources
+                for s in sources
             )
-            sections.append(f"## Sources Collected\n{sources}")
+            sections.append(f"## Sources Collected\n{text}")
 
-        if self.sub_agent_results:
-            results = "\n".join(
+        if sub_results:
+            text = "\n".join(
                 f"### {name}\n{result[:200]}..." if len(result) > 200 else f"### {name}\n{result}"
-                for name, result in self.sub_agent_results.items()
+                for name, result in sub_results.items()
             )
-            sections.append(f"## Sub-Agent Results\n{results}")
+            sections.append(f"## Sub-Agent Results\n{text}")
 
         if not sections:
             return ""
@@ -107,12 +124,13 @@ class SessionMemory:
         return "[SESSION MEMORY]\n\n" + "\n\n".join(sections) + "\n"
 
     def is_empty(self) -> bool:
-        return (
-            not self.key_findings
-            and not self.attempted_strategies
-            and not self.sources
-            and not self.sub_agent_results
-        )
+        with self._lock:
+            return (
+                not self.key_findings
+                and not self.attempted_strategies
+                and not self.sources
+                and not self.sub_agent_results
+            )
 
     def extract_from_tool_result(self, tool_name: str, tool_result: dict | str):
         """从工具结果中自动提取来源信息"""
@@ -182,7 +200,7 @@ class LongTermMemory:
         self.max_entries = max_entries
         self._entries: list[MemoryEntry] = []
         self._loaded = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # RLock: store()/recall() 内部调用 _ensure_loaded() 需要可重入
 
     def _ensure_loaded(self):
         """Lazy load from disk (thread-safe via _lock)."""

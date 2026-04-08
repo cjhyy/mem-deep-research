@@ -30,13 +30,15 @@ from mem_deep_research_core.core.window_strategy import (
 
 
 def _make_history(num_turns: int, content_size: int = 500) -> list:
-    """生成测试用消息历史"""
+    """生成测试用消息历史（tool result 类型）"""
+    from mem_deep_research_core.core.constants import MT
+
     history = [
         {"role": "user", "content": [{"type": "text", "text": "initial task" * 10}]},
     ]
     for t in range(num_turns):
         history.append({"role": "assistant", "content": f"response {t}" * 20})
-        history.append({"role": "user", "content": [{"type": "text", "text": "x" * content_size}]})
+        history.append({"role": "user", "_type": MT.TOOL_RESULT, "content": [{"type": "text", "text": "x" * content_size}]})
     return history
 
 

@@ -276,12 +276,14 @@ async def _execute_dynamic_commands(content: str, shell: str = "bash") -> str:
     if not matches:
         return content
 
-    # Execute all commands concurrently
-    replacements = await asyncio.gather(*[run_cmd(m) for m in matches])
+    # Execute all commands concurrently (return_exceptions prevents partial failure)
+    replacements = await asyncio.gather(*[run_cmd(m) for m in matches], return_exceptions=True)
 
     # Replace in reverse order to preserve positions
     result = content
-    for match, replacement in zip(reversed(matches), reversed(replacements), strict=True):
+    for match, replacement in zip(reversed(matches), reversed(replacements)):
+        if isinstance(replacement, Exception):
+            replacement = f"[command error: {replacement}]"
         result = result[: match.start()] + replacement + result[match.end() :]
 
     return result

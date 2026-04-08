@@ -1,5 +1,44 @@
 # Changelog
 
+## v1.2.0 (2026-04-08)
+
+**Phase 1 内核收敛完成** — 运行时隔离、消息类型系统、稳定性修复、集成测试骨架。
+
+### Runtime Isolation (`AgentRuntime`)
+- 新增 `core/agent_runtime.py`：轻量容器，持有实例级 `HookRegistry` + `ConfigLoader`
+- 重构 9 个消费模块接受注入 hooks（llm_call_handler, tool_result_formatter, message_interceptor, prompt_builder, sub_agent_runner, context_manager, tool/manager, tool_utils, orchestrator）
+- `load_project_hooks()` 支持可选 `hook_registry` 参数
+- 多 `DeepResearch` 实例并行运行时 hooks/config_loader 完全隔离
+- 全局单例保留为向后兼容 fallback
+
+### Message Type System (`MT`)
+- `constants.py` 新增 `MT` 类：20 种消息类型 + `PROTECTED_MESSAGE_TYPES` frozenset
+- 24 个消息创建点统一打标 `_type` 字段
+- `window_strategy` / `context_manager` / `message_utils` 优先检查 `_type`，keyword 为 fallback
+- `_is_protected_message(msg)` 替代脆弱的 `_is_system_message(content)`
+
+### Stability Fixes
+- `SessionMemory`: 所有变更方法加 `threading.Lock`，`to_context_string()` 基于快照
+- `orchestrator.py`: 修复 2 处 silent `except Exception: pass`，改为日志 fallback
+- `tool/manager.py`: 5 处 `except Exception` 窄化为具体异常类型
+- 修复 deadlock、context coupling、hooks 全局污染问题
+- 修复空 text content block 和空 assistant content 导致的 API 错误
+- 修正 `agent_deep_research.yaml` model_name 格式
+
+### Integration Test Skeleton (491 tests)
+- `test_agent_runtime.py`: AgentRuntime 隔离、全局 fallback、setup_hook_defaults、load_project_hooks
+- `test_hook_injection.py`: 6 个消费模块 hooks 注入链验证
+- `test_message_types.py`: MT 类型系统、保护消息判断、keyword fallback
+- `test_session_memory.py`: SessionMemory 线程安全、去重、溢出截断
+- `test_mainloop_tools.py`: 主循环 + 工具执行链（工具调用→结果回注→下轮 LLM）
+- `test_compact_offload.py`: compact + offload + resume round-trip
+- `test_long_term_memory.py`: LongTermMemory store/recall/forget 生命周期 + 持久化
+- `test_sub_agent.py`: 子 Agent spawn + return + 上下文隔离
+
+### Other
+- Deep research config for Sonnet 4.6
+- Pluggable offload backend via `on_result_offload` / `on_result_restore` hooks
+
 ## v1.1.1 (2026-04-07)
 
 ### New Features

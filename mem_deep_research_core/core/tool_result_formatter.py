@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Any
 
-from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 
 logger = logging.getLogger("mem_deep_research")
 
@@ -111,11 +111,6 @@ def _extract_result_count(result_str: str) -> int | None:
     return None
 
 
-# 注册默认实现
-hooks.set_default("on_thinking_generate", _default_thinking_generate)
-hooks.set_default("on_tool_result_format", _default_tool_result_format)
-
-
 class ToolResultFormatter:
     """
     工具调用结果格式化器
@@ -123,14 +118,16 @@ class ToolResultFormatter:
     通过钩子系统支持自定义格式化逻辑。
     """
 
-    def __init__(self, context: dict[str, Any] | None = None):
+    def __init__(self, context: dict[str, Any] | None = None, *, hooks: HookRegistry):
         """
         初始化格式化器
 
         Args:
             context: 用户上下文
+            hooks: HookRegistry 实例（必传）
         """
         self.context = context or {}
+        self._hooks = hooks
 
     def get_tool_thinking_description(self, tool_name: str, arguments: dict = None) -> str:
         """
@@ -151,7 +148,7 @@ class ToolResultFormatter:
             arguments=arguments or {},
             context=self.context,
         )
-        return hooks.call("on_thinking_generate", ctx)
+        return self._hooks.call("on_thinking_generate", ctx)
 
     def extract_tool_query_info(self, tool_name: str, arguments: dict) -> str | None:
         """
@@ -201,4 +198,4 @@ class ToolResultFormatter:
             arguments=arguments or {},
             context=self.context,
         )
-        return hooks.call("on_tool_result_format", ctx)
+        return self._hooks.call("on_tool_result_format", ctx)

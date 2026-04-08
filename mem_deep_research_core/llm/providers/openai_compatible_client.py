@@ -174,6 +174,20 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         else:
             processed_messages = messages_copy
 
+        # Sanitize: ensure no empty text content blocks (Anthropic via OpenRouter rejects them)
+        for msg in processed_messages:
+            content = msg.get("content")
+            if content is None or (isinstance(content, str) and content == ""):
+                msg["content"] = "[empty]"
+            elif isinstance(content, list):
+                if not content:  # empty list
+                    msg["content"] = "[empty]"
+                else:
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            if not item.get("text"):  # None or ""
+                                item["text"] = "[empty]"
+
         # Allow subclass model validation
         self._validate_model()
 
@@ -325,11 +339,9 @@ class OpenAICompatibleClient(LLMProviderClientBase):
             assistant_response_text = self._clean_user_content_from_response(
                 assistant_response_text
             )
-            message_history.append({"role": "assistant", "content": assistant_response_text})
         elif finish_reason == "tool_calls":
-            # Native tool calling: model returned tool_calls via API
+            # Native tool calling: content 可能为空（Claude 通过 OpenRouter 调工具时 content=null）
             assistant_response_text = llm_response.choices[0].message.content or ""
-            message_history.append({"role": "assistant", "content": assistant_response_text})
         elif finish_reason == "length":
             assistant_response_text = llm_response.choices[0].message.content or ""
             if assistant_response_text == "":
@@ -338,13 +350,15 @@ class OpenAICompatibleClient(LLMProviderClientBase):
                 assistant_response_text = self._clean_user_content_from_response(
                     assistant_response_text
                 )
-            message_history.append({"role": "assistant", "content": assistant_response_text})
         else:
             logger.error(f"Unsupported finish reason: {finish_reason}")
             assistant_response_text = "Successful response, but unsupported finish reason: " + str(
                 finish_reason
             )
-            message_history.append({"role": "assistant", "content": assistant_response_text})
+
+        # Append to history — 确保 content 非空（API 拒绝空 text block）
+        history_content = assistant_response_text if assistant_response_text else "[assistant]"
+        message_history.append({"role": "assistant", "content": history_content})
         logger.debug(f"LLM Response: {truncate_for_log(assistant_response_text)}")
 
         return assistant_response_text, False
@@ -452,14 +466,11 @@ class OpenAICompatibleClient(LLMProviderClientBase):
             for _tool_id, content in bad_tool_calls:
                 output_parts.append(content["text"])
 
+        from mem_deep_research_core.core.constants import make_tool_result_msg
+
         merged_text = "\n\n".join(output_parts)
 
-        message_history.append(
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": merged_text}],
-            }
-        )
+        message_history.append(make_tool_result_msg(merged_text))
         return message_history
 
     def parse_llm_response(self, llm_response) -> str:

@@ -26,7 +26,8 @@ from mem_deep_research_core.core.constants import (
 )
 from mem_deep_research_core.core.context_manager import ContextManager, ContextManagerConfig
 from mem_deep_research_core.core.deferred_tools import DeferredToolManager
-from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.core.agent_runtime import AgentRuntime
+from mem_deep_research_core.core.hooks import HookContext
 from mem_deep_research_core.core.interceptor_config import InterceptorConfig, InterceptorPresets
 from mem_deep_research_core.core.llm_call_handler import (
     LLMCallHandler,
@@ -53,7 +54,7 @@ from mem_deep_research_core.core.tool_result_formatter import ToolResultFormatte
 from mem_deep_research_core.llm.provider_client_base import LLMProviderClientBase
 from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
 from mem_deep_research_core.tool.manager import ToolManager
-from mem_deep_research_core.utils.external_loader import external_loader
+from mem_deep_research_core.utils.external_loader import ConfigLoader
 from mem_deep_research_core.utils.io_utils import OutputFormatter, process_input
 from mem_deep_research_core.utils.stream_parsing_utils import TextInterceptor
 from mem_deep_research_core.utils.tool_utils import expose_sub_agents_as_tools
@@ -89,10 +90,8 @@ def _default_on_turn_end(ctx: HookContext):
     return None
 
 
-hooks.set_default("on_agent_start", _default_on_agent_start)
-hooks.set_default("on_agent_end", _default_on_agent_end)
-hooks.set_default("on_turn_start", _default_on_turn_start)
-hooks.set_default("on_turn_end", _default_on_turn_end)
+# 注意：默认钩子注册已移至 AgentRuntime.setup_hook_defaults()
+# 此处不再注册到全局单例
 
 logger = logging.getLogger("mem_deep_research")
 
@@ -133,7 +132,15 @@ class Orchestrator:
         tool_definitions: list[dict[str, Any]] | None = None,
         sub_agent_tool_definitions: dict[str, list[dict[str, Any]]] | None = None,
         context: dict[str, Any] | None = None,
+        runtime: AgentRuntime | None = None,
     ):
+        # 运行时隔离
+        self.runtime = runtime or AgentRuntime()
+        self._hooks = self.runtime.hooks
+
+        # 注册所有框架默认钩子到本实例
+        self.runtime.setup_hook_defaults()
+
         # 基础组件
         self.main_agent_tool_manager = main_agent_tool_manager
         self.sub_agent_tool_managers = sub_agent_tool_managers
@@ -170,8 +177,8 @@ class Orchestrator:
         if self.sub_agent_llm_client and task_log and self.sub_agent_llm_client != self.llm_client:
             self.sub_agent_llm_client.task_log = task_log
 
-        # 设置上下文到工具管理器
-        if self.context and self.context.get("user_id"):
+        # 设置上下文到工具管理器（无条件传播，不依赖 user_id）
+        if self.context:
             self.main_agent_tool_manager.set_context(self.context)
             for sub_manager in self.sub_agent_tool_managers.values():
                 sub_manager.set_context(self.context)
@@ -218,7 +225,7 @@ class Orchestrator:
         self.stream_handler = StreamHandler(self.stream_queue)
 
         # 工具结果格式化器
-        self.tool_formatter = ToolResultFormatter(self.context)
+        self.tool_formatter = ToolResultFormatter(self.context, hooks=self._hooks)
 
         # 消息拦截处理器
         interceptor_config = self._load_interceptor_config()
@@ -232,6 +239,7 @@ class Orchestrator:
             stream_tool_call_callback=self.stream_handler.stream_tool_call,
             stream_message_callback=self.stream_handler.stream_message,
             context=self.context,
+            hooks=self._hooks,
         )
 
         # 最终消息拦截器
@@ -269,6 +277,7 @@ class Orchestrator:
             stream_usage_info=self.stream_handler.stream_usage_info,
             retry_max=retry_cfg.get("max_retries", 2) if retry_cfg.get("enabled", True) else 0,
             retry_backoff_base=retry_cfg.get("backoff_base", 1.0),
+            hook_registry=self._hooks,  # 注入实例级 hooks，避免全局单例
         )
         # scrape_max_length: 优先从配置读，fallback 环境变量，最后默认 20000
         scrape_max_length = monitoring_cfg_dict.get("scrape_max_length", None)
@@ -296,6 +305,8 @@ class Orchestrator:
             handle_llm_call=self.llm_handler.handle_llm_call,
             handle_summary=self.summary_handler.handle_summary_with_retry,
             intercept_key_message=self._intercept_key_message,
+            hooks=self._hooks,
+            config_loader=self.runtime.config_loader,
             streaming_final_message=self._streaming_final_message,
         )
         if self.sub_agent_tool_definitions:
@@ -311,6 +322,7 @@ class Orchestrator:
             add_message_id=self.add_message_id,
             keep_tool_result=self.cfg.main_agent.keep_tool_result,
             stream_error_callback=self.stream_handler.stream_tool_call,
+            hooks=self._hooks,
         )
 
         # 摘要处理器
@@ -340,7 +352,7 @@ class Orchestrator:
         self.todo_tracker = TodoTracker(enabled=todo_enabled)
 
         # Inline Skill Selector
-        self.inline_skill_selector = external_loader.get_inline_skill_selector(
+        self.inline_skill_selector = self.runtime.config_loader.get_inline_skill_selector(
             self.cfg, chinese=self.chinese_context
         )
         # 将 <next_skills> 注册为 reasoning tag，使其被 TextInterceptor 自动提取并从输出中剥离
@@ -353,7 +365,7 @@ class Orchestrator:
                 self.key_message_interceptor.set_reasoning_tags(current_tags)
 
         # Skill Commands — 统一格式，传递给 MainLoopContext
-        self.skill_commands = external_loader.get_skill_commands()
+        self.skill_commands = self.runtime.config_loader.get_skill_commands()
 
         # Prompt Builder
         self.prompt_builder = PromptBuilder(
@@ -361,13 +373,15 @@ class Orchestrator:
             context=self.context,
             chinese_context=self.chinese_context,
             inline_skill_selector=self.inline_skill_selector,
+            hooks=self._hooks,
+            config_loader=self.runtime.config_loader,
         )
 
     def _init_context_manager(self):
         """初始化 Context Manager（三级 context 管理 + dedup + source registry）"""
         cm_cfg_dict = ensure_dict(self.cfg.main_agent.get("context_manager", {}))
         cm_config = ContextManagerConfig(**cm_cfg_dict) if cm_cfg_dict else ContextManagerConfig()
-        self.context_manager = ContextManager(config=cm_config)
+        self.context_manager = ContextManager(config=cm_config, hooks=self._hooks)
         # 注入 token 估算函数
         if hasattr(self.llm_client, "_estimate_tokens"):
             self.context_manager.set_token_estimator(self.llm_client._estimate_tokens)
@@ -489,8 +503,8 @@ class Orchestrator:
                     await self.stream_handler.stream_tool_call(
                         "show_text", {"text": message}, True, message_id
                     )
-            except Exception:
-                pass
+            except Exception as fallback_err:
+                logger.warning(f"Fallback streaming also failed in _intercept_key_message: {fallback_err}")
             return True
 
     async def _streaming_final_message(self, message_id: str, message: str, is_last: bool):
@@ -528,8 +542,8 @@ class Orchestrator:
                     await self.stream_handler.stream_message(
                         message_id=message_id, delta_content=message
                     )
-            except Exception:
-                pass
+            except Exception as fallback_err:
+                logger.warning(f"Fallback streaming also failed in _streaming_final_message: {fallback_err}")
             return True
 
     # ========== LLM 调用处理 ==========
@@ -567,7 +581,7 @@ class Orchestrator:
         # 0.5. 输入编译链
         from mem_deep_research_core.core.input_compiler import InputCompiler
 
-        input_compiler = InputCompiler(hooks=hooks)
+        input_compiler = InputCompiler(hooks=self._hooks)
         compile_result = input_compiler.compile(task_description, context=self.context)
         task_description = compile_result.query
 
@@ -607,7 +621,9 @@ class Orchestrator:
 
         # 3. 构建消息历史
         message_history = self._build_initial_history(history)
-        message_history.append({"role": "user", "content": initial_user_content})
+        from mem_deep_research_core.core.constants import MT
+
+        message_history.append({"role": "user", "_type": MT.USER_INPUT, "content": initial_user_content})
 
         # 4. 获取工具定义
         _perf_t0 = time.perf_counter()
@@ -772,7 +788,7 @@ class Orchestrator:
             extract_recent_tool_names=self._extract_recent_tool_names,
             deduplicate_trailing_messages=self._deduplicate_trailing_messages,
             long_term_memory=self.long_term_memory,
-            hooks=hooks,
+            hooks=self._hooks,
             deferred_tool_manager=self.deferred_tool_manager,
             transcript=self.transcript,
             file_state_cache=self.file_state_cache,

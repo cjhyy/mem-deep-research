@@ -39,6 +39,7 @@ async def execute_task_pipeline(
     main_agent_llm_client: Any | None = None,
     sub_agent_llm_client: Any | None = None,
     resume_from: dict | None = None,
+    runtime: Any | None = None,
 ) -> tuple[str, str, pathlib.Path]:
     """
     Executes the full pipeline for a single task.
@@ -127,6 +128,7 @@ async def execute_task_pipeline(
             tool_definitions=tool_definitions,
             sub_agent_tool_definitions=sub_agent_tool_definitions,
             context=context,
+            runtime=runtime,
         )
 
         task_log.status = "running"
@@ -194,34 +196,42 @@ async def execute_task_pipeline(
         return final_answer, final_boxed_answer, task_log.log_path
 
 
-def create_pipeline_components(cfg: DictConfig, logs_dir: str | None = None):
+def create_pipeline_components(cfg: DictConfig, logs_dir: str | None = None, *, runtime=None):
     """
     Creates and initializes the core components of the agent pipeline.
 
     Args:
         cfg: The Hydra configuration object.
+        logs_dir: Optional log directory path.
+        runtime: AgentRuntime instance for hooks/config_loader injection.
 
     Returns:
         Tuple of (main_agent_tool_manager, sub_agent_tool_managers, output_formatter)
     """
+    # Extract runtime dependencies
+    _hook_registry = runtime.hooks if runtime else None
+    _config_loader = runtime.config_loader if runtime else None
+
     # Create ToolManagers for main agent and sub-agents
     main_agent_mcp_server_configs, main_agent_blacklist = create_mcp_server_parameters(
-        cfg, cfg.main_agent, logs_dir
+        cfg, cfg.main_agent, logs_dir, config_loader=_config_loader
     )
     main_agent_tool_manager = ToolManager(
         main_agent_mcp_server_configs,
         tool_blacklist=main_agent_blacklist,
+        hook_registry=_hook_registry,
     )
 
     sub_agent_tool_managers = {}
     if getattr(cfg, "sub_agents", None):
         for sub_agent in cfg.sub_agents:
             sub_agent_mcp_server_configs, sub_agent_blacklist = create_mcp_server_parameters(
-                cfg, cfg.sub_agents[sub_agent], logs_dir
+                cfg, cfg.sub_agents[sub_agent], logs_dir, config_loader=_config_loader
             )
             sub_agent_tool_manager = ToolManager(
                 sub_agent_mcp_server_configs,
                 tool_blacklist=sub_agent_blacklist,
+                hook_registry=_hook_registry,
             )
             sub_agent_tool_managers[sub_agent] = sub_agent_tool_manager
 

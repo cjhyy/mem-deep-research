@@ -10,6 +10,7 @@ mem_deep_research - AI Agent 端到端任务完成框架
 - config_schema: 配置验证 Schema
 """
 
+from mem_deep_research_core.core.agent_runtime import AgentRuntime
 from mem_deep_research_core.exceptions import (
     ConfigNotFoundError,
     ConfigurationError,
@@ -37,13 +38,15 @@ from mem_deep_research_core.exceptions import (
     ToolTimeoutError,
 )
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __author__ = "maki maki"
 
 __all__ = [
     # Version info
     "__version__",
     "__author__",
+    # Runtime isolation
+    "AgentRuntime",
     # Base exceptions
     "MemDeepResearchError",
     # Tool exceptions

@@ -12,9 +12,9 @@ import logging
 from typing import Any
 
 from mem_deep_research_core.core.constants import parse_bool_config
-from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.prompts.template_loader import PromptTemplateLoader
-from mem_deep_research_core.utils.external_loader import external_loader
+from mem_deep_research_core.utils.external_loader import ConfigLoader
 from mem_deep_research_core.utils.tool_utils import _load_agent_prompt
 
 logger = logging.getLogger("mem_deep_research")
@@ -38,12 +38,17 @@ class PromptBuilder:
         context: dict[str, Any],
         chinese_context: bool,
         inline_skill_selector=None,
+        *,
+        hooks: HookRegistry,
+        config_loader: ConfigLoader,
     ):
         self.cfg = cfg
         self.context = context
         self.chinese_context = chinese_context
         self.inline_skill_selector = inline_skill_selector
         self._template_loader = PromptTemplateLoader()
+        self._hooks = hooks
+        self._config_loader = config_loader
 
         # Section cache: 静态段缓存
         self._section_cache: dict[str, str] = {}
@@ -118,7 +123,7 @@ class PromptBuilder:
             return None
 
         try:
-            selector = external_loader.get_llm_skill_selector(self.cfg)
+            selector = self._config_loader.get_llm_skill_selector(self.cfg)
             if not selector:
                 return None
 
@@ -197,7 +202,7 @@ class PromptBuilder:
                 )
                 logger.debug(f"Inline legacy first-turn skills injected: {selected_skill_names}")
         else:
-            skill_injector = external_loader.get_skill_injector()
+            skill_injector = self._config_loader.get_skill_injector()
             if skill_injector and initial_user_content:
                 if selected_skill_names is not None:
                     # LLM 选择路径：按名称直接注入
@@ -220,7 +225,7 @@ class PromptBuilder:
                     logger.debug("Rule-matched skills injected into system prompt")
 
         # Hook: on_system_prompt_build — post-process system prompt (dynamic)
-        hook_result = hooks.call(
+        hook_result = self._hooks.call(
             "on_system_prompt_build",
             HookContext(
                 hook_name="on_system_prompt_build",

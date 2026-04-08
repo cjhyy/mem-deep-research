@@ -1,6 +1,6 @@
 [project]
 name = "mem-deep-research"
-version = "1.1.1"
+version = "1.2.0"
 description = "Mem Deep Research - AI Agent Orchestration Framework"
 readme = "README.md"
 license = {text = "Apache-2.0"}

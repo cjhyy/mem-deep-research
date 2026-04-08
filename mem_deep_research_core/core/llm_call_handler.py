@@ -20,7 +20,7 @@ from mem_deep_research_core.core.constants import (
     TASK_PREVIEW_LENGTH,
     generate_message_id,
 )
-from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.exceptions import ContextLimitError, GuardrailError
 from mem_deep_research_core.llm.provider_client_base import LLMProviderClientBase
 from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
@@ -40,6 +40,7 @@ class LLMCallHandler:
         add_message_id: bool = False,
         keep_tool_result: int = -1,
         stream_error_callback: Callable | None = None,
+        hooks: HookRegistry | None = None,
     ):
         """
         初始化 LLM 调用处理器
@@ -51,13 +52,18 @@ class LLMCallHandler:
             add_message_id: 是否为用户消息添加 ID
             keep_tool_result: 保留工具结果数量
             stream_error_callback: 流式错误回调函数
+            hooks: HookRegistry 实例（必传，spawn 路径可省略走 fallback）
         """
+        if hooks is None:
+            # spawn() 路径未传 hooks — 创建独立实例（不污染全局）
+            hooks = HookRegistry()
         self.main_llm_client = main_llm_client
         self.sub_agent_llm_client = sub_agent_llm_client or main_llm_client
         self.task_log = task_log
         self.add_message_id = add_message_id
         self.keep_tool_result = keep_tool_result
         self.stream_error_callback = stream_error_callback
+        self._hooks = hooks
 
     def get_client(self, agent_type: str = "main") -> LLMProviderClientBase:
         """获取指定类型的 LLM 客户端"""
@@ -149,9 +155,9 @@ class LLMCallHandler:
 
         try:
             # Guardrail: pre-LLM validation
-            if hooks.has_hooks("on_before_llm_call"):
+            if self._hooks.has_hooks("on_before_llm_call"):
                 try:
-                    hooks.call(
+                    self._hooks.call(
                         "on_before_llm_call",
                         HookContext(
                             hook_name="on_before_llm_call",
@@ -190,11 +196,20 @@ class LLMCallHandler:
                     response, assistant_response_text
                 )
 
-                if assistant_response_text:
+                # 有效响应：有文本 或 有工具调用（Claude 调工具时 content 可能为空）
+                # tool_calls_info 是 (list, list) tuple 或 "context_limit" 字符串
+                has_tool_calls = (
+                    isinstance(tool_calls_info, (list, tuple))
+                    and len(tool_calls_info) > 0
+                    and (tool_calls_info[0] if isinstance(tool_calls_info, tuple) else tool_calls_info)
+                )
+                has_valid_response = bool(assistant_response_text) or bool(has_tool_calls)
+
+                if has_valid_response:
                     # Guardrail: post-LLM validation
-                    if hooks.has_hooks("on_after_llm_call"):
+                    if assistant_response_text and self._hooks.has_hooks("on_after_llm_call"):
                         try:
-                            hooks.call(
+                            self._hooks.call(
                                 "on_after_llm_call",
                                 HookContext(
                                     hook_name="on_after_llm_call",
@@ -278,6 +293,7 @@ class SummaryHandler:
         self.chinese_context = chinese_context
         self.response_language = response_language
         self.context: dict[str, Any] | None = None
+        self._hooks = llm_call_handler._hooks
 
     async def handle_summary_with_retry(
         self,
@@ -334,7 +350,7 @@ class SummaryHandler:
             )
 
             # Hook: on_summarize_prompt_build
-            hook_result = hooks.call(
+            hook_result = self._hooks.call(
                 "on_summarize_prompt_build",
                 HookContext(
                     hook_name="on_summarize_prompt_build",
@@ -353,8 +369,10 @@ class SummaryHandler:
 
             # 添加摘要提示到消息历史（记录位置以便失败时回滚）
             history_len_before_summary = len(message_history)
+            from mem_deep_research_core.core.constants import MT
+
             message_history.append(
-                {"role": "user", "content": [{"type": "text", "text": summary_prompt}]}
+                {"role": "user", "_type": MT.SUMMARY_PROMPT, "content": [{"type": "text", "text": summary_prompt}]}
             )
 
             # 网络重试循环

@@ -181,6 +181,132 @@ CONTEXT_COMPRESSION_NOTICE = (
 )
 
 # ============================================================
+# Message Types — 结构化消息分类
+#
+# 每条 message_history 中的消息可通过 `_type` 字段标明类型，
+# 让 compact / offload / dedup 基于类型判断，而非关键词匹配。
+# 无 `_type` 的旧消息仍通过 SYSTEM_MESSAGE_KEYWORDS 兜底。
+# ============================================================
+
+
+class MT:
+    """Message Types — 简短常量集合，不做 enum 以避免序列化开销"""
+
+    # === 用户输入 ===
+    USER_INPUT = "user_input"
+
+    # === LLM 输出 ===
+    ASSISTANT = "assistant"
+
+    # === 工具结果 ===
+    TOOL_RESULT = "tool_result"
+
+    # === 系统注入（受压缩保护） ===
+    SESSION_MEMORY = "session_memory"
+    LONG_TERM_MEMORY = "long_term_memory"
+    TASK_PROGRESS = "task_progress"
+    PLAN = "plan"
+    REFLECTION = "reflection"
+    CITATION_SUMMARY = "citation_summary"
+    TOKEN_WARNING = "token_warning"
+    CONTEXT_COMPRESSION = "context_compression"
+    RESUME_NOTICE = "resume_notice"
+
+    # === 系统提示（不受压缩保护，可被清理） ===
+    LOOP_HINT = "loop_hint"
+    TRUNCATION_RECOVERY = "truncation_recovery"
+    INLINE_SKILL = "inline_skill"
+
+    # === 压缩产物 ===
+    CONTEXT_SUMMARY = "context_summary"
+    OFFLOADED = "offloaded"
+
+    # === 内部 LLM 调用（不进入主 message_history） ===
+    SUMMARY_PROMPT = "summary_prompt"
+    ROUTING = "routing"
+    TASK_PLANNING = "task_planning"
+
+
+# 受压缩保护的消息类型集合（不会被 compact / masking / microcompact 清理）
+PROTECTED_MESSAGE_TYPES = frozenset({
+    MT.SESSION_MEMORY,
+    MT.LONG_TERM_MEMORY,
+    MT.TASK_PROGRESS,
+    MT.PLAN,
+    MT.REFLECTION,
+    MT.CITATION_SUMMARY,
+    MT.TOKEN_WARNING,
+    MT.CONTEXT_COMPRESSION,
+    MT.RESUME_NOTICE,
+    MT.CONTEXT_SUMMARY,
+    MT.OFFLOADED,
+})
+
+
+def make_msg(role: str, text: str, _type: str | None = None, **extra) -> dict:
+    """创建标准 message dict
+
+    Args:
+        role: "user" 或 "assistant"
+        text: 消息文本
+        _type: 消息类型 (MT.xxx)
+        **extra: 额外字段 (如 _meta=True)
+
+    Returns:
+        {"role": ..., "content": [{"type": "text", "text": ...}], "_type": ...}
+    """
+    msg = {"role": role, "content": [{"type": "text", "text": text}]}
+    if _type is not None:
+        msg["_type"] = _type
+    if extra:
+        msg.update(extra)
+    return msg
+
+
+def make_tool_result_msg(text: str, **extra) -> dict:
+    """创建 tool result 消息（统一入口，确保 _type=MT.TOOL_RESULT）
+
+    所有 provider 的 update_message_history() 应使用此函数，
+    而非手动构建 {"role": "user", "content": [...]}.
+
+    Args:
+        text: 工具结果文本
+        **extra: 额外字段 (如 tool_call_id)
+
+    Returns:
+        {"role": "user", "_type": "tool_result", "content": [{"type": "text", "text": ...}]}
+    """
+    msg = {
+        "role": "user",
+        "_type": MT.TOOL_RESULT,
+        "content": [{"type": "text", "text": text}],
+    }
+    if extra:
+        msg.update(extra)
+    return msg
+
+
+def make_tool_result_msg_native(call_id: str, text: str) -> dict:
+    """创建 OpenAI 原生格式的 tool result 消息
+
+    用于 GPTOpenAIClient 等使用 role="tool" 的 provider。
+
+    Args:
+        call_id: tool_call_id
+        text: 工具结果文本
+
+    Returns:
+        {"role": "tool", "_type": "tool_result", "tool_call_id": ..., "content": ...}
+    """
+    return {
+        "role": "tool",
+        "_type": MT.TOOL_RESULT,
+        "tool_call_id": call_id,
+        "content": text,
+    }
+
+
+# ============================================================
 # Fallback Messages
 # ============================================================
 

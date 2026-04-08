@@ -267,13 +267,11 @@ class GPTOpenAIClient(LLMProviderClientBase):
     ):
         """Update message history with tool calls data (llm client specific)"""
 
+        from mem_deep_research_core.core.constants import make_tool_result_msg_native
+
         for cur_call_id, tool_result in tool_call_info:
             message_history.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": cur_call_id,
-                    "content": tool_result["text"],
-                }
+                make_tool_result_msg_native(cur_call_id, tool_result["text"])
             )
 
         return message_history

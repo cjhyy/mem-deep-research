@@ -40,6 +40,8 @@ from typing import Any
 
 from mem_deep_research_core.core.constants import (
     COMPACT_MIN_CHARS,
+    MT,
+    PROTECTED_MESSAGE_TYPES,
     SYSTEM_MESSAGE_KEYWORDS,
     TAG_CONTEXT_SUMMARY,
     TAG_OFFLOADED,
@@ -146,8 +148,30 @@ def _get_message_char_count(msg: dict) -> int:
     return len(str(content))
 
 
+def _is_protected_message(msg: dict) -> bool:
+    """判断消息是否受压缩保护（不应被 compact / masking / microcompact 清理）
+
+    优先检查 `_type` 字段（结构化），fallback 到关键词匹配（向后兼容）。
+    """
+    # Fast path: 结构化类型判断
+    msg_type = msg.get("_type")
+    if msg_type is not None:
+        return msg_type in PROTECTED_MESSAGE_TYPES
+
+    # Fallback: 关键词匹配（无 _type 的旧消息）
+    return _content_matches_keywords(msg.get("content"))
+
+
 def _is_system_message(content) -> bool:
-    """判断是否是系统注入的消息（反思提示、hint 等），不应被压缩"""
+    """判断是否是系统注入的消息（反思提示、hint 等），不应被压缩
+
+    向后兼容接口 — 新代码请优先使用 _is_protected_message(msg)。
+    """
+    return _content_matches_keywords(content)
+
+
+def _content_matches_keywords(content) -> bool:
+    """通过关键词匹配检测系统注入消息"""
     if isinstance(content, str):
         return any(kw in content for kw in SYSTEM_MESSAGE_KEYWORDS)
     if isinstance(content, list):
@@ -159,8 +183,16 @@ def _is_system_message(content) -> bool:
     return False
 
 
-def _is_offloaded(content) -> bool:
-    """判断消息是否是已卸载的内容（不应被二次压缩）"""
+def _is_offloaded(msg_or_content) -> bool:
+    """判断消息是否是已卸载的内容（不应被二次压缩）
+
+    接受完整 message dict 或 content 字段。
+    """
+    # Fast path: 结构化类型
+    if isinstance(msg_or_content, dict) and msg_or_content.get("_type") == MT.OFFLOADED:
+        return True
+
+    content = msg_or_content.get("content") if isinstance(msg_or_content, dict) else msg_or_content
     if isinstance(content, str):
         return content.startswith(TAG_OFFLOADED)
     if isinstance(content, list):
@@ -331,8 +363,9 @@ class ObservationMaskingStrategy(WindowStrategy):
 
             if role == "assistant":
                 estimated_turn += 1
-            elif role == "user" and estimated_turn > 0 and estimated_turn <= cutoff_turn:
-                if not _is_system_message(msg.get("content")):
+            elif estimated_turn > 0 and estimated_turn <= cutoff_turn:
+                # 白名单：只压缩显式标记为 TOOL_RESULT 的消息（role 可以是 user 或 tool）
+                if msg.get("_type") == MT.TOOL_RESULT:
                     if _get_message_char_count(msg) > COMPACT_MIN_CHARS:
                         summary = self._generate_summary(msg, estimated_turn, ctx.call_registry)
                         if summary:
@@ -368,9 +401,9 @@ class ObservationMaskingStrategy(WindowStrategy):
 
             if role == "assistant":
                 estimated_turn += 1
-            elif role == "user" and estimated_turn > 0 and estimated_turn <= cutoff_turn:
-                content = msg.get("content")
-                if not _is_system_message(content) and not _is_offloaded(content):
+            elif estimated_turn > 0 and estimated_turn <= cutoff_turn:
+                # 白名单：只收集显式标记为 TOOL_RESULT 的消息（role 可以是 user 或 tool）
+                if msg.get("_type") == MT.TOOL_RESULT and not _is_offloaded(msg):
                     char_count = _get_message_char_count(msg)
                     if char_count > COMPACT_MIN_CHARS:
                         candidates.append((i, estimated_turn, char_count))
@@ -475,7 +508,7 @@ class SessionMemoryCompactStrategy(WindowStrategy):
                 estimated_turn += 1
 
             if estimated_turn > 0 and estimated_turn <= cutoff_turn:
-                if not _is_system_message(msg.get("content")):
+                if not _is_protected_message(msg):
                     old_indices.append(i)
             elif estimated_turn > cutoff_turn:
                 break
@@ -489,8 +522,11 @@ class SessionMemoryCompactStrategy(WindowStrategy):
                 messages.pop(idx)
 
         # 插入 session memory 摘要
+        from mem_deep_research_core.core.constants import MT
+
         summary_msg = {
             "role": "user",
+            "_type": MT.CONTEXT_SUMMARY,
             "content": [
                 {
                     "type": "text",
@@ -606,8 +642,11 @@ class LLMSummarizeStrategy(WindowStrategy):
                     messages.pop(1)
 
             # 插入新 summary
+            from mem_deep_research_core.core.constants import MT
+
             summary_msg = {
                 "role": "user",
+                "_type": MT.CONTEXT_SUMMARY,
                 "content": [
                     {
                         "type": "text",

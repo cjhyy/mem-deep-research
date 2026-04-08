@@ -13,7 +13,7 @@ from collections.abc import Callable
 from typing import Any
 
 from mem_deep_research_core.core.constants import TOOL_TRANSIENT_ERRORS
-from mem_deep_research_core.core.hooks import HookContext, hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.secure_context import resolve_placeholders_in_args
 from mem_deep_research_core.core.tool_result_formatter import ToolResultFormatter
 from mem_deep_research_core.tool.manager import ToolManager
@@ -35,10 +35,6 @@ def _default_on_tool_end(ctx: HookContext):
     return ctx.tool_result
 
 
-hooks.set_default("on_tool_start", _default_on_tool_start)
-hooks.set_default("on_tool_end", _default_on_tool_end)
-
-
 class ToolExecutor:
     """工具调用执行器"""
 
@@ -53,6 +49,8 @@ class ToolExecutor:
         stream_usage_info: Callable | None = None,
         retry_max: int = 2,
         retry_backoff_base: float = 1.0,
+        *,
+        hook_registry: HookRegistry,
     ):
         """
         初始化工具执行器
@@ -67,6 +65,7 @@ class ToolExecutor:
             stream_usage_info: 流式使用信息回调
             retry_max: 瞬态错误最大重试次数
             retry_backoff_base: 重试退避基数(秒)
+            hook_registry: HookRegistry 实例（必传）
         """
         self.tool_manager = tool_manager
         self.output_formatter = output_formatter
@@ -77,6 +76,7 @@ class ToolExecutor:
         self.stream_usage_info = stream_usage_info
         self.retry_max = retry_max
         self.retry_backoff_base = retry_backoff_base
+        self._hooks = hook_registry
 
         # Scrape 结果最大长度
         self.scrape_max_length = 20000
@@ -177,7 +177,7 @@ class ToolExecutor:
 
             # Hook: on_tool_start — 可修改 arguments（深拷贝防止污染原始记录）
             arguments = copy.deepcopy(arguments)
-            modified = hooks.call(
+            modified = self._hooks.call(
                 "on_tool_start",
                 HookContext(
                     hook_name="on_tool_start",
@@ -200,7 +200,7 @@ class ToolExecutor:
             tool_result = self._post_process_tool_result(tool_name, tool_result)
 
             # Hook: on_tool_end — 可修改 tool_result
-            modified_result = hooks.call(
+            modified_result = self._hooks.call(
                 "on_tool_end",
                 HookContext(
                     hook_name="on_tool_end",

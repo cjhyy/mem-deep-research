@@ -218,56 +218,34 @@ class LLMProviderClientBase(ABC):
         pass
 
     def _remove_tool_result_from_messages(self, messages, keep_tool_result):
-        """Remove tool results from messages"""
+        """Remove tool results from messages.
+
+        Only touches messages with _type=MT.TOOL_RESULT.
+        Messages without _type (legacy) or with other types are never modified.
+        """
+        from mem_deep_research_core.core.constants import MT
+
         messages_copy = [m.copy() for m in messages]
         if keep_tool_result >= 0:
-            # Find indices of all user messages
-            user_indices = [
-                i
-                for i, msg in enumerate(messages_copy)
-                if msg.get("role") == "user" or msg.get("role") == "tool"
+            tool_result_indices = [
+                i for i, msg in enumerate(messages_copy)
+                if msg.get("_type") == MT.TOOL_RESULT
             ]
 
-            if len(user_indices) > 1:  # Only proceed if there are more than one user message
-                first_user_idx = user_indices[0]  # Always keep the first user message
-
-                # Calculate how many messages to keep from the end
-                # If keep_tool_result is 0, we only keep the first message
+            if tool_result_indices:
                 num_to_keep = (
-                    0 if keep_tool_result == 0 else min(keep_tool_result, len(user_indices) - 1)
+                    0 if keep_tool_result == 0 else min(keep_tool_result, len(tool_result_indices))
                 )
+                indices_to_keep = set(tool_result_indices[-num_to_keep:]) if num_to_keep > 0 else set()
 
-                # Get indices of messages to keep from the end
-                last_indices_to_keep = user_indices[-num_to_keep:] if num_to_keep > 0 else []
-
-                # Combine first message and last k messages
-                indices_to_keep = [first_user_idx] + last_indices_to_keep
-
-                logger.debug("\n=======>>>>>> Message retention summary:")
-                logger.debug(f"Total user messages: {len(user_indices)}")
-                logger.debug(f"Keeping first message at index: {first_user_idx}")
                 logger.debug(
-                    f"Keeping last {num_to_keep} messages at indices: {last_indices_to_keep}"
+                    f"[keep_tool_result] {len(tool_result_indices)} tool results found, "
+                    f"keeping {num_to_keep}, omitting {len(tool_result_indices) - num_to_keep}"
                 )
-                logger.debug(f"Total messages to keep: {len(indices_to_keep)}")
 
-                for i, msg in enumerate(messages_copy):
-                    if (
-                        msg.get("role") == "user" or msg.get("role") == "tool"
-                    ) and i not in indices_to_keep:
-                        logger.debug(f"Omitting content for user message at index {i}")
-                        msg["content"] = "Tool result is omitted to save tokens."
-            elif user_indices:  # This means only 1 user message exists
-                logger.debug("\n=======>>>>>> Only 1 user message found. Keeping it as is.")
-            else:  # No user messages at all
-                logger.debug("\n=======>>>>>> No user messages found in the history.")
-
-            logger.debug(
-                f"\n\n=======>>>>>> Messages after potential content omission: {json.dumps(messages_copy, indent=4, ensure_ascii=False)}\n\n"
-            )
-        elif keep_tool_result == -1:
-            # No processing
-            pass
+                for i in tool_result_indices:
+                    if i not in indices_to_keep:
+                        messages_copy[i]["content"] = "Tool result is omitted to save tokens."
 
         return messages_copy
 
@@ -285,15 +263,13 @@ class LLMProviderClientBase(ABC):
         """
         Call LLM to generate response, supports tool calls - unified implementation
         """
-        # Filter message history
-        filtered_history = self._filter_message_history(message_history, keep_tool_result)
-
         response = None
 
         # Unified LLM call handling
+        # Note: _remove_tool_result_from_messages() is called inside each provider's _create_message()
         response = await self._create_message(
             system_prompt,
-            filtered_history,
+            message_history,
             tool_definitions,
             keep_tool_result=keep_tool_result,
             stream_message_callback=stream_message_callback,
@@ -362,29 +338,6 @@ class LLMProviderClientBase(ABC):
             logger.debug(f"LLMClient closed (async) for task_id={self.task_id}")
         except Exception as e:
             logger.warning(f"Error closing LLM client (async): {e}")
-
-    def _filter_message_history(
-        self, message_history: list[dict], keep_tool_result: int
-    ) -> list[dict]:
-        """Filter message history, keep specified number of tool results.
-
-        Always preserves the first user message (task description) to maintain context.
-        """
-        if keep_tool_result == -1:
-            return message_history
-
-        if keep_tool_result > 0 and len(message_history) > keep_tool_result:
-            # 保留首条 user 消息（任务描述）+ 最近 N 条消息
-            first_user_msg = None
-            for msg in message_history:
-                if msg.get("role") == "user":
-                    first_user_msg = msg
-                    break
-            tail = message_history[-keep_tool_result:]
-            if first_user_msg and first_user_msg not in tail:
-                return [first_user_msg] + tail
-            return tail
-        return message_history
 
     def _format_response_for_log(self, response) -> dict:
         """Format response for logging"""

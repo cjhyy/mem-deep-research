@@ -129,6 +129,8 @@ class HookRegistry:
         # 存储
         "on_result_offload",  # 大结果卸载 (可覆盖存储后端: 文件/内存/S3/Redis)
         "on_result_restore",  # 卸载结果恢复 (可覆盖读取后端)
+        # 输入编译
+        "on_query_compile",  # 用户 query 编译后 (可修改 query / 追加 attachments)
     ]
 
     def __init__(self):
@@ -350,7 +352,7 @@ def on_reflection_build(priority: int = 0):
 # ============================================================
 
 
-def load_project_hooks(project_dir: str) -> None:
+def load_project_hooks(project_dir: str, hook_registry: HookRegistry | None = None) -> None:
     """
     从项目目录加载钩子定义
 
@@ -359,13 +361,16 @@ def load_project_hooks(project_dir: str) -> None:
 
     Args:
         project_dir: 项目目录路径
+        hook_registry: 目标 HookRegistry 实例。为 None 时使用全局 hooks。
     """
     import importlib.util
     import sys
     from pathlib import Path
 
+    target = hook_registry if hook_registry is not None else hooks
+
     # Clear previously registered project hooks to avoid cross-project pollution
-    hooks.clear()
+    target.clear()
 
     hooks_file = Path(project_dir) / "hooks.py"
     if not hooks_file.exists():
@@ -373,15 +378,32 @@ def load_project_hooks(project_dir: str) -> None:
         return
 
     try:
-        spec = importlib.util.spec_from_file_location("project_hooks", hooks_file)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load hooks from {hooks_file}")
+        # 如果目标不是全局 hooks，临时替换全局 hooks，
+        # 使项目 hooks.py 中的 `from ...hooks import hooks; @hooks.register(...)` 注册到目标实例
+        _swapped = False
+        _original_hooks = None
+        if target is not hooks:
+            import mem_deep_research_core.core.hooks as _self_module
 
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["project_hooks"] = module
-        spec.loader.exec_module(module)
+            _original_hooks = _self_module.hooks
+            _self_module.hooks = target
+            _swapped = True
 
-        logger.info(f"[Hooks] Loaded project hooks from {hooks_file}")
-        logger.info(f"[Hooks] Registered hooks: {hooks.list_hooks()}")
+        try:
+            spec = importlib.util.spec_from_file_location("project_hooks", hooks_file)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load hooks from {hooks_file}")
+
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["project_hooks"] = module
+            spec.loader.exec_module(module)
+
+            logger.info(f"[Hooks] Loaded project hooks from {hooks_file}")
+            logger.info(f"[Hooks] Registered hooks: {target.list_hooks()}")
+        finally:
+            if _swapped and _original_hooks is not None:
+                import mem_deep_research_core.core.hooks as _self_module
+
+                _self_module.hooks = _original_hooks
     except Exception as e:
         logger.warning(f"[Hooks] Failed to load project hooks: {e}")

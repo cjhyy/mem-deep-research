@@ -187,8 +187,11 @@ class TodoTracker:
 
         self._last_injected_turn = turn
 
+        from mem_deep_research_core.core.constants import MT
+
         return {
             "role": "user",
+            "_type": MT.TASK_PROGRESS,
             "content": [{"type": "text", "text": "\n".join(lines)}],
         }
 

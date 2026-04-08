@@ -37,12 +37,12 @@ from mem_deep_research_core.core.constants import (
     SUB_AGENT_PREFIX,
     TAG_COLLECTED_SOURCES,
     TAG_TASK_PLAN,
+    MT,
     TOKEN_BUDGET_HARD_RATIO,
     TOKEN_BUDGET_WARNING_RATIO,
     generate_message_id,
 )
-from mem_deep_research_core.core.hooks import HookContext
-from mem_deep_research_core.core.hooks import hooks as _default_hooks
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.llm_call_handler import generate_reflection_prompt
 from mem_deep_research_core.core.memory import SessionMemory
 from mem_deep_research_core.core.monitoring import (
@@ -100,8 +100,8 @@ class MainLoopContext:
     # Current spawn nesting depth (0 = main agent, increments per spawn)
     spawn_depth: int = 0
 
-    # HookRegistry instance (defaults to module-level singleton for backward compat)
-    hooks: Any = None  # Set to _default_hooks in MainLoopRunner.__init__ if None
+    # HookRegistry instance (必传，由 Orchestrator 注入)
+    hooks: Any = None
 
     # DeferredToolManager instance (optional, for lazy tool schema loading)
     deferred_tool_manager: Any = None
@@ -255,7 +255,9 @@ class MainLoopRunner:
 
         self.long_term_memory = ctx.long_term_memory
         self.spawn_depth = ctx.spawn_depth
-        self.hooks = ctx.hooks or _default_hooks
+        if ctx.hooks is None:
+            raise ValueError("MainLoopContext.hooks is required — pass a HookRegistry instance")
+        self.hooks = ctx.hooks
         self.deferred_tool_manager = ctx.deferred_tool_manager
         self.transcript = ctx.transcript
         self.file_state_cache = ctx.file_state_cache
@@ -389,10 +391,28 @@ class MainLoopRunner:
                     line = line.strip().lstrip("- ")
                     if line:
                         self.session_memory.add_finding(line)
+            # Restore todo tracker state
+            todo_state = resume_from.get("todo_state")
+            if todo_state and self.todo_tracker is not None:
+                from mem_deep_research_core.core.todo_tracker import TodoTracker
+
+                self.todo_tracker = TodoTracker.from_dict(
+                    todo_state, enabled=self.todo_tracker.enabled
+                )
+                logger.info(
+                    f"[Resume] Restored todo tracker: {len(self.todo_tracker._items)} items"
+                )
+
+            # Restore offloaded content (replace previews with full text)
+            restored = self.context_manager.restore_offloaded_content(message_history)
+            if restored > 0:
+                logger.info(f"[Resume] Restored {restored} offloaded results")
+
             # Inject resume notice into conversation
             message_history.append(
                 {
                     "role": "user",
+                    "_type": MT.RESUME_NOTICE,
                     "content": [
                         {
                             "type": "text",
@@ -459,6 +479,7 @@ class MainLoopRunner:
                 message_history.append(
                     {
                         "role": "user",
+                        "_type": MT.LONG_TERM_MEMORY,
                         "content": [
                             {
                                 "type": "text",
@@ -514,6 +535,7 @@ class MainLoopRunner:
                 message_history.append(
                     {
                         "role": "user",
+                        "_type": MT.PLAN,
                         "content": [
                             {"type": "text", "text": f"{TAG_TASK_PLAN}\n{plan.to_context_string()}"}
                         ],
@@ -564,10 +586,15 @@ class MainLoopRunner:
             if not self.session_memory.is_empty():
                 memory_msg = {
                     "role": "user",
+                    "_type": MT.SESSION_MEMORY,
                     "content": [{"type": "text", "text": self.session_memory.to_context_string()}],
                 }
                 # Replace previous session memory message (avoid duplicates)
                 for i in range(len(message_history) - 1, -1, -1):
+                    if message_history[i].get("_type") == MT.SESSION_MEMORY:
+                        message_history.pop(i)
+                        break
+                    # Fallback: keyword match for untyped messages
                     content = message_history[i].get("content", "")
                     if isinstance(content, list) and content:
                         text = content[0].get("text", "") if isinstance(content[0], dict) else ""
@@ -590,6 +617,7 @@ class MainLoopRunner:
                 message_history.append(
                     {
                         "role": "user",
+                        "_type": MT.TOKEN_WARNING,
                         "content": [
                             {
                                 "type": "text",
@@ -652,6 +680,7 @@ class MainLoopRunner:
                     message_history.append(
                         {
                             "role": "user",
+                            "_type": MT.TOKEN_WARNING,
                             "content": [
                                 {
                                     "type": "text",
@@ -694,6 +723,7 @@ class MainLoopRunner:
                 message_history.append(
                     {
                         "role": "user",
+                        "_type": MT.TRUNCATION_RECOVERY,
                         "content": [
                             {
                                 "type": "text",
@@ -741,7 +771,7 @@ class MainLoopRunner:
                     chinese=self.chinese_context,
                 )
                 message_history.append(
-                    {"role": "user", "content": [{"type": "text", "text": hint_text}]}
+                    {"role": "user", "_type": MT.LOOP_HINT, "content": [{"type": "text", "text": hint_text}]}
                 )
                 temp_boost = getattr(
                     self.monitor.config, "temperature_boost", DEFAULT_TEMPERATURE_BOOST
@@ -767,34 +797,39 @@ class MainLoopRunner:
                             sc = self.skill_commands.get(skill_name)
                             if not sc:
                                 continue
-                            if sc.context_mode == "fork":
-                                # Fork: spawn 子 agent 执行
-                                fork_result = await self._run_fork_skill(sc)
-                                message_history.append(
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {
-                                                "type": "text",
-                                                "text": f"[Skill Result: {skill_name}]\n{fork_result}",
-                                            }
-                                        ],
-                                    }
+                            try:
+                                if sc.context_mode == "fork":
+                                    # Fork: spawn 子 agent 执行
+                                    fork_result = await self._run_fork_skill(sc)
+                                    message_history.append(
+                                        {
+                                            "role": "user",
+                                            "_type": MT.INLINE_SKILL,
+                                            "content": [
+                                                {
+                                                    "type": "text",
+                                                    "text": f"[Skill Result: {skill_name}]\n{fork_result}",
+                                                }
+                                            ],
+                                        }
+                                    )
+                                    logger.info(f"[InlineSkill] Fork skill '{skill_name}' completed")
+                                else:
+                                    # Inline: 渲染 prompt，注入 meta message
+                                    rendered = await sc.get_prompt()
+                                    message_history.append(
+                                        {
+                                            "role": "user",
+                                            "_type": MT.INLINE_SKILL,
+                                            "content": [{"type": "text", "text": rendered}],
+                                            "_meta": True,
+                                        }
+                                    )
+                                    logger.info(
+                                        f"[InlineSkill] Injected meta message for skill '{skill_name}'"
                                 )
-                                logger.info(f"[InlineSkill] Fork skill '{skill_name}' completed")
-                            else:
-                                # Inline: 渲染 prompt，注入 meta message
-                                rendered = await sc.get_prompt()
-                                message_history.append(
-                                    {
-                                        "role": "user",
-                                        "content": [{"type": "text", "text": rendered}],
-                                        "_meta": True,
-                                    }
-                                )
-                                logger.info(
-                                    f"[InlineSkill] Injected meta message for skill '{skill_name}'"
-                                )
+                            except Exception as e:
+                                logger.error(f"[InlineSkill] Skill '{skill_name}' failed: {e}")
                     else:
                         # 传统模式: 修改 system prompt
                         system_prompt = self.inline_skill_selector.inject_pending_skills(
@@ -1077,6 +1112,7 @@ class MainLoopRunner:
                     message_history.append(
                         {
                             "role": "user",
+                            "_type": MT.CONTEXT_COMPRESSION,
                             "content": [{"type": "text", "text": CONTEXT_COMPRESSION_NOTICE}],
                         }
                     )
@@ -1144,7 +1180,7 @@ class MainLoopRunner:
                         reflection_prompt = modified_prompt
 
                 message_history.append(
-                    {"role": "user", "content": [{"type": "text", "text": reflection_prompt}]}
+                    {"role": "user", "_type": MT.REFLECTION, "content": [{"type": "text", "text": reflection_prompt}]}
                 )
                 self.task_log.log_step(
                     "reflection_checkpoint", f"Injected at turn {turn_count}", "info"
@@ -1219,6 +1255,7 @@ class MainLoopRunner:
             message_history.append(
                 {
                     "role": "user",
+                    "_type": MT.CITATION_SUMMARY,
                     "content": [
                         {
                             "type": "text",
