@@ -48,6 +48,9 @@ class ConfigLoader:
     """
 
     def __init__(self):
+        import threading
+
+        self._lock = threading.Lock()
         self._skill_injector: Any | None = None
         self._skill_injector_initialized = False
         self._llm_skill_selector: Any | None = None
@@ -58,33 +61,37 @@ class ConfigLoader:
 
     def reset(self) -> None:
         """Reset all cached state for a fresh start."""
-        self._skill_injector = None
-        self._skill_injector_initialized = False
-        self._llm_skill_selector = None
-        self._llm_skill_selector_initialized = False
-        self._project_dir = None
-        self._extra_skill_dirs = []
-        self._skill_commands = {}
-
-    def set_project_dir(self, project_dir: str | Path | None) -> None:
-        """设置项目目录，用于加载项目级别的工具配置
-
-        Args:
-            project_dir: 项目目录路径，设置为 None 清除
-        """
-        new_dir = Path(project_dir) if project_dir is not None else None
-        if new_dir != self._project_dir:
-            # Project changed — invalidate cached skills/selectors
+        with self._lock:
             self._skill_injector = None
             self._skill_injector_initialized = False
             self._llm_skill_selector = None
             self._llm_skill_selector_initialized = False
-        if new_dir is not None:
-            self._project_dir = new_dir
-            logger.info(f"[ConfigLoader] Project directory set to: {self._project_dir}")
-        else:
             self._project_dir = None
-            logger.info("[ConfigLoader] Project directory cleared")
+            self._extra_skill_dirs = []
+            self._skill_commands = {}
+
+    def set_project_dir(self, project_dir: str | Path | None) -> None:
+        """设置项目目录，用于加载项目级别的工具配置
+
+        线程安全：通过锁保护缓存失效。
+
+        Args:
+            project_dir: 项目目录路径，设置为 None 清除
+        """
+        with self._lock:
+            new_dir = Path(project_dir) if project_dir is not None else None
+            if new_dir != self._project_dir:
+                # Project changed — invalidate cached skills/selectors
+                self._skill_injector = None
+                self._skill_injector_initialized = False
+                self._llm_skill_selector = None
+                self._llm_skill_selector_initialized = False
+            if new_dir is not None:
+                self._project_dir = new_dir
+                logger.info(f"[ConfigLoader] Project directory set to: {self._project_dir}")
+            else:
+                self._project_dir = None
+                logger.info("[ConfigLoader] Project directory cleared")
 
     def get_project_dir(self) -> Path | None:
         """获取当前项目目录"""
@@ -221,37 +228,42 @@ class ConfigLoader:
         Returns:
             SkillInjector 实例，如果有 skills 的话
         """
+        # Fast path (no lock)
         if self._skill_injector_initialized:
             return self._skill_injector
 
-        self._skill_injector_initialized = True
-
-        try:
-            from mem_deep_research_core.skills import SkillInjector, SkillMatcher
-            from mem_deep_research_core.skills.skill_loader import SkillLoader
-
-            # 使用 SkillLoader 统一扫描所有目录
-            loader = SkillLoader(
-                framework_dir=CONFIG_DIR.parent,
-                project_dir=self._project_dir,
-                extra_dirs=[Path(d) for d in self._extra_skill_dirs],
-            )
-            skill_commands = loader.load_all()
-            self._skill_commands = skill_commands
-
-            # 创建 SkillMatcher（用框架 skills 目录初始化，合并 Claude Code skills）
-            framework_skills_dir = CONFIG_DIR / "skills"
-            matcher = SkillMatcher(
-                framework_skills_dir,
-                extra_skill_commands=skill_commands,
-            )
-
-            if matcher.skills:
-                self._skill_injector = SkillInjector(matcher)
+        # Double-check locking: set flag AFTER initialization completes
+        with self._lock:
+            if self._skill_injector_initialized:
                 return self._skill_injector
 
-        except Exception as e:
-            logger.warning(f"Failed to load skill injector: {e}")
+            try:
+                from mem_deep_research_core.skills import SkillInjector, SkillMatcher
+                from mem_deep_research_core.skills.skill_loader import SkillLoader
+
+                # 使用 SkillLoader 统一扫描所有目录
+                loader = SkillLoader(
+                    framework_dir=CONFIG_DIR.parent,
+                    project_dir=self._project_dir,
+                    extra_dirs=[Path(d) for d in self._extra_skill_dirs],
+                )
+                skill_commands = loader.load_all()
+                self._skill_commands = skill_commands
+
+                # 创建 SkillMatcher（用框架 skills 目录初始化，合并 Claude Code skills）
+                framework_skills_dir = CONFIG_DIR / "skills"
+                matcher = SkillMatcher(
+                    framework_skills_dir,
+                    extra_skill_commands=skill_commands,
+                )
+
+                if matcher.skills:
+                    self._skill_injector = SkillInjector(matcher)
+
+            except Exception as e:
+                logger.warning(f"Failed to load skill injector: {e}")
+            finally:
+                self._skill_injector_initialized = True
 
         return None
 
@@ -277,55 +289,59 @@ class ConfigLoader:
         if self._llm_skill_selector_initialized:
             return self._llm_skill_selector
 
-        self._llm_skill_selector_initialized = True
+        with self._lock:
+            if self._llm_skill_selector_initialized:
+                return self._llm_skill_selector
 
-        try:
-            import os
+            try:
+                import os
 
-            from mem_deep_research_core.skills import LLMSkillSelector
+                from mem_deep_research_core.skills import LLMSkillSelector
 
-            # 检查 skill_selection 配置
-            skill_selection_cfg = cfg.main_agent.get("skill_selection", {})
-            if not skill_selection_cfg.get("enabled", True):
-                logger.info("[ConfigLoader] LLM skill selection is disabled")
-                return None
+                # 检查 skill_selection 配置
+                skill_selection_cfg = cfg.main_agent.get("skill_selection", {})
+                if not skill_selection_cfg.get("enabled", True):
+                    logger.info("[ConfigLoader] LLM skill selection is disabled")
+                    return None
 
-            # 获取 API key
-            api_key = cfg.main_agent.get("openai_api_key")
-            if not api_key:
-                logger.info("[ConfigLoader] No openai_api_key, LLM skill selector not available")
-                return None
+                # 获取 API key
+                api_key = cfg.main_agent.get("openai_api_key")
+                if not api_key:
+                    logger.info("[ConfigLoader] No openai_api_key, LLM skill selector not available")
+                    return None
 
-            # 获取已初始化的 skill injector 来取 matcher
-            injector = self.get_skill_injector()
-            if not injector:
-                logger.info(
-                    "[ConfigLoader] No skill injector available, LLM skill selector not created"
+                # 获取已初始化的 skill injector 来取 matcher
+                injector = self.get_skill_injector()
+                if not injector:
+                    logger.info(
+                        "[ConfigLoader] No skill injector available, LLM skill selector not created"
+                    )
+                    return None
+
+                base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+                model = skill_selection_cfg.get("model", "gpt-4o-mini")
+                max_skills = skill_selection_cfg.get("max_skills", 3)
+                fallback_to_rules = skill_selection_cfg.get("fallback_to_rules", True)
+
+                self._llm_skill_selector = LLMSkillSelector(
+                    matcher=injector.matcher,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    max_skills=max_skills,
+                    fallback_to_rules=fallback_to_rules,
                 )
-                return None
+                logger.info(
+                    f"[ConfigLoader] LLM skill selector initialized (model={model}, "
+                    f"max_skills={max_skills}, fallback={fallback_to_rules})"
+                )
 
-            base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-            model = skill_selection_cfg.get("model", "gpt-4o-mini")
-            max_skills = skill_selection_cfg.get("max_skills", 3)
-            fallback_to_rules = skill_selection_cfg.get("fallback_to_rules", True)
+            except Exception as e:
+                logger.warning(f"Failed to create LLM skill selector: {e}")
+            finally:
+                self._llm_skill_selector_initialized = True
 
-            self._llm_skill_selector = LLMSkillSelector(
-                matcher=injector.matcher,
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                max_skills=max_skills,
-                fallback_to_rules=fallback_to_rules,
-            )
-            logger.info(
-                f"[ConfigLoader] LLM skill selector initialized (model={model}, "
-                f"max_skills={max_skills}, fallback={fallback_to_rules})"
-            )
             return self._llm_skill_selector
-
-        except Exception as e:
-            logger.warning(f"Failed to create LLM skill selector: {e}")
-            return None
 
     def get_inline_skill_selector(self, cfg, chinese: bool = False) -> Any | None:
         """

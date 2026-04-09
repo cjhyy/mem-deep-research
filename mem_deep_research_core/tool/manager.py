@@ -194,7 +194,8 @@ class ToolManager(ToolManagerProtocol):
         self._persistent_sessions: dict[str, ClientSession] = {}
         self._session_transports: dict[str, tuple] = {}  # store (read, write) or similar
         self._exit_stack = contextlib.AsyncExitStack()
-        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}  # Guards session creation
+        self._call_locks: dict[str, asyncio.Lock] = {}  # Guards call_tool per-server (stdio not concurrent-safe)
         self._global_lock = asyncio.Lock()
 
         logger.info(f"ToolManager initialized, loaded servers: {list(self.server_dict.keys())}")
@@ -248,7 +249,19 @@ class ToolManager(ToolManagerProtocol):
                 self._session_locks[server_name] = asyncio.Lock()
             return self._session_locks[server_name]
 
-    async def _get_or_create_session(self, server_name: str) -> tuple[ClientSession, bool]:
+    async def _get_call_lock(self, server_name: str) -> asyncio.Lock:
+        """Get or create a per-server lock for serializing call_tool on stdio sessions.
+
+        MCP stdio sessions communicate over a single stdin/stdout pipe and are NOT
+        concurrent-safe. This lock ensures only one call_tool runs at a time per server.
+        HTTP/SSE transports could skip this, but the overhead is negligible.
+        """
+        async with self._global_lock:
+            if server_name not in self._call_locks:
+                self._call_locks[server_name] = asyncio.Lock()
+            return self._call_locks[server_name]
+
+    async def _get_or_create_session(self, server_name: str, context: dict[str, Any] | None = None) -> tuple[ClientSession, bool]:
         """Get an existing persistent session or create a new one.
 
         Supports stdio, streamable-http, and sse transports.
@@ -308,7 +321,8 @@ class ToolManager(ToolManagerProtocol):
 
             try:
                 if isinstance(server_params, StdioServerParameters):
-                    updated_params = update_server_params_with_context(server_params, self._context, hook_registry=self._hook_registry)
+                    effective_ctx = context or self._context or {}
+                    updated_params = update_server_params_with_context(server_params, effective_ctx, hook_registry=self._hook_registry)
                     transport_ctx = stdio_client(updated_params)
                     read, write = await self._exit_stack.enter_async_context(transport_ctx)
                 elif isinstance(server_params, str) and server_params.startswith(
@@ -718,9 +732,12 @@ class ToolManager(ToolManagerProtocol):
                 # Use persistent session pool
                 import time as _time
 
+                # Per-server call lock: MCP stdio sessions are NOT concurrent-safe
+                call_lock = await self._get_call_lock(server_name)
+
                 try:
                     _perf_sess_start = _time.perf_counter()
-                    session, was_cached = await self._get_or_create_session(server_name)
+                    session, was_cached = await self._get_or_create_session(server_name, context=effective_context)
                     _perf_sess_elapsed = _time.perf_counter() - _perf_sess_start
                     logger.info(
                         f"[Perf] Session for '{server_name}': "
@@ -728,9 +745,10 @@ class ToolManager(ToolManagerProtocol):
                     )
                     _perf_call_start = _time.perf_counter()
                     try:
-                        tool_result = await session.call_tool(
-                            tool_name, arguments=enriched_arguments
-                        )
+                        async with call_lock:
+                            tool_result = await session.call_tool(
+                                tool_name, arguments=enriched_arguments
+                            )
                         result_content = self._extract_tool_result(
                             tool_name, tool_result, arguments
                         )
@@ -741,10 +759,11 @@ class ToolManager(ToolManagerProtocol):
                         )
                         await self._invalidate_session(server_name)
                         try:
-                            session, _ = await self._get_or_create_session(server_name)
-                            tool_result = await session.call_tool(
-                                tool_name, arguments=enriched_arguments
-                            )
+                            session, _ = await self._get_or_create_session(server_name, context=effective_context)
+                            async with call_lock:
+                                tool_result = await session.call_tool(
+                                    tool_name, arguments=enriched_arguments
+                                )
                             result_content = self._extract_tool_result(
                                 tool_name, tool_result, arguments
                             )

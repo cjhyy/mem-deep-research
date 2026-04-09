@@ -8,6 +8,7 @@
 import logging
 from typing import Any
 
+from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.constants import FALLBACK_NO_ANSWER
 from mem_deep_research_core.mem_deep_research_logging.logger import truncate_for_log
 from mem_deep_research_core.mem_deep_research_logging.task_tracer import TaskTracer
@@ -27,6 +28,8 @@ async def post_process_final_answer(
     output_formatter: OutputFormatter,
     llm_client: Any,
     is_simple_response: bool = False,
+    context: dict[str, Any] | None = None,
+    hooks: HookRegistry | None = None,
 ) -> tuple[str, str]:
     """后处理最终答案
 
@@ -35,10 +38,40 @@ async def post_process_final_answer(
     """
     if final_answer_text:
         task_log.log_step("final_answer", "Final answer extracted successfully")
-        task_log.log_step("final_answer_content", f"Content: {final_answer_text}")
     else:
         final_answer_text = FALLBACK_NO_ANSWER
         task_log.log_step("final_answer", "Failed to extract final answer", "failed")
+
+    if hooks is not None and hooks.has_hooks("on_final_answer"):
+        original_text = final_answer_text
+        hook_result = hooks.call(
+            "on_final_answer",
+            HookContext(
+                hook_name="on_final_answer",
+                query=task_description,
+                result=final_answer_text,
+                context=context,
+                extra={
+                    "message_history": message_history,
+                    "system_prompt": system_prompt,
+                    "chinese_context": chinese_context,
+                    "is_simple_response": is_simple_response,
+                    "cfg": cfg,
+                    "llm_client": llm_client,
+                    "task_log": task_log,
+                },
+            ),
+        )
+        if isinstance(hook_result, str):
+            final_answer_text = hook_result
+        task_log.log_step(
+            "final_answer_hook",
+            "Applied on_final_answer hook"
+            if final_answer_text == original_text
+            else "Applied on_final_answer hook and updated final answer",
+        )
+
+    task_log.log_step("final_answer_content", f"Content: {final_answer_text}")
 
     logger.debug(f"LLM Final Answer: {truncate_for_log(final_answer_text)}")
 

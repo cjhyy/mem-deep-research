@@ -531,6 +531,44 @@ class TestAnswerHandler:
         call_args = formatter.format_final_summary_and_log.call_args
         assert call_args[0][0] == FALLBACK_NO_ANSWER
 
+    @pytest.mark.asyncio
+    async def test_final_answer_hook_can_override_answer(self):
+        """on_final_answer hook should run before final formatting."""
+        cfg = OmegaConf.create(
+            {
+                "main_agent": {
+                    "output_process": {
+                        "final_answer_extraction": False,
+                    }
+                }
+            }
+        )
+
+        formatter = _make_mock_output_formatter()
+        task_log = _make_mock_task_log()
+        registry = HookRegistry()
+
+        def final_answer_hook(ctx, original_fn):
+            return f"[Judged] {ctx.result}"
+
+        registry.register_fn("on_final_answer", final_answer_hook)
+
+        await post_process_final_answer(
+            cfg=cfg,
+            final_answer_text="The answer is 42.",
+            task_description="What is the answer?",
+            message_history=[],
+            system_prompt="sys",
+            chinese_context=False,
+            task_log=task_log,
+            output_formatter=formatter,
+            llm_client=MagicMock(),
+            hooks=registry,
+        )
+
+        call_args = formatter.format_final_summary_and_log.call_args
+        assert call_args[0][0] == "[Judged] The answer is 42."
+
 
 # ============================================================
 # Task Planner Integration Tests

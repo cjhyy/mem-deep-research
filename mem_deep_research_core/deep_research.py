@@ -278,14 +278,7 @@ class DeepResearch:
         rt.set_project_dir(str(project_dir))
 
         # 加载项目钩子到实例级 hook_registry
-        from mem_deep_research_core.core.hooks import load_project_hooks
-
-        load_project_hooks(str(project_dir), hook_registry=rt.hooks)
-
-        # 同时更新全局单例以保持向后兼容（单实例场景）
-        from mem_deep_research_core.utils.external_loader import external_loader
-
-        external_loader.set_project_dir(project_dir)
+        rt.load_project_hooks(str(project_dir))
 
         return cls.from_config_dir(config_dir, config_name, logs_dir, runtime=rt)
 

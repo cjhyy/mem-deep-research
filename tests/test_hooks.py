@@ -248,3 +248,16 @@ class TestNewHooks:
             HookContext(hook_name="on_tool_filter", tool_calls_batch=[{"tool_name": "a"}]),
         )
         assert result is None
+
+    def test_on_final_answer(self, registry):
+        """on_final_answer 可改写最终答案文本"""
+
+        def final_answer_hook(ctx, original_fn):
+            return ctx.result + " [reviewed]"
+
+        registry.register_fn("on_final_answer", final_answer_hook)
+        result = registry.call(
+            "on_final_answer",
+            HookContext(hook_name="on_final_answer", result="Base answer"),
+        )
+        assert result == "Base answer [reviewed]"

@@ -283,9 +283,8 @@ class LongTermMemory:
         Returns:
             匹配的记忆条目列表
         """
-        self._ensure_loaded()
-
         with self._lock:
+            self._ensure_loaded()
             candidates = list(self._entries)  # Copy under lock to avoid race
 
         # Metadata filter
@@ -344,8 +343,8 @@ class LongTermMemory:
 
     def list_all(self) -> list[MemoryEntry]:
         """列出所有记忆"""
-        self._ensure_loaded()
         with self._lock:
+            self._ensure_loaded()
             return list(self._entries)
 
     def deduplicate(self):

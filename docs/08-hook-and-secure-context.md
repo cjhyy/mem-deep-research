@@ -16,6 +16,7 @@ HookRegistry 是全局单例，支持在 Agent 生命周期的关键节点注入
 | `on_turn_end` | 每轮结束 | — |
 | `on_tool_start` | 工具调用前 | arguments |
 | `on_tool_end` | 工具调用后 | tool_result |
+| `on_final_answer` | 最终答案后处理 | 返回值（str） |
 | `on_tool_result_format` | 结果格式化 | 返回值 |
 | `on_thinking_generate` | thinking 描述生成 | 返回值 |
 | `on_env_inject` | MCP 环境变量注入 | server_params |

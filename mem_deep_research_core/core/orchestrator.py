@@ -681,6 +681,8 @@ class Orchestrator:
             output_formatter=self.output_formatter,
             llm_client=self.llm_client,
             is_simple_response=is_simple_response,
+            context=self.context,
+            hooks=self._hooks,
         )
         self.task_log.record_perf("post_process_duration", time.perf_counter() - _perf_t0)
 

@@ -266,6 +266,14 @@ class MainLoopRunner:
         # Session memory (within-run structured memory, survives context compression)
         self.session_memory = SessionMemory()
 
+        # Sub-agent concurrency semaphore (instance-level, shared across turns)
+        max_concurrent = getattr(
+            self.cfg.main_agent,
+            "max_concurrent_subagents",
+            DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+        )
+        self._sub_agent_semaphore = asyncio.Semaphore(max_concurrent)
+
         # 当前 Agent ID
         self.current_agent_id: str | None = None
 
@@ -1269,12 +1277,15 @@ class MainLoopRunner:
                 f"Injected {len(self.context_manager.source_registry.get_all_sources())} sources into message history",
             )
 
-        # 检测简单响应：无工具调用且有有效文本
+        # 是否跳过 summary：
+        # 1. generate_summary=false（默认）→ 有文本就跳过
+        # 2. generate_summary=true → 仅无工具调用时跳过（简单响应）
+        generate_summary = self.cfg.main_agent.get("generate_summary", False)
         is_simple_response = (
             not task_failed
-            and total_tool_calls_executed == 0
             and last_assistant_text
             and last_assistant_text.strip()
+            and (not generate_summary or total_tool_calls_executed == 0)
         )
 
         # Record main loop timing
@@ -1446,16 +1457,9 @@ class MainLoopRunner:
                 await self.stream_handler.stream_end_llm(self.agent_name)
                 await self.stream_handler.stream_end_agent(self.agent_name, self.current_agent_id)
 
-                # Run sub-agents with concurrency limit
-                max_concurrent = getattr(
-                    self.cfg.main_agent,
-                    "max_concurrent_subagents",
-                    DEFAULT_MAX_CONCURRENT_SUBAGENTS,
-                )
-                semaphore = asyncio.Semaphore(max_concurrent)
-
+                # Run sub-agents with instance-level concurrency limit
                 async def _run_one_agent(call):
-                    async with semaphore:
+                    async with self._sub_agent_semaphore:
                         try:
                             result = await self.sub_agent_runner.run(
                                 call["server_name"], call["arguments"], keep_tool_result

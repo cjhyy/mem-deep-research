@@ -109,6 +109,7 @@ class HookRegistry:
         # Prompt 钩子
         "on_system_prompt_build",  # system prompt 生成后 (可修改 prompt)
         "on_summarize_prompt_build",  # summarize prompt 生成后 (可修改 prompt)
+        "on_final_answer",  # 最终答案后处理（可修改 final answer 文本）
         # 格式化钩子
         "on_tool_result_format",  # 工具结果格式化
         "on_thinking_generate",  # thinking 描述生成
@@ -332,6 +333,11 @@ def on_after_llm_call(priority: int = 0):
     return hooks.register("on_after_llm_call", priority)
 
 
+def on_final_answer(priority: int = 0):
+    """最终答案后处理钩子 — 可修改 final answer 文本"""
+    return hooks.register("on_final_answer", priority)
+
+
 def on_tool_filter(priority: int = 0):
     """工具去重后、执行前钩子 — 可修改/重排/拦截工具调用列表"""
     return hooks.register("on_tool_filter", priority)
@@ -352,12 +358,19 @@ def on_reflection_build(priority: int = 0):
 # ============================================================
 
 
+import threading as _threading
+
+_load_hooks_lock = _threading.Lock()
+
+
 def load_project_hooks(project_dir: str, hook_registry: HookRegistry | None = None) -> None:
     """
     从项目目录加载钩子定义
 
     查找 {project_dir}/hooks.py 文件并执行，
     该文件应该使用 @hooks.register() 装饰器注册钩子。
+
+    线程安全：并发加载时通过锁串行化，避免全局 hooks 交叉污染。
 
     Args:
         project_dir: 项目目录路径
@@ -377,33 +390,38 @@ def load_project_hooks(project_dir: str, hook_registry: HookRegistry | None = No
         logger.debug(f"[Hooks] No hooks.py found in {project_dir}")
         return
 
-    try:
-        # 如果目标不是全局 hooks，临时替换全局 hooks，
-        # 使项目 hooks.py 中的 `from ...hooks import hooks; @hooks.register(...)` 注册到目标实例
-        _swapped = False
-        _original_hooks = None
-        if target is not hooks:
-            import mem_deep_research_core.core.hooks as _self_module
+    # 使用唯一模块名避免 sys.modules 冲突
+    module_name = f"_project_hooks_{id(target)}_{id(hooks_file)}"
 
-            _original_hooks = _self_module.hooks
-            _self_module.hooks = target
-            _swapped = True
-
+    # 锁保护：临时替换全局 hooks 期间不允许其他线程同时加载
+    with _load_hooks_lock:
         try:
-            spec = importlib.util.spec_from_file_location("project_hooks", hooks_file)
-            if spec is None or spec.loader is None:
-                raise ImportError(f"Cannot load hooks from {hooks_file}")
-
-            module = importlib.util.module_from_spec(spec)
-            sys.modules["project_hooks"] = module
-            spec.loader.exec_module(module)
-
-            logger.info(f"[Hooks] Loaded project hooks from {hooks_file}")
-            logger.info(f"[Hooks] Registered hooks: {target.list_hooks()}")
-        finally:
-            if _swapped and _original_hooks is not None:
+            _swapped = False
+            _original_hooks = None
+            if target is not hooks:
                 import mem_deep_research_core.core.hooks as _self_module
 
-                _self_module.hooks = _original_hooks
-    except Exception as e:
-        logger.warning(f"[Hooks] Failed to load project hooks: {e}")
+                _original_hooks = _self_module.hooks
+                _self_module.hooks = target
+                _swapped = True
+
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, hooks_file)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"Cannot load hooks from {hooks_file}")
+
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+
+                logger.info(f"[Hooks] Loaded project hooks from {hooks_file}")
+                logger.info(f"[Hooks] Registered hooks: {target.list_hooks()}")
+            finally:
+                if _swapped and _original_hooks is not None:
+                    import mem_deep_research_core.core.hooks as _self_module
+
+                    _self_module.hooks = _original_hooks
+                # 清理 sys.modules 避免累积
+                sys.modules.pop(module_name, None)
+        except Exception as e:
+            logger.warning(f"[Hooks] Failed to load project hooks: {e}")

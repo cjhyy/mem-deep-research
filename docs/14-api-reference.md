@@ -266,6 +266,7 @@ hooks.clear()                     # 清除所有钩子
 | `on_tool_filter` | 去重后、执行前 | `tool_calls_batch` |
 | `on_system_prompt_build` | system prompt 生成后 | 返回值（str） |
 | `on_summarize_prompt_build` | 摘要 prompt 生成后 | 返回值（str） |
+| `on_final_answer` | 最终答案后处理 | 返回值（str） |
 | `on_tool_result_format` | 工具结果格式化 | 返回值 |
 | `on_thinking_generate` | thinking 描述生成 | 返回值 |
 | `on_env_inject` | MCP 环境变量注入 | `server_params` |

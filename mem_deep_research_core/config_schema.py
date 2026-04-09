@@ -350,6 +350,10 @@ class MainAgentConfig(BaseModel):
         description="执行模式: 'auto' LLM智能路由, 'quick' 快速模式(≤3轮), 'standard' 多轮工具调用, 'deep' 多轮+反思+子agent",
     )
     max_concurrent_subagents: int = Field(default=3, ge=1, description="最大并行子 Agent 数")
+    generate_summary: bool = Field(
+        default=False,
+        description="是否在工具调用后生成最终摘要（额外一次 LLM 调用）。默认跳过，直接用最后一轮 assistant 文本。",
+    )
 
     # Deep Research
     task_engine: TaskEngineConfig = Field(

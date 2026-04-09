@@ -87,6 +87,9 @@ class SourceRegistry:
     }
 
     def __init__(self):
+        import threading
+
+        self._lock = threading.Lock()
         self._sources: list[SourceRecord] = []
         self._seen_urls: set = set()
 
@@ -97,7 +100,7 @@ class SourceRegistry:
         result_text: str,
         turn: int,
     ) -> list[SourceRecord]:
-        """从工具调用中提取并注册来源"""
+        """从工具调用中提取并注册来源（线程安全）"""
         new_sources = []
 
         # 1. 从 arguments 提取
@@ -108,7 +111,6 @@ class SourceRegistry:
             if url and url not in self._seen_urls:
                 source = SourceRecord(url=url, title=title, tool_name=tool_name, turn=turn)
                 new_sources.append(source)
-                self._seen_urls.add(url)
 
         # 2. 从 JSON 结果中提取 URL 列表
         try:
@@ -139,21 +141,29 @@ class SourceRegistry:
                         break
                 source = SourceRecord(url=url, title=title, tool_name=tool_name, turn=turn)
                 new_sources.append(source)
-                self._seen_urls.add(url)
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
-        self._sources.extend(new_sources)
+        # Commit under lock to avoid race on _sources/_seen_urls
+        with self._lock:
+            for src in new_sources:
+                if src.url not in self._seen_urls:
+                    self._sources.append(src)
+                    self._seen_urls.add(src.url)
+
         return new_sources
 
     def get_all_sources(self) -> list[SourceRecord]:
-        return list(self._sources)
+        with self._lock:
+            return list(self._sources)
 
     def get_citation_summary(self) -> str:
-        if not self._sources:
+        with self._lock:
+            sources = list(self._sources)
+        if not sources:
             return ""
         lines = ["## Sources"]
-        for i, source in enumerate(self._sources, 1):
+        for i, source in enumerate(sources, 1):
             if source.title:
                 lines.append(f"{i}. [{source.title}]({source.url})")
             else:
@@ -161,8 +171,9 @@ class SourceRegistry:
         return "\n".join(lines)
 
     def reset(self):
-        self._sources.clear()
-        self._seen_urls.clear()
+        with self._lock:
+            self._sources.clear()
+            self._seen_urls.clear()
 
 
 # ============================================================
