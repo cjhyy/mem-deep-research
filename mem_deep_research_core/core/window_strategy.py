@@ -40,6 +40,7 @@ from typing import Any
 
 from mem_deep_research_core.core.constants import (
     COMPACT_MIN_CHARS,
+    COMPACT_PREVIEW_LENGTH,
     MT,
     PROTECTED_MESSAGE_TYPES,
     SYSTEM_MESSAGE_KEYWORDS,
@@ -287,10 +288,12 @@ class ObservationMaskingStrategy(WindowStrategy):
         trigger_ratio: float = 0.6,
         keep_recent: int = 3,
         chars_per_token: float = 3.5,
+        preview_length: int = COMPACT_PREVIEW_LENGTH,
     ):
         self.trigger_ratio = trigger_ratio
         self.keep_recent = keep_recent
         self.chars_per_token = chars_per_token
+        self.preview_length = preview_length
 
     def should_trigger(self, ctx: WindowContext) -> bool:
         if ctx.max_tokens <= 0:
@@ -412,27 +415,39 @@ class ObservationMaskingStrategy(WindowStrategy):
         return candidates
 
     def _generate_summary(self, msg: dict, turn: int, call_registry: list) -> str | None:
-        """生成结构化一行摘要"""
+        """生成结构化摘要，保留足够信息供最终 summary 使用"""
         turn_records = [r for r in call_registry if r.turn == turn]
+        preview_len = self.preview_length
 
         if turn_records:
             lines = []
             for record in turn_records:
-                parts = [f"Turn {record.turn}"]
+                # Header line
+                header_parts = [f"Turn {record.turn}"]
                 key_arg = _extract_key_argument(record.tool_name, record.arguments)
                 if key_arg:
-                    parts.append(f'{record.tool_name}("{key_arg}")')
+                    header_parts.append(f'{record.tool_name}("{key_arg}")')
                 else:
-                    parts.append(record.tool_name)
-                parts.append(f"{record.result_chars} chars")
+                    header_parts.append(record.tool_name)
+                header_parts.append(f"{record.result_chars} chars")
                 if "search" in record.tool_name.lower():
                     count = _count_results(record.result_full)
                     if count is not None:
-                        parts.append(f"{count} results")
-                if record.result_brief is not None:
-                    preview = record.result_brief[:80].replace("\n", " ")
-                    parts.append(f'preview="{preview}..."')
-                lines.append(f"[{' | '.join(parts)}]")
+                        header_parts.append(f"{count} results")
+                lines.append(f"[{' | '.join(header_parts)}]")
+
+                # Hint: offloaded content can be recalled via read_result
+                expected_ref = f"turn{record.turn}_{record.tool_name}_{record.result_chars}chars.txt"
+                if record.result_chars > 3000:
+                    lines.append(f"  (use read_result(\"{expected_ref}\") for full content)")
+
+                # Result preview — use full result_full for better extraction
+                if preview_len > 0 and record.result_full:
+                    preview = record.result_full[:preview_len].replace("\n", " ")
+                    lines.append(f"  {preview}")
+                elif record.result_brief:
+                    preview = record.result_brief[:preview_len].replace("\n", " ")
+                    lines.append(f"  {preview}")
             return "\n".join(lines)
 
         char_count = _get_message_char_count(msg)
@@ -663,6 +678,10 @@ class LLMSummarizeStrategy(WindowStrategy):
             self._summary_text = summary
             self._summarized_up_to_turn = cutoff_turn
 
+            # 从 LLM 摘要中提取 Evidence 部分，存入 session_memory
+            if ctx.session_memory is not None:
+                self._extract_evidence_from_summary(summary, cutoff_turn, ctx.session_memory)
+
             logger.info(
                 f"[WINDOW] LLMSummarize: summarized turns 1-{cutoff_turn}, "
                 f"removed {len(old_indices)} messages"
@@ -760,9 +779,52 @@ class LLMSummarizeStrategy(WindowStrategy):
 
         lines.append("=== END OF CONVERSATION ===")
         lines.append("")
-        lines.append("Now provide a concise summary preserving all key facts:")
+        lines.append(
+            "Now provide a concise summary. Your output MUST have two sections:\n"
+            "\n"
+            "## Summary\n"
+            "A concise narrative preserving all key facts, specific data, and tool findings.\n"
+            "\n"
+            "## Evidence\n"
+            "A bullet list of the most important verified facts extracted from tool results. "
+            "Each bullet should be one specific, data-rich fact (include numbers, names, dates, URLs). "
+            "This section will survive further context compression, so prioritize the facts "
+            "that are most critical for answering the research question."
+        )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_evidence_from_summary(summary: str, up_to_turn: int, session_memory) -> None:
+        """从 LLM 压缩摘要中提取 ## Evidence 部分，存入 session_memory。"""
+        from mem_deep_research_core.core.memory import EvidenceItem
+
+        # 查找 ## Evidence 部分
+        evidence_start = summary.find("## Evidence")
+        if evidence_start == -1:
+            return
+
+        evidence_text = summary[evidence_start + len("## Evidence") :]
+        # 截取到下一个 ## 或末尾
+        next_section = evidence_text.find("\n## ")
+        if next_section != -1:
+            evidence_text = evidence_text[:next_section]
+        evidence_text = evidence_text.strip()
+
+        if not evidence_text:
+            return
+
+        session_memory.add_evidence(
+            EvidenceItem(
+                tool_name="llm_summarize",
+                turn=up_to_turn,
+                summary=evidence_text[:1000],
+            )
+        )
+        logger.info(
+            f"[WINDOW] LLMSummarize: extracted evidence from summary "
+            f"(turns 1-{up_to_turn}, {len(evidence_text)} chars)"
+        )
 
     def reset(self):
         """重置状态"""

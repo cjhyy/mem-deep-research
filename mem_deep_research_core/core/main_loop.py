@@ -12,6 +12,7 @@
 import asyncio
 import json as _json
 import logging
+import re
 import sys
 import time
 from collections.abc import Callable
@@ -19,10 +20,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mem_deep_research_core.core.constants import (
+    BUILTIN_TOOL_READ_RESULT,
     BUILTIN_TOOL_SEARCH,
     BUILTIN_TOOL_SPAWN_AGENT,
-    CONCURRENT_SAFE_TOOL_PATTERNS,
-    CONTEXT_COMPRESSION_NOTICE,
+    BUILTIN_TOOL_UPDATE_TODO,
+    EVIDENCE_MAX_CHARS,
+    CONCURRENT_SAFE_TOOL_SEGMENTS,
+    build_context_compression_notice,
     DEFAULT_MAX_CONCURRENT_SUBAGENTS,
     DEFAULT_TASK_TOKEN_BUDGET,
     DEFAULT_TEMPERATURE_BOOST,
@@ -30,12 +34,14 @@ from mem_deep_research_core.core.constants import (
     EXECUTION_MODE_AUTO,
     EXECUTION_MODE_DEEP,
     EXECUTION_MODE_QUICK,
+    EXECUTION_MODE_SIMPLE_AUTO,
     EXECUTION_MODE_STANDARD,
     MAX_CONTEXT_LIMIT_RETRIES,
     MAX_SPAWN_DEPTH,
     QUICK_MODE_MAX_TURNS,
     SUB_AGENT_PREFIX,
     TAG_COLLECTED_SOURCES,
+    TAG_OFFLOADED,
     TAG_TASK_PLAN,
     MT,
     TOKEN_BUDGET_HARD_RATIO,
@@ -44,7 +50,7 @@ from mem_deep_research_core.core.constants import (
 )
 from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.llm_call_handler import generate_reflection_prompt
-from mem_deep_research_core.core.memory import SessionMemory
+from mem_deep_research_core.core.memory import EvidenceItem, SessionMemory
 from mem_deep_research_core.core.monitoring import (
     EscalationAction,
     TurnCounter,
@@ -115,6 +121,12 @@ class MainLoopContext:
     # Skill commands registry (optional, unified SkillCommand dict)
     skill_commands: dict = field(default_factory=dict)
 
+    # Router LLM client (optional, lightweight model for auto mode task classification)
+    router_llm_client: Any = None
+
+    # ConfigLoader instance (optional, needed for spawning sub-agents)
+    config_loader: Any = None
+
 
 def _get_spawn_agent_tool_definition() -> dict:
     """Built-in spawn_agent tool — MCP server format for system prompt rendering."""
@@ -142,6 +154,168 @@ def _get_spawn_agent_tool_definition() -> dict:
             }
         ],
     }
+
+
+def _get_read_result_tool_definition() -> dict:
+    """Built-in read_result tool — allows LLM to recall offloaded/masked tool results."""
+    return {
+        "name": "builtin-read-result",
+        "tools": [
+            {
+                "name": BUILTIN_TOOL_READ_RESULT,
+                "description": (
+                    "Read back the full content of a previously offloaded or compressed tool result. "
+                    "Use this when you need detailed data from an earlier tool call whose result was "
+                    "offloaded to a file or compressed. Pass the file reference from an "
+                    "[OFFLOADED:ref|chars] marker (e.g. 'toolmsg_abcd1234.txt') "
+                    "or 'turn:N' to retrieve all cached results from turn N."
+                ),
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ref": {
+                            "type": "string",
+                            "description": (
+                                "File reference from an [OFFLOADED:...] marker, "
+                                "or 'turn:N' to get all cached results from turn N"
+                            ),
+                        },
+                    },
+                    "required": ["ref"],
+                },
+            }
+        ],
+    }
+
+
+_RE_EVIDENCE = re.compile(r"<evidence>(.*?)</evidence>", re.DOTALL)
+_RE_SOURCE = re.compile(r"\(source:\s*(https?://[^\s)]+)\)", re.IGNORECASE)
+_RE_CONFIDENCE = re.compile(r"\(confidence:\s*(high|medium|low)\)", re.IGNORECASE)
+_RE_OFFLOAD_EVIDENCE = re.compile(
+    r'<offload_evidence\s+ref="([^"]+)">(.*?)</offload_evidence>', re.DOTALL
+)
+
+
+def _extract_offload_evidence(assistant_text: str, context_manager) -> str:
+    """从 LLM 回复中提取 <offload_evidence ref="..."> 块，绑定到 offload registry。
+
+    Returns:
+        清理掉 <offload_evidence> 标签后的 assistant_text
+    """
+    matches = _RE_OFFLOAD_EVIDENCE.findall(assistant_text)
+    if not matches:
+        return assistant_text
+
+    for ref, block in matches:
+        lines = [
+            l.strip().lstrip("- ").strip()
+            for l in block.strip().split("\n")
+            if l.strip() and l.strip() != "-"
+        ]
+        if lines:
+            context_manager.update_offload_evidence(ref, lines)
+
+    return _RE_OFFLOAD_EVIDENCE.sub("", assistant_text).strip()
+
+
+def _parse_evidence_line(line: str) -> tuple[str, str, str]:
+    """从单行证据中提取 source_url 和 confidence，返回 (clean_text, source_url, confidence)。"""
+    source_url = ""
+    confidence = ""
+    m = _RE_SOURCE.search(line)
+    if m:
+        source_url = m.group(1)
+        line = line[: m.start()] + line[m.end() :]
+    m = _RE_CONFIDENCE.search(line)
+    if m:
+        confidence = m.group(1).lower()
+        line = line[: m.start()] + line[m.end() :]
+    return line.strip().strip("-").strip(), source_url, confidence
+
+
+def _extract_evidence_tags(
+    assistant_text: str,
+    turn: int,
+    session_memory: SessionMemory,
+) -> str:
+    """从 LLM 回复中提取 <evidence> 标签内容，存入 session_memory。
+
+    支持两种格式：
+    1. 逐行结构化（推荐）：每行含 (source: URL) (confidence: high/medium/low)
+    2. 整块文本（兼容旧格式）
+
+    Returns:
+        清理掉 <evidence> 标签后的 assistant_text
+    """
+    matches = _RE_EVIDENCE.findall(assistant_text)
+    if not matches:
+        return assistant_text
+
+    count = 0
+    for block in matches:
+        block = block.strip()
+        if not block:
+            continue
+
+        # 尝试逐行解析（每行以 - 开头）
+        lines = [l.strip() for l in block.split("\n") if l.strip().startswith("-")]
+        if lines:
+            for line in lines:
+                text, source_url, confidence = _parse_evidence_line(line)
+                if not text:
+                    continue
+                if len(text) > EVIDENCE_MAX_CHARS:
+                    text = text[:EVIDENCE_MAX_CHARS] + "..."
+                session_memory.add_evidence(
+                    EvidenceItem(
+                        tool_name="llm_extraction",
+                        turn=turn,
+                        summary=text,
+                        source_url=source_url,
+                        confidence=confidence,
+                    )
+                )
+                count += 1
+        else:
+            # 整块作为一个 EvidenceItem（兼容旧格式）
+            if len(block) > EVIDENCE_MAX_CHARS:
+                block = block[:EVIDENCE_MAX_CHARS] + "..."
+            session_memory.add_evidence(
+                EvidenceItem(
+                    tool_name="llm_extraction",
+                    turn=turn,
+                    summary=block,
+                )
+            )
+            count += 1
+
+    logger.debug(f"[Evidence] Extracted {count} evidence items from turn {turn}")
+
+    # 从 assistant 文本中移除 <evidence> 标签
+    return _RE_EVIDENCE.sub("", assistant_text).strip()
+
+
+def _strip_evidence_from_last_assistant(message_history: list) -> None:
+    """清理 message_history 中最后一条 assistant 消息里的 evidence 相关标签。"""
+
+    def _clean(text: str) -> str:
+        text = _RE_EVIDENCE.sub("", text)
+        text = _RE_OFFLOAD_EVIDENCE.sub("", text)
+        return text.strip()
+
+    for msg in reversed(message_history):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and ("<evidence>" in content or "<offload_evidence" in content):
+            msg["content"] = _clean(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    t = item.get("text", "")
+                    if "<evidence>" in t or "<offload_evidence" in t:
+                        item["text"] = _clean(t)
+        break
 
 
 class TokenBudgetTracker:
@@ -262,6 +436,8 @@ class MainLoopRunner:
         self.transcript = ctx.transcript
         self.file_state_cache = ctx.file_state_cache
         self.skill_commands = ctx.skill_commands
+        self.router_llm_client = ctx.router_llm_client
+        self.config_loader = ctx.config_loader
 
         # Session memory (within-run structured memory, survives context compression)
         self.session_memory = SessionMemory()
@@ -276,6 +452,9 @@ class MainLoopRunner:
 
         # 当前 Agent ID
         self.current_agent_id: str | None = None
+
+        # 运行时上下文引用（在 run() 中设置）
+        self._current_system_prompt: str = ""
 
     def _record_event(self, event_type, data=None, turn=0, ref_event_id=None, duration_ms=None):
         """Record a transcript event (no-op if transcript not configured)."""
@@ -294,55 +473,6 @@ class MainLoopRunner:
             ref_event_id=ref_event_id,
             duration_ms=duration_ms,
         )
-
-    async def _route_execution_mode(
-        self, task_description: str, task_engine_cfg: dict | None
-    ) -> str:
-        """LLM 智能路由：判断任务复杂度，选择执行模式。
-
-        Returns:
-            "quick" | "standard" | "deep"
-        """
-        # 如果 deep_research 配置显式启用，直接 deep
-        if task_engine_cfg and task_engine_cfg.get("enabled"):
-            return EXECUTION_MODE_DEEP
-
-        # 用 LLM 判断任务复杂度
-        routing_prompt = (
-            "You are a task complexity classifier. Given the user's task, respond with EXACTLY one word:\n"
-            '- "quick" — simple question, greeting, calculation, or factual lookup (1-2 steps)\n'
-            '- "standard" — moderate task needing multiple tool calls or analysis (3-10 steps)\n'
-            '- "deep" — complex research, multi-step investigation, report generation (10+ steps)\n\n'
-            f"Task: {task_description[:500]}\n\n"
-            "Your answer (one word):"
-        )
-        try:
-            response = await self.llm_client.create_message(
-                system_prompt="You are a task complexity classifier. Respond with exactly one word: quick, standard, or deep.",
-                message_history=[
-                    {"role": "user", "content": [{"type": "text", "text": routing_prompt}]}
-                ],
-                tool_definitions=[],
-                keep_tool_result=-1,
-            )
-            if response and response.choices:
-                content = getattr(response.choices[0].message, "content", None)
-                if not content:
-                    return EXECUTION_MODE_STANDARD
-                choice = content.strip().lower()
-                if choice in ("quick", "standard", "deep"):
-                    logger.info(f"[AutoRoute] LLM classified task as: {choice}")
-                    return choice
-                # 从回复中提取关键词
-                for mode in ("deep", "standard", "quick"):
-                    if mode in choice:
-                        logger.info(f"[AutoRoute] LLM classified task as: {mode} (extracted)")
-                        return mode
-        except Exception as e:
-            logger.warning(f"[AutoRoute] LLM routing failed, falling back to standard: {e}")
-
-        # Fallback: standard
-        return EXECUTION_MODE_STANDARD
 
     async def run(
         self,
@@ -438,13 +568,10 @@ class MainLoopRunner:
                 f"message_history={len(message_history)} messages"
             )
 
-        turn_counter = TurnCounter(
-            max_turns=max_turns,
-            reflection_enabled=task_engine_cfg and task_engine_cfg.get("enabled", False),
-            reflection_interval=task_engine_cfg.get("reflection_interval", 5)
-            if task_engine_cfg
-            else 5,
-        )
+        # TurnCounter 延迟到路由后创建（reflection 由 effective_mode 驱动）
+        turn_counter = None  # initialized after mode resolution
+
+        self._current_system_prompt = system_prompt
 
         task_failed = False
         self.current_agent_id = await self.stream_handler.stream_start_agent(self.agent_name)
@@ -475,7 +602,10 @@ class MainLoopRunner:
         if self.response_language == "auto":
             from mem_deep_research_core.core.user_context import detect_language_by_chars
 
-            self.response_language = detect_language_by_chars(task_description)
+            # Prefer original_query (raw user text) over task_description which may
+            # contain English wrapper text that dilutes CJK character ratio
+            lang_text = (self.context or {}).get("original_query") or task_description
+            self.response_language = detect_language_by_chars(lang_text)
             self.chinese_context = self.response_language == "Chinese"
             logger.info(f"[Language] Auto-detected: {self.response_language}")
 
@@ -498,39 +628,121 @@ class MainLoopRunner:
                 )
 
         # Resolve execution mode
-        # Auto 模式统一走 LLMRouter：结构信号 → hook → LLM 分类 → 默认
-        # Router 内部自动处理 adaptive thinking / reasoning_effort 注入
+        # auto / simple_auto 使用 adaptive 策略：结构信号（零成本）→ hook → 第一轮后根据 LLM 行为定模式
+        # simple_auto 与 auto 的区别：adaptive 阶段不会升级到 deep（clamp 到 standard）
+        # 非 auto 模式直接使用配置值
         effective_mode = self.execution_mode
-        if effective_mode == EXECUTION_MODE_AUTO:
+        _adaptive_pending = False  # True = auto 模式待第一轮后定模式
+        _adaptive_allow_deep = True  # simple_auto 时为 False
+
+        if effective_mode in (EXECUTION_MODE_AUTO, EXECUTION_MODE_SIMPLE_AUTO):
+            _adaptive_allow_deep = effective_mode == EXECUTION_MODE_AUTO
+
             from mem_deep_research_core.core.llm_router import LLMRouter
 
-            router = LLMRouter(hooks=self.hooks, llm_client=self.llm_client)
-            route_result = await router.route(
-                query=task_description,
-                tool_count=sum(
+            router = LLMRouter(
+                hooks=self.hooks,
+                llm_client=self.llm_client,
+            )
+
+            # 1. Hook: on_route_classify（用户完全自定义）
+            _deterministic_result = None
+            if self.hooks.has_hooks("on_route_classify"):
+                from mem_deep_research_core.core.hooks import HookContext as _HC
+
+                _tool_count = sum(
                     len(s.get("tools", [])) for s in tool_definitions if isinstance(s, dict)
-                ),
-                has_sub_agents=bool(getattr(self.cfg, "sub_agents", None)),
-                task_engine_enabled=bool(task_engine_cfg and task_engine_cfg.get("enabled")),
-                context=self.context,
-            )
-            effective_mode = route_result.mode
-            logger.info(
-                f"[{self.agent_name}] Auto route: {effective_mode} "
-                f"(effort={route_result.reasoning_effort}, source={route_result.source}, "
-                f"thinking={bool(route_result.thinking_params)})"
-            )
+                )
+                hook_ctx = _HC(
+                    hook_name="on_route_classify",
+                    query=task_description,
+                    context=self.context or {},
+                    extra={
+                        "tool_count": _tool_count,
+                        "has_sub_agents": bool(getattr(self.cfg, "sub_agents", None)),
+                        "task_engine_enabled": bool(
+                            task_engine_cfg and task_engine_cfg.get("enabled")
+                        ),
+                    },
+                )
+                hook_result = self.hooks.call("on_route_classify", hook_ctx)
+                _deterministic_result = router._parse_hook_result(hook_result)
+
+            # 2. 结构信号路由（零成本）
+            if _deterministic_result is None:
+                _deterministic_result = router._structural_route(
+                    tool_count=sum(
+                        len(s.get("tools", [])) for s in tool_definitions if isinstance(s, dict)
+                    ),
+                    has_sub_agents=bool(getattr(self.cfg, "sub_agents", None)),
+                )
+
+            if _deterministic_result is not None:
+                # simple_auto: 结构信号判定 deep 时，clamp 到 standard
+                if not _adaptive_allow_deep and _deterministic_result.mode == EXECUTION_MODE_DEEP:
+                    _deterministic_result.mode = EXECUTION_MODE_STANDARD
+                    _deterministic_result.reasoning_effort = "medium"
+                # finalize（注入 thinking_params 等）
+                route_result = router._finalize(
+                    _deterministic_result, task_description, self.context
+                )
+                effective_mode = route_result.mode
+                logger.info(
+                    f"[{self.agent_name}] Auto route (deterministic): {effective_mode} "
+                    f"(source={route_result.source})"
+                )
+            else:
+                # 无确定性信号 → adaptive：先用 standard 跑第一轮，之后根据行为定模式
+                effective_mode = EXECUTION_MODE_STANDARD
+                _adaptive_pending = True
+                logger.info(
+                    f"[{self.agent_name}] Auto route: adaptive pending, "
+                    f"starting as standard (will finalize after turn 1)"
+                )
 
         logger.info(
             f"[{self.agent_name}] Execution mode: {effective_mode} (config={self.execution_mode})"
+        )
+        self.task_log.record_perf("config_mode", self.execution_mode, unit="")
+
+        # Deep 能力由 effective_mode 驱动（auto 路由到 deep 时也激活）
+        is_deep_mode = effective_mode == EXECUTION_MODE_DEEP
+        reflection_interval = (
+            task_engine_cfg.get("reflection_interval", 5) if task_engine_cfg else 5
+        )
+        turn_counter = TurnCounter(
+            max_turns=max_turns,
+            reflection_enabled=is_deep_mode,
+            reflection_interval=reflection_interval,
         )
 
         # Quick mode: limited turns, tools enabled, skip heavy features (reflection/skills/hints)
         is_quick_mode = effective_mode == EXECUTION_MODE_QUICK
         if is_quick_mode:
             max_turns = min(max_turns, QUICK_MODE_MAX_TURNS)
+            turn_counter.max_turns = max_turns
+            # 裁剪 quick 模式不需要的内置工具（spawn_agent / update_todo / read_result）
+            _quick_strip = {BUILTIN_TOOL_SPAWN_AGENT, BUILTIN_TOOL_UPDATE_TODO, BUILTIN_TOOL_READ_RESULT}
+            before_count = len(tool_definitions)
+            tool_definitions = [
+                td for td in tool_definitions
+                if not any(
+                    t.get("name") in _quick_strip
+                    for t in td.get("tools", [td]) if isinstance(t, dict)
+                )
+            ]
+            stripped = before_count - len(tool_definitions)
+            # 注入 quick preset 到 system prompt（路由后动态追加）
+            from mem_deep_research_core.prompts.template_loader import template_loader as _tpl_loader
+
+            try:
+                quick_preset = _tpl_loader.load_template("presets/quick")
+                system_prompt = system_prompt + "\n\n" + quick_preset
+            except FileNotFoundError:
+                pass
             logger.info(
-                f"[{self.agent_name}] QUICK mode: max_turns={max_turns}, tools enabled, no reflection/skills"
+                f"[{self.agent_name}] QUICK mode: max_turns={max_turns}, "
+                f"stripped {stripped} heavy tools, no reflection/skills"
             )
 
         # 自动任务分解（仅深度研究模式 + auto_planning 启用时，quick 模式跳过）
@@ -562,6 +774,7 @@ class MainLoopRunner:
         total_tool_calls_executed = 0
         last_assistant_text = ""
         _context_limit_retries = 0
+        _reflection_pending = False  # 上一轮末尾注入了反思 prompt，下轮允许无工具回复
         _perf_main_loop_start = time.perf_counter()
         _perf_total_llm_time = 0.0
         _perf_total_tool_time = 0.0
@@ -642,7 +855,38 @@ class MainLoopRunner:
                 break
 
             # Microcompact: 每轮 LLM 调用前清理旧 tool_result（零成本）
-            self.context_manager.microcompact(message_history, turn_count, keep_recent=3)
+            keep_recent = self.context_manager.config.compact_keep_recent
+            self.context_manager.microcompact(message_history, turn_count, keep_recent=keep_recent)
+
+            # Phase 2: 标记即将滑出窗口的旧大结果，注入 sidecar prompt 要求产 evidence
+            offload_candidates = self.context_manager.prepare_offload_candidates(
+                message_history, turn_count, keep_recent=keep_recent
+            )
+            _offload_prep_injected = False
+            if offload_candidates:
+                candidate_lines = []
+                for c in offload_candidates:
+                    candidate_lines.append(
+                        f'- ref="{c["ref"]}" (turn {c["turn"]}, {c["chars"]} chars)'
+                    )
+                sidecar = (
+                    "[OFFLOAD PREP]\n\n"
+                    "The following tool-result messages will be offloaded after this turn. "
+                    "While completing your normal reasoning, emit evidence blocks for any candidate "
+                    "you used.\n\n"
+                    "Output format:\n"
+                    '<offload_evidence ref="REF_ID">\n'
+                    "- key fact 1\n"
+                    "- key fact 2\n"
+                    "</offload_evidence>\n\n"
+                    "Candidates:\n" + "\n".join(candidate_lines)
+                )
+                message_history.append({
+                    "role": "user",
+                    "_type": MT.OFFLOAD_PREP,
+                    "content": [{"type": "text", "text": sidecar}],
+                })
+                _offload_prep_injected = True
 
             # LLM 调用
             _perf_llm_start = time.perf_counter()
@@ -654,15 +898,23 @@ class MainLoopRunner:
                 },
                 turn=turn_count,
             )
-            assistant_response_text, should_break, tool_calls = await self._handle_llm_call(
-                system_prompt,
-                message_history,
-                tool_definitions,
-                turn_count,
-                f"{self.agent_name} agent turn {turn_count}",
-                agent_type=self.agent_name,
-                stream_message_callback=self._intercept_key_message,
-            )
+            try:
+                assistant_response_text, should_break, tool_calls = await self._handle_llm_call(
+                    system_prompt,
+                    message_history,
+                    tool_definitions,
+                    turn_count,
+                    f"{self.agent_name} agent turn {turn_count}",
+                    agent_type=self.agent_name,
+                    stream_message_callback=self._intercept_key_message,
+                )
+            finally:
+                # 确保 OFFLOAD_PREP sidecar 即使 LLM 调用异常也被清理，
+                # 避免临时消息残留在 message_history 中
+                if _offload_prep_injected:
+                    message_history[:] = [
+                        m for m in message_history if m.get("_type") != MT.OFFLOAD_PREP
+                    ]
             _perf_llm_elapsed = time.perf_counter() - _perf_llm_start
             _perf_total_llm_time += _perf_llm_elapsed
             self.task_log.append_perf("llm_call_durations", _perf_llm_elapsed)
@@ -771,6 +1023,47 @@ class MainLoopRunner:
                 task_failed = True
                 break
 
+            # Adaptive mode finalization: 第一轮结束后根据 LLM 行为定模式
+            # 跳过 resume 场景（恢复的任务已有足够上下文，不需要重新判断模式）
+            if _adaptive_pending and turn_count == 1 and not resume_from:
+                _adaptive_pending = False
+                from mem_deep_research_core.core.llm_router import LLMRouter
+
+                _has_spawn = bool(
+                    tool_calls
+                    and isinstance(tool_calls, list)
+                    and len(tool_calls) > 0
+                    and any(
+                        c.get("tool_name") == BUILTIN_TOOL_SPAWN_AGENT
+                        for c in (tool_calls[0] if tool_calls else [])
+                    )
+                )
+                adaptive_result = LLMRouter.adaptive_classify(
+                    should_break=should_break,
+                    tool_calls=tool_calls,
+                    has_spawn_agent=_has_spawn,
+                    allow_deep=_adaptive_allow_deep,
+                )
+                effective_mode = adaptive_result.mode
+                is_quick_mode = effective_mode == EXECUTION_MODE_QUICK
+                is_deep_mode = effective_mode == EXECUTION_MODE_DEEP
+
+                # Apply mode-specific configuration
+                if is_deep_mode:
+                    turn_counter.reflection_enabled = True
+                    # 同步 reasoning_effort 到 llm_client（后续轮次生效）
+                    if hasattr(self.llm_client, "reasoning_effort"):
+                        self.llm_client.reasoning_effort = adaptive_result.reasoning_effort
+
+                logger.info(
+                    f"[{self.agent_name}] Adaptive finalized: {effective_mode} "
+                    f"(reason={adaptive_result.metadata.get('reason', '?')})"
+                )
+                self.task_log.record_perf("adaptive_source", adaptive_result.source, unit="")
+                self.task_log.record_perf(
+                    "adaptive_reason", adaptive_result.metadata.get("reason", ""), unit=""
+                )
+
             # 响应循环升级到 INJECT_HINT 时注入强制策略指令 + 温度提升
             if self.monitor.last_loop_action == EscalationAction.INJECT_HINT:
                 recent_tools = self._extract_recent_tool_names(message_history)
@@ -844,6 +1137,21 @@ class MainLoopRunner:
                             system_prompt
                         )
                     logger.info(f"[InlineSkill] Processed skills for next turn: {next_skills}")
+
+            # 处理 offload evidence（在 should_break 之前，确保最终回合也能解析）
+            if assistant_response_text and _offload_prep_injected:
+                cleaned = _extract_offload_evidence(
+                    assistant_response_text, self.context_manager
+                )
+                if cleaned != assistant_response_text:
+                    assistant_response_text = cleaned
+                    _strip_evidence_from_last_assistant(message_history)
+
+            # Finalize offload: 替换旧消息为 OFFLOADED marker
+            if offload_candidates:
+                self.context_manager.finalize_offload_candidates(
+                    message_history, turn_count, keep_recent=keep_recent
+                )
 
             # 处理 LLM 响应
             if assistant_response_text is not None:
@@ -923,6 +1231,13 @@ class MainLoopRunner:
                 or len(tool_calls) < 2
                 or (len(tool_calls[0]) == 0 and len(tool_calls[1]) == 0)
             ):
+                # 反思轮允许无工具回复：LLM 可能只输出反思文字，下一轮再调工具
+                if _reflection_pending:
+                    _reflection_pending = False
+                    logger.info(
+                        f"[{self.agent_name}] No tool calls after reflection, continuing (turn {turn_count})"
+                    )
+                    continue
                 logger.info(
                     f"[{self.agent_name}] No tool calls, ending (turn {turn_count}, task_failed={task_failed})"
                 )
@@ -972,11 +1287,17 @@ class MainLoopRunner:
                     if eid:
                         _tool_event_ids[call.get("id", "")] = eid
 
+                # 将当前轮 LLM 回复文本传入 tool_executor，供 on_thinking_generate hook 使用
+                self.tool_executor._current_assistant_text = assistant_response_text
+
                 _perf_tool_start = time.perf_counter()
                 modified_tool_calls = [to_execute, tool_calls[1] if len(tool_calls) > 1 else []]
-                all_tool_results_with_id = await self._execute_tools(
-                    modified_tool_calls, max_tool_calls, keep_tool_result
-                )
+                try:
+                    all_tool_results_with_id = await self._execute_tools(
+                        modified_tool_calls, max_tool_calls, keep_tool_result
+                    )
+                finally:
+                    self.tool_executor._current_assistant_text = None  # 清理，避免跨轮泄漏
                 _perf_tool_elapsed = time.perf_counter() - _perf_tool_start
                 _perf_total_tool_time += _perf_tool_elapsed
                 self.task_log.append_perf("tool_batch_durations", _perf_tool_elapsed)
@@ -1034,7 +1355,19 @@ class MainLoopRunner:
                 executed_results = all_tool_results_with_id[: len(to_execute)]
                 self.context_manager.register_tool_results(to_execute, executed_results, turn_count)
 
-            # Update session memory with findings from this turn
+            # 提炼证据：从 LLM 回复中提取 <evidence> 标签内容（零额外 LLM 调用）
+            # LLM 在 prompt 指令下会在回复中输出 <evidence>...</evidence> 标签
+            # 返回清理后的文本（标签已移除，不会泄露到用户输出）
+            if assistant_response_text and self.context_manager.config.enable_evidence_extraction:
+                cleaned = _extract_evidence_tags(
+                    assistant_response_text, turn_count, self.session_memory
+                )
+                if cleaned != assistant_response_text:
+                    assistant_response_text = cleaned
+                    # 同步清理 message_history 中已有的 assistant 消息
+                    _strip_evidence_from_last_assistant(message_history)
+
+            # Update session memory with findings from this turn (keyword-based fallback)
             if assistant_response_text:
                 for line in assistant_response_text.split("\n"):
                     line = line.strip()
@@ -1071,6 +1404,26 @@ class MainLoopRunner:
             message_history = self.llm_client.update_message_history(
                 message_history, all_tool_results_with_id, tool_calls_exceeded
             )
+
+            # 将 offload metadata 挂到刚加入的 TOOL_RESULT 消息上
+            offload_refs = [
+                r[1].get("_offload_ref")
+                for r in all_tool_results_with_id
+                if isinstance(r[1], dict) and r[1].get("_offload_ref")
+            ]
+            if offload_refs:
+                # 找到刚加入的最后一条 TOOL_RESULT 消息
+                for msg in reversed(message_history):
+                    if msg.get("_type") == MT.TOOL_RESULT:
+                        # 多个工具结果可能合并到一条消息中
+                        msg["_offload_refs"] = offload_refs
+                        total_chars = sum(
+                            r[1].get("_offload_chars", 0)
+                            for r in all_tool_results_with_id
+                            if isinstance(r[1], dict) and r[1].get("_offload_ref")
+                        )
+                        msg["_offload_chars"] = total_chars
+                        break
 
             # 三级 Context 管理
             action = self.context_manager.manage_context(
@@ -1117,11 +1470,14 @@ class MainLoopRunner:
             if action and action != "none":
                 recent_texts = [str(m.get("content", "")) for m in message_history[-3:]]
                 if not any("[CONTEXT NOTE]" in t for t in recent_texts):
+                    cm_cfg = self.cfg.main_agent.get("context_manager", {})
+                    has_read_result = cm_cfg.get("result_offload_threshold", 5000) > 0
+                    notice = build_context_compression_notice(has_read_result=has_read_result)
                     message_history.append(
                         {
                             "role": "user",
                             "_type": MT.CONTEXT_COMPRESSION,
-                            "content": [{"type": "text", "text": CONTEXT_COMPRESSION_NOTICE}],
+                            "content": [{"type": "text", "text": notice}],
                         }
                     )
 
@@ -1190,6 +1546,7 @@ class MainLoopRunner:
                 message_history.append(
                     {"role": "user", "_type": MT.REFLECTION, "content": [{"type": "text", "text": reflection_prompt}]}
                 )
+                _reflection_pending = True
                 self.task_log.log_step(
                     "reflection_checkpoint", f"Injected at turn {turn_count}", "info"
                 )
@@ -1277,10 +1634,27 @@ class MainLoopRunner:
                 f"Injected {len(self.context_manager.source_registry.get_all_sources())} sources into message history",
             )
 
+        # Deep verify 检查点：summary 前验证证据质量
+        if (
+            is_deep_mode
+            and not task_failed
+            and total_tool_calls_executed > 0
+            and task_engine_cfg
+            and task_engine_cfg.get("enable_verify", True)
+            and not self.session_memory.is_empty()
+        ):
+            await self._run_verify_checkpoint(
+                system_prompt, message_history, task_description
+            )
+
         # 是否跳过 summary：
-        # 1. generate_summary=false（默认）→ 有文本就跳过
-        # 2. generate_summary=true → 仅无工具调用时跳过（简单响应）
+        # 1. deep 模式且调用过工具 → 强制生成 summary（中间轮文本不能当最终答案）
+        # 2. generate_summary=true → 仅无工具调用时跳过
+        # 3. generate_summary=false（默认）→ 有文本就跳过
         generate_summary = self.cfg.main_agent.get("generate_summary", False)
+        # deep 模式下如果使用了工具，强制生成 summary
+        if effective_mode == EXECUTION_MODE_DEEP and total_tool_calls_executed > 0:
+            generate_summary = True
         is_simple_response = (
             not task_failed
             and last_assistant_text
@@ -1295,6 +1669,7 @@ class MainLoopRunner:
         self.task_log.record_perf("main_loop_total_tool_time", _perf_total_tool_time)
         self.task_log.record_perf("main_loop_turns", turn_counter.current_turn, unit="")
         self.task_log.record_perf("main_loop_tool_calls", total_tool_calls_executed, unit="")
+        self.task_log.record_perf("effective_mode", effective_mode, unit="")
         if token_budget.enabled:
             self.task_log.record_perf("token_budget_total", token_budget.budget, unit="tokens")
             self.task_log.record_perf("token_budget_used", token_budget.total_used, unit="tokens")
@@ -1423,6 +1798,18 @@ class MainLoopRunner:
                     }
                 )
                 builtin_results.append((call["id"], tool_result_for_llm))
+            elif call["tool_name"] == BUILTIN_TOOL_READ_RESULT:
+                ref = call["arguments"].get("ref", "")
+                logger.info(f"[{self.agent_name}] Builtin: read_result ref={ref}")
+                result_text = self._handle_read_result(ref)
+                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                    {
+                        "server_name": "builtin",
+                        "tool_name": BUILTIN_TOOL_READ_RESULT,
+                        "result": result_text,
+                    }
+                )
+                builtin_results.append((call["id"], tool_result_for_llm))
             else:
                 remaining_calls.append(call)
 
@@ -1509,20 +1896,165 @@ class MainLoopRunner:
 
         return all_tool_results_with_id
 
+    async def _run_verify_checkpoint(
+        self,
+        system_prompt: str,
+        message_history: list,
+        task_description: str,
+    ) -> None:
+        """Deep 模式 verify 检查点：summary 前验证证据质量。
+
+        用一次 LLM 调用检查：
+        - 证据覆盖率（关键结论是否有来源支撑）
+        - 冲突证据
+        - 未回答的子问题
+        结果注入 message_history，供 summary LLM 参考。
+        """
+        _perf_start = time.perf_counter()
+
+        # 构建 verify prompt
+        from mem_deep_research_core.prompts.template_loader import template_loader as _tpl_loader
+
+        evidence_summary = self.session_memory.to_evidence_string()
+        if not evidence_summary:
+            evidence_summary = self.session_memory.to_context_string()
+
+        try:
+            verify_prompt = _tpl_loader.load_and_render(
+                "reflection/verify",
+                task_preview=task_description[:300],
+                evidence_summary=evidence_summary,
+            )
+        except FileNotFoundError:
+            logger.debug("[Verify] verify template not found, skipping")
+            return
+
+        # 注入 verify prompt 到 message_history
+        message_history.append(
+            {
+                "role": "user",
+                "_type": MT.REFLECTION,
+                "content": [{"type": "text", "text": verify_prompt}],
+            }
+        )
+
+        # 调用 LLM 做 verify
+        try:
+            verify_text, _, _ = await self._handle_llm_call(
+                system_prompt,
+                message_history,
+                [],  # verify 不需要工具
+                999,
+                "Deep verify checkpoint",
+                agent_type=self.agent_name,
+            )
+            if verify_text:
+                logger.info(
+                    f"[Verify] Checkpoint completed ({len(verify_text)} chars, "
+                    f"{time.perf_counter() - _perf_start:.1f}s)"
+                )
+                self.task_log.log_step(
+                    "deep_verify",
+                    f"Verify checkpoint: {verify_text[:200]}...",
+                )
+            else:
+                logger.warning("[Verify] LLM returned empty verify response")
+        except Exception as e:
+            logger.warning(f"[Verify] Checkpoint failed: {e}")
+            # 非致命错误，不影响后续 summary
+
+        self.task_log.record_perf("verify_duration", time.perf_counter() - _perf_start)
+
+    def _handle_read_result(self, ref: str) -> str:
+        """处理 read_result 工具调用：从 offload 文件或 dedup 缓存中回捞完整结果。
+
+        支持两种引用格式：
+        - 文件引用: "turn3_search_15000chars.txt"
+        - 轮次引用: "turn:3" — 返回该轮次所有缓存的工具结果
+        """
+        # 1. 轮次引用: "turn:N"
+        if ref.startswith("turn:"):
+            try:
+                target_turn = int(ref.split(":")[1])
+            except (ValueError, IndexError):
+                return f"Invalid turn reference: {ref}. Use format 'turn:N' where N is a number."
+            records = [
+                r for r in self.context_manager._call_registry if r.turn == target_turn
+            ]
+            if not records:
+                return f"No tool results found for turn {target_turn}."
+            parts = []
+            for r in records:
+                content = r.result_full
+                # 优先用 offload_ref 回捞
+                if r.offload_ref:
+                    restored = self.context_manager.restore_single_file(r.offload_ref)
+                    if restored:
+                        content = restored
+                # 回退: 检查 content 中的 OFFLOADED marker
+                elif content and TAG_OFFLOADED in content:
+                    offload_ref = self._extract_offload_ref(content)
+                    if offload_ref:
+                        restored = self.context_manager.restore_single_file(offload_ref)
+                        if restored:
+                            content = restored
+                if content and TAG_OFFLOADED not in content:
+                    parts.append(
+                        f"=== {r.tool_name} (turn {r.turn}, {r.result_chars} chars) ===\n"
+                        f"{content}"
+                    )
+                else:
+                    parts.append(
+                        f"=== {r.tool_name} (turn {r.turn}) ===\n"
+                        f"[Result not in cache, brief: {r.result_brief}]"
+                    )
+            return "\n\n".join(parts)
+
+        # 2. 文件引用: 通过 context_manager 恢复（支持 on_result_restore hook + 路径遍历防护）
+        content = self.context_manager.restore_single_file(ref)
+        if content is not None:
+            return content
+
+        # 3. Fallback: 在 dedup 缓存中按文件名模式搜索
+        # 文件名格式: turn{N}_{tool_name}_{chars}chars.txt
+        for record in self.context_manager._call_registry:
+            expected_name = f"turn{record.turn}_{record.tool_name}_{record.result_chars}chars.txt"
+            if expected_name == ref and record.result_full:
+                return record.result_full
+
+        return (
+            f"Could not find content for '{ref}'. "
+            f"Available turns: {sorted({r.turn for r in self.context_manager._call_registry})}. "
+            f"Try 'turn:N' format to get results from a specific turn."
+        )
+
+    @staticmethod
+    def _extract_offload_ref(text: str) -> str | None:
+        """Extract filename from an [OFFLOADED:filename|size] marker."""
+        start = text.find(TAG_OFFLOADED)
+        if start < 0:
+            return None
+        start += len(TAG_OFFLOADED)
+        end = text.find("]", start)
+        if end < 0:
+            return None
+        # Format: "filename|size" — take the filename part
+        ref_part = text[start:end]
+        return ref_part.split("|")[0].strip() or None
+
     @staticmethod
     def _is_concurrent_safe(tool_name: str) -> bool:
-        """判断工具是否可以安全并发执行（只读、无副作用）"""
-        name_lower = tool_name.lower()
-        return any(pattern in name_lower for pattern in CONCURRENT_SAFE_TOOL_PATTERNS)
+        """判断工具是否可以安全并发执行（只读、无副作用）。
+
+        使用分段匹配：将工具名按 _ 和 - 拆分为段，检查是否有任一段
+        命中安全集合。避免子串误判（如 "research_and_write" 不会匹配 "search"）。
+        """
+        import re
+        segments = set(re.split(r"[_\-]+", tool_name.lower()))
+        return bool(segments & CONCURRENT_SAFE_TOOL_SEGMENTS)
 
     async def _execute_one_regular_tool(self, call: dict) -> tuple[str, dict]:
         """执行单个普通工具并返回 (call_id, formatted_result)"""
-        # Stream progress: tool execution started
-        tool_name = call.get("tool_name", "")
-        await self.stream_handler.stream_reasoning(
-            self.agent_name, f"[TOOL_PROGRESS] Executing {tool_name}..."
-        ) if hasattr(self.stream_handler, "stream_reasoning") else None
-
         tool_result, _ = await self.tool_executor.execute_single_tool(
             server_name=call["server_name"],
             tool_name=call["tool_name"],
@@ -1532,21 +2064,20 @@ class MainLoopRunner:
         )
         tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
 
-        # Offload large results to filesystem
+        # Backup large results to file (不替换 history，由滑动窗口统一处理)
         result_text = (
             tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
         )
-        if (
-            isinstance(result_text, str)
-            and self.context_manager.config.result_offload_threshold > 0
-        ):
-            shortened, file_path = self.context_manager.offload_large_result(
+        if isinstance(result_text, str):
+            ref = self.context_manager.backup_large_result(
                 result_text,
                 tool_name=call["tool_name"],
                 turn=self.context_manager._current_turn,
             )
-            if file_path:
-                tool_result_for_llm["text"] = shortened
+            if ref:
+                # 挂 metadata 到结果上，供后续 message_history 中的消息携带
+                tool_result_for_llm["_offload_ref"] = ref
+                tool_result_for_llm["_offload_chars"] = len(result_text)
 
         return call["id"], tool_result_for_llm
 
@@ -1630,15 +2161,20 @@ class MainLoopRunner:
             handle_summary=self._handle_summary,
             intercept_key_message=self._intercept_key_message,
             streaming_final_message=self._streaming_final_message,
+            hooks=self.hooks,
+            config_loader=self.config_loader,
         )
 
         # Tool definitions: remove spawn_agent if child can't spawn further
         next_depth = self.spawn_depth + 1
         if next_depth >= MAX_SPAWN_DEPTH:
             spawn_tool_defs = [
-                t
-                for t in (self._current_tool_definitions or [])
-                if t.get("name") != BUILTIN_TOOL_SPAWN_AGENT
+                td
+                for td in (self._current_tool_definitions or [])
+                if not any(
+                    t.get("name") == BUILTIN_TOOL_SPAWN_AGENT
+                    for t in td.get("tools", [td]) if isinstance(t, dict)
+                )
             ]
         else:
             spawn_tool_defs = list(self._current_tool_definitions or [])

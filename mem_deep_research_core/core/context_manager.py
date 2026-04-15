@@ -22,8 +22,9 @@ Context Manager 模块
 import hashlib
 import json
 import logging
+import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mem_deep_research_core.core.constants import (
     MT,
@@ -61,6 +62,19 @@ class ToolCallRecord:
     source_url: str | None = None
     source_title: str | None = None
     source_date: str | None = None
+    offload_ref: str = ""  # 逻辑 ref（如 toolmsg_abcd1234.txt）
+
+
+@dataclass
+class OffloadRecord:
+    """Offload 记录 — 跟踪一条大工具结果的备份与替换状态"""
+
+    ref: str  # 逻辑引用（toolmsg_{uuid8}.txt）
+    turn: int
+    char_count: int
+    tool_names: list[str] = field(default_factory=list)
+    state: str = "backed_up"  # backed_up | pending_evidence | offloaded
+    evidence: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -191,6 +205,7 @@ class ContextManagerConfig:
     # Level 1: 摘要替换
     compact_at_ratio: float = 0.6  # token 占比超过此值时触发 compact
     compact_keep_recent: int = 3  # 至少保留最近 N 轮完整结果
+    compact_preview_length: int = 300  # masking 摘要中保留的结果预览字符数
 
     # Level 2: LLM 压缩
     summarize_at_ratio: float = 0.8  # token 占比超过此值时触发 LLM 压缩
@@ -204,6 +219,9 @@ class ContextManagerConfig:
     # Result offloading
     result_offload_threshold: int = 5000  # 0 = disabled
     result_offload_dir: str = ""
+
+    # Evidence extraction
+    enable_evidence_extraction: bool = True
 
 
 # ============================================================
@@ -255,6 +273,9 @@ class ContextManager:
         # Offload directory for large results
         self._offload_dir: str = ""
 
+        # Offload registry: ref -> OffloadRecord
+        self._offload_registry: dict[str, OffloadRecord] = {}
+
     # ---- 初始化 ----
 
     def _build_pipeline_from_config(self) -> WindowStrategyPipeline:
@@ -266,6 +287,7 @@ class ContextManager:
                     trigger_ratio=self.config.compact_at_ratio,
                     keep_recent=self.config.compact_keep_recent,
                     chars_per_token=self.config.chars_per_token,
+                    preview_length=self.config.compact_preview_length,
                 )
             )
         strategies.append(
@@ -301,32 +323,38 @@ class ContextManager:
         """Set the directory for offloading large results."""
         self._offload_dir = path
 
-    def offload_large_result(
-        self, result_text: str, tool_name: str, turn: int
-    ) -> tuple[str, str | None]:
-        """Offload large tool results.
+    def _generate_offload_ref(self) -> str:
+        """生成稳定的逻辑引用（短 UUID），含碰撞重试"""
+        for _ in range(10):
+            ref = f"toolmsg_{uuid.uuid4().hex[:8]}.txt"
+            if ref not in self._offload_registry:
+                return ref
+        return f"toolmsg_{uuid.uuid4().hex[:12]}.txt"
 
-        默认写本地文件系统。可通过 on_result_offload hook 覆盖存储后端。
+    def backup_large_result(
+        self,
+        result_text: str,
+        tool_name: str,
+        turn: int,
+    ) -> str | None:
+        """Phase 1: 备份大工具结果到文件，返回逻辑 ref。
+
+        只做备份，不替换 message_history 中的内容。
+        真正的替换在 finalize_offload_candidates() 中统一处理。
 
         Hook 签名:
             on_result_offload(ctx, original_fn) -> dict | None
             ctx.extra = {"result_text": str, "tool_name": str, "turn": int, "file_name": str}
-            返回 {"summary": str, "ref": str} 覆盖默认行为，返回 None 走默认。
-
-        Args:
-            result_text: Full result text
-            tool_name: Tool name (for file naming)
-            turn: Current turn number
+            返回 {"ref": str} 覆盖默认行为，返回 None 走默认。
 
         Returns:
-            (text_for_context, ref) — shortened text + storage ref if offloaded, or (original, None)
+            逻辑 ref（如 toolmsg_abcd1234.txt），备份失败或未触发返回 None
         """
         threshold = self.config.result_offload_threshold
         if threshold <= 0 or len(result_text) <= threshold:
-            return result_text, None
+            return None
 
-        file_name = f"turn{turn}_{tool_name}_{len(result_text)}chars.txt"
-        preview = result_text[:500].replace("\n", " ")
+        ref = self._generate_offload_ref()
 
         # Hook: on_result_offload — 用户可覆盖存储后端（S3/Redis/内存等）
         from mem_deep_research_core.core.hooks import HookContext
@@ -340,42 +368,52 @@ class ContextManager:
                         "result_text": result_text,
                         "tool_name": tool_name,
                         "turn": turn,
-                        "file_name": file_name,
-                        "preview": preview,
+                        "file_name": ref,
                     },
                 ),
             )
-            if isinstance(hook_result, dict) and "summary" in hook_result:
-                logger.info(
-                    f"[Context] Offloaded {len(result_text)} chars via hook"
+            if isinstance(hook_result, dict) and hook_result.get("ref"):
+                ref = hook_result["ref"]
+                self._offload_registry[ref] = OffloadRecord(
+                    ref=ref,
+                    turn=turn,
+                    char_count=len(result_text),
+                    tool_names=[tool_name],
+                    state="backed_up",
                 )
-                return hook_result["summary"], hook_result.get("ref")
+                logger.info(
+                    f"[Context] Backed up {len(result_text)} chars via hook, ref={ref}"
+                )
+                return ref
 
         # 默认：写本地文件系统
         offload_dir = self._offload_dir or self.config.result_offload_dir
         if not offload_dir:
-            return result_text, None
+            return None
 
         import os
 
         os.makedirs(offload_dir, exist_ok=True)
 
-        file_path = os.path.join(offload_dir, file_name)
+        file_path = os.path.join(offload_dir, ref)
         try:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(result_text)
         except Exception as e:
-            logger.warning(f"[Context] Failed to offload result: {e}")
-            return result_text, None
+            logger.warning(f"[Context] Failed to backup result: {e}")
+            return None
 
-        summary = (
-            f"{TAG_OFFLOADED}{file_name}|{len(result_text)}]\n"
-            f"Preview: {preview}...\n"
-            f"Use file operations to read the full content if needed."
+        self._offload_registry[ref] = OffloadRecord(
+            ref=ref,
+            turn=turn,
+            char_count=len(result_text),
+            tool_names=[tool_name],
+            state="backed_up",
         )
-
-        logger.info(f"[Context] Offloaded {len(result_text)} chars to {file_path}")
-        return summary, file_path
+        logger.info(
+            f"[Context] Backed up {len(result_text)} chars to {file_path}, ref={ref}"
+        )
+        return ref
 
     def restore_offloaded_content(self, message_history: list) -> int:
         """恢复 offloaded 内容（resume 场景使用）。
@@ -427,9 +465,15 @@ class ContextManager:
                 if isinstance(hook_result, str):
                     original_content = hook_result
 
-            # 默认：从本地文件读取
+            # 默认：从本地文件读取（含路径遍历防护）
             if original_content is None and offload_dir:
-                file_path = os.path.join(offload_dir, file_name)
+                real_offload = os.path.realpath(offload_dir)
+                file_path = os.path.realpath(os.path.join(offload_dir, file_name))
+                if not file_path.startswith(real_offload + os.sep) and file_path != real_offload:
+                    logger.warning(
+                        f"[Context] Path traversal blocked in restore: {file_name!r}"
+                    )
+                    continue
                 if not os.path.isfile(file_path):
                     logger.debug(f"[Context] Offloaded file not found: {file_path}")
                     continue
@@ -446,7 +490,121 @@ class ContextManager:
 
         if restored > 0:
             logger.info(f"[Context] Restored {restored} offloaded messages from {offload_dir}")
+
+        # Rebuild _offload_registry from message_history so that read_result,
+        # finalize_offload_candidates, and microcompact work correctly after resume.
+        self._rebuild_registry_from_history(message_history)
+
         return restored
+
+    def _rebuild_registry_from_history(self, message_history: list) -> None:
+        """Scan message_history to rebuild _offload_registry entries lost during resume.
+
+        Handles two cases:
+        1. Messages with _offload_refs whose content was restored (state="backed_up")
+        2. Messages still carrying OFFLOADED markers (state="offloaded")
+        """
+        import os
+        import re
+
+        offload_dir = self._offload_dir or self.config.result_offload_dir
+
+        for msg in message_history:
+            # Case 1: messages with _offload_refs (content may have been restored)
+            offload_refs = msg.get("_offload_refs")
+            if offload_refs:
+                for ref in offload_refs:
+                    if ref in self._offload_registry:
+                        continue
+                    # Determine char_count from file on disk if available
+                    char_count = 0
+                    if offload_dir:
+                        real_offload = os.path.realpath(offload_dir)
+                        file_path = os.path.realpath(os.path.join(offload_dir, ref))
+                        if file_path.startswith(real_offload + os.sep) and os.path.isfile(file_path):
+                            try:
+                                char_count = os.path.getsize(file_path)
+                            except OSError:
+                                pass
+                    self._offload_registry[ref] = OffloadRecord(
+                        ref=ref,
+                        turn=0,
+                        char_count=char_count,
+                        state="backed_up",
+                    )
+
+            # Case 2: messages still carrying OFFLOADED markers
+            content = msg.get("content")
+            if not isinstance(content, list) or not content:
+                continue
+            first = content[0] if isinstance(content[0], dict) else {}
+            text = first.get("text", "")
+            if not text.startswith(TAG_OFFLOADED):
+                continue
+
+            # Parse all [OFFLOADED:ref|chars] markers in the text
+            for match in re.finditer(
+                re.escape(TAG_OFFLOADED) + r"([^|]+)\|(\d+)\]", text
+            ):
+                ref = match.group(1)
+                chars = int(match.group(2))
+                if ref not in self._offload_registry:
+                    self._offload_registry[ref] = OffloadRecord(
+                        ref=ref,
+                        turn=0,
+                        char_count=chars,
+                        state="offloaded",
+                    )
+
+        if self._offload_registry:
+            logger.info(
+                f"[Context] Rebuilt offload registry: {len(self._offload_registry)} entries"
+            )
+
+    def restore_single_file(self, file_name: str) -> str | None:
+        """根据文件名恢复单个 offloaded 结果。
+
+        与 restore_offloaded_content 共享 on_result_restore hook 逻辑，
+        确保自定义存储后端（S3/Redis）在 read_result 工具调用时也能正常工作。
+
+        Returns:
+            文件内容字符串，找不到返回 None
+        """
+        import os
+
+        from mem_deep_research_core.core.hooks import HookContext
+
+        # Hook: on_result_restore
+        if self._hooks is not None and self._hooks.has_hooks("on_result_restore"):
+            hook_result = self._hooks.call(
+                "on_result_restore",
+                HookContext(
+                    hook_name="on_result_restore",
+                    extra={"file_name": file_name, "marker_text": ""},
+                ),
+            )
+            if isinstance(hook_result, str):
+                return hook_result
+
+        # 默认：从本地文件读取（含路径遍历防护）
+        offload_dir = self._offload_dir or self.config.result_offload_dir
+        if not offload_dir:
+            return None
+
+        real_offload = os.path.realpath(offload_dir)
+        file_path = os.path.realpath(os.path.join(offload_dir, file_name))
+        if not file_path.startswith(real_offload + os.sep) and file_path != real_offload:
+            logger.warning(f"[Context] Path traversal blocked in restore: {file_name!r}")
+            return None
+
+        if not os.path.isfile(file_path):
+            return None
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            logger.warning(f"[Context] Failed to restore file {file_name}: {e}")
+            return None
 
     # ============================================================
     # Microcompact: 每轮自动清理旧 tool_result（零 LLM 成本）
@@ -516,7 +674,16 @@ class ContextManager:
                 if first_text.startswith(TAG_OFFLOADED):
                     continue
 
-            # 构建占位符（有工具记录时用详细摘要，否则用通用占位符）
+            # 有 offload 备份的消息 → OFFLOADED marker（可通过 read_result 回捞）
+            offload_refs = msg.get("_offload_refs")
+            if offload_refs:
+                placeholder = self._build_offload_marker(offload_refs, fallback_chars=char_count)
+                msg["content"] = [{"type": "text", "text": placeholder}]
+                msg["_type"] = MT.OFFLOADED
+                cleaned += 1
+                continue
+
+            # 无 offload 备份 → 通用 placeholder
             turn_records = [r for r in self._call_registry if r.turn == estimated_turn]
             if turn_records:
                 placeholders = []
@@ -539,6 +706,176 @@ class ContextManager:
             )
 
         return cleaned
+
+    # ============================================================
+    # Offload 滑动窗口: prepare + finalize
+    # ============================================================
+
+    def prepare_offload_candidates(
+        self,
+        message_history: list,
+        current_turn: int,
+        keep_recent: int = 0,
+    ) -> list[dict]:
+        """Phase 2: 标记即将滑出 keep_recent 窗口的旧 TOOL_RESULT 消息。
+
+        在每轮 LLM 调用前执行。只做标记，不清扫消息。
+        返回候选消息列表（含 ref），供 sidecar prompt 使用。
+
+        Args:
+            message_history: 消息历史
+            current_turn: 当前轮次
+            keep_recent: 保留最近 N 轮（0 = 使用 config 默认值）
+
+        Returns:
+            候选列表: [{"ref": str, "turn": int, "chars": int, "msg_index": int}]
+        """
+        if keep_recent <= 0:
+            keep_recent = self.config.compact_keep_recent
+
+        # 有意设计：prepare 比 finalize/microcompact 多看一轮。
+        #
+        # prepare cutoff  = N - K + 1  (标记即将滑出的消息)
+        # finalize cutoff = N - K      (替换已滑出的消息)
+        #
+        # 这确保 prepare 在 turn N 标记的消息在当前轮仍有完整内容可见，
+        # LLM 能在本轮 sidecar prompt 中提取 evidence。
+        # 下一轮 (N+1) 的 finalize/microcompact 再执行实际替换。
+        cutoff_turn = current_turn - keep_recent + 1
+        if cutoff_turn <= 0:
+            return []
+
+        candidates = []
+        estimated_turn = 0
+        for i in range(1, len(message_history)):
+            msg = message_history[i]
+
+            if msg.get("role") == "assistant":
+                estimated_turn += 1
+                continue
+
+            if estimated_turn == 0 or estimated_turn > cutoff_turn:
+                continue
+            if msg.get("_type") != MT.TOOL_RESULT:
+                continue
+
+            # 只标记有 offload 备份的消息
+            offload_refs = msg.get("_offload_refs")
+            if not offload_refs:
+                continue
+
+            for ref in offload_refs:
+                record = self._offload_registry.get(ref)
+                if not record:
+                    continue
+                # 重入兜底：pending_evidence 状态的记录也重新纳入候选
+                # （上一轮 LLM 调用可能失败，导致 state 滞留）
+                if record.state in ("backed_up", "pending_evidence"):
+                    record.state = "pending_evidence"
+                    candidates.append({
+                        "ref": ref,
+                        "turn": estimated_turn,
+                        "chars": record.char_count,
+                        "msg_index": i,
+                    })
+
+        if candidates:
+            logger.debug(
+                f"[CONTEXT] Offload candidates: {len(candidates)} messages "
+                f"(turns <= {cutoff_turn}) marked for evidence extraction"
+            )
+        return candidates
+
+    def finalize_offload_candidates(
+        self,
+        message_history: list,
+        current_turn: int,
+        keep_recent: int = 0,
+    ) -> int:
+        """Phase 4: 替换已准备好的候选消息为 OFFLOADED marker。
+
+        在本轮 assistant 响应产生后执行。把 pending_evidence 状态的消息
+        替换为 OFFLOADED marker（内联 evidence）。
+
+        Args:
+            message_history: 消息历史（就地修改）
+            current_turn: 当前轮次
+            keep_recent: 保留最近 N 轮（0 = 使用 config 默认值）
+
+        Returns:
+            被替换的消息数
+        """
+        if keep_recent <= 0:
+            keep_recent = self.config.compact_keep_recent
+
+        cutoff_turn = current_turn - keep_recent
+        if cutoff_turn <= 0:
+            return 0
+
+        replaced = 0
+        estimated_turn = 0
+        for i in range(1, len(message_history)):
+            msg = message_history[i]
+
+            if msg.get("role") == "assistant":
+                estimated_turn += 1
+                continue
+
+            if estimated_turn == 0 or estimated_turn > cutoff_turn:
+                continue
+            if msg.get("_type") not in (MT.TOOL_RESULT,):
+                continue
+
+            offload_refs = msg.get("_offload_refs")
+            if not offload_refs:
+                continue
+
+            # 过滤掉 registry 中不存在的 ref（避免生成空 marker）
+            valid_refs = [r for r in offload_refs if r in self._offload_registry]
+            if not valid_refs:
+                continue
+
+            marker = self._build_offload_marker(valid_refs)
+            msg["content"] = [{"type": "text", "text": marker}]
+            msg["_type"] = MT.OFFLOADED
+            replaced += 1
+
+        if replaced > 0:
+            logger.info(
+                f"[CONTEXT] Finalized {replaced} offload candidates "
+                f"(turns <= {cutoff_turn})"
+            )
+        return replaced
+
+    def _build_offload_marker(self, refs: list[str], fallback_chars: int = 0) -> str:
+        """构建 OFFLOADED marker 文本（microcompact 和 finalize 共用）。"""
+        parts = []
+        for ref in refs:
+            record = self._offload_registry.get(ref)
+            evidence_lines = ""
+            if record and record.evidence:
+                evidence_lines = (
+                    "\n\nEvidence:\n"
+                    + "\n".join(f"- {e}" for e in record.evidence)
+                )
+            ref_chars = record.char_count if record else fallback_chars
+            parts.append(
+                f"{TAG_OFFLOADED}{ref}|{ref_chars}]"
+                f"{evidence_lines}\n"
+                f"Full content: read_result(\"{ref}\")"
+            )
+            if record:
+                record.state = "offloaded"
+        return "\n\n".join(parts)
+
+    def update_offload_evidence(self, ref: str, evidence: list[str]) -> None:
+        """Phase 3: 将解析到的 evidence 绑定到 offload record。"""
+        record = self._offload_registry.get(ref)
+        if record:
+            record.evidence = evidence
+            logger.debug(
+                f"[Context] Bound {len(evidence)} evidence items to ref={ref}"
+            )
 
     # ============================================================
     # Token 估算
@@ -675,6 +1012,11 @@ class ContextManager:
             result_hash = hashlib.md5(result_text.encode("utf-8", errors="replace")).hexdigest()
             result_brief = result_text[:RESULT_BRIEF_LENGTH].strip()
 
+            # 从工具结果 metadata 中提取 offload ref
+            offload_ref = ""
+            if isinstance(result_content, dict):
+                offload_ref = result_content.get("_offload_ref", "")
+
             record = ToolCallRecord(
                 tool_name=tool_name,
                 arguments_hash=args_hash,
@@ -684,6 +1026,7 @@ class ContextManager:
                 result_brief=result_brief,
                 result_full=result_text,
                 result_chars=len(result_text),
+                offload_ref=offload_ref,
             )
 
             if self.config.enable_dedup and args_hash not in self._dedup_cache:
@@ -856,6 +1199,7 @@ class ContextManager:
         self.source_registry.reset()
         self._compacted_turns.clear()
         self._pipeline.reset()
+        self._offload_registry.clear()
 
     @property
     def dedup_cache_size(self) -> int:

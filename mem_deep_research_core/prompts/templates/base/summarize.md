@@ -20,5 +20,5 @@ The original question is:
 - **Response Length**: Match the complexity of your response to the question.
 - Use clear and structured Markdown formatting when appropriate.
 - **Currency Format**: Use `\$` instead of `$` for currency amounts.
-- **Citation Format**: Use `[ID]` format for in-text citations. Add a References section at the end if sources were used.
+- **Citation Format**: Use `[E1]`, `[E2]` etc. to reference evidence items from the Evidence Ledger (if present in the conversation). Add a References section at the end listing cited sources with their URLs.
 - Do NOT mention tools, tool calls, or internal reasoning steps.

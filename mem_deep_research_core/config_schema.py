@@ -108,6 +108,10 @@ class TaskEngineConfig(BaseModel):
     reflection_interval: int = Field(default=5, ge=1, description="反思间隔轮次")
     require_explicit_planning: bool = Field(default=True, description="是否需要显式规划")
     auto_planning: bool = Field(default=False, description="是否启用 LLM 自动任务分解")
+    enable_verify: bool = Field(
+        default=True,
+        description="deep 模式下在 summary 前执行 verify 检查点（证据覆盖 + 冲突检测）",
+    )
 
 
 class InputProcessConfig(BaseModel):
@@ -260,6 +264,11 @@ class ContextManagerConfig(BaseModel):
         default=0.6, ge=0.0, le=1.0, description="token 占比超过此值时触发 compact"
     )
     compact_keep_recent: int = Field(default=3, ge=1, description="至少保留最近 N 轮完整结果")
+    compact_preview_length: int = Field(
+        default=300,
+        ge=0,
+        description="Masking 摘要中保留的结果预览字符数。越大最终 summary 质量越好，但压缩效果越弱。",
+    )
 
     # Level 2: LLM 压缩
     summarize_at_ratio: float = Field(
@@ -273,9 +282,15 @@ class ContextManagerConfig(BaseModel):
 
     # Result offloading
     result_offload_threshold: int = Field(
-        default=5000, ge=0, description="工具结果超过此字符数时卸载到文件，0=禁用"
+        default=5000, ge=0, description="工具结果超过此字符数时备份到文件，0=禁用。替换由 compact_keep_recent 滑动窗口控制"
     )
     result_offload_dir: str = Field(default="", description="卸载文件目录，空=使用 output_dir")
+
+    # Evidence extraction
+    enable_evidence_extraction: bool = Field(
+        default=True,
+        description="每轮工具结果执行后自动提炼高价值证据，常驻 context 不被压缩丢失",
+    )
 
     # Token 估算
     chars_per_token: float = Field(
@@ -345,9 +360,13 @@ class MainAgentConfig(BaseModel):
     max_turns: int = Field(default=20, ge=1, description="最大对话轮次")
     max_tool_calls_per_turn: int = Field(default=10, ge=1, description="每轮最大工具调用数")
     keep_tool_result: int = Field(default=-1, description="保留工具结果数")
-    execution_mode: Literal["auto", "quick", "standard", "deep"] = Field(
+    execution_mode: Literal["auto", "simple_auto", "quick", "standard", "deep"] = Field(
         default="auto",
-        description="执行模式: 'auto' LLM智能路由, 'quick' 快速模式(≤3轮), 'standard' 多轮工具调用, 'deep' 多轮+反思+子agent",
+        description=(
+            "执行模式: 'auto' adaptive路由(quick/standard/deep), "
+            "'simple_auto' 轻量路由(仅quick/standard,不升级deep), "
+            "'quick' 快速模式(≤3轮), 'standard' 多轮工具调用, 'deep' 多轮+反思+子agent"
+        ),
     )
     max_concurrent_subagents: int = Field(default=3, ge=1, description="最大并行子 Agent 数")
     generate_summary: bool = Field(

@@ -12,6 +12,10 @@ Values that are internal implementation details live here.
 # Result text preview length for logs and brief summaries
 RESULT_BRIEF_LENGTH = 200
 
+# Preview length retained in observation masking summaries (chars).
+# Longer = better final summary quality, but slower context savings.
+COMPACT_PREVIEW_LENGTH = 300
+
 # Minimum chars in a message before it's worth compacting
 COMPACT_MIN_CHARS = 200
 
@@ -20,6 +24,9 @@ MICROCOMPACT_MIN_CHARS = 300
 
 # Default chars-per-token ratio (fallback when tiktoken unavailable)
 DEFAULT_CHARS_PER_TOKEN = 3.5
+
+# Evidence extraction: max chars per evidence item
+EVIDENCE_MAX_CHARS = 500
 
 # ============================================================
 # Context Limit Recovery (SummaryHandler)
@@ -72,31 +79,33 @@ DEFAULT_RESULT_OFFLOAD_THRESHOLD = 5000
 BUILTIN_TOOL_UPDATE_TODO = "update_todo"
 BUILTIN_TOOL_SPAWN_AGENT = "spawn_agent"
 BUILTIN_TOOL_SEARCH = "tool_search"
+BUILTIN_TOOL_READ_RESULT = "read_result"
 
 # Maximum nesting depth for spawned agents (prevents exponential resource consumption)
 MAX_SPAWN_DEPTH = 2
 
 # Tools that are safe to execute concurrently (read-only, no side effects).
-# Matched by substring: if any pattern is contained in tool_name, it's concurrent-safe.
-CONCURRENT_SAFE_TOOL_PATTERNS = [
+# Matched by segment: tool_name is split on "_" and "-", then checked for exact
+# segment matches. This avoids false positives like "research_and_write" matching "search".
+CONCURRENT_SAFE_TOOL_SEGMENTS = frozenset({
     "search",
     "scrape",
     "fetch",
     "read",
-    "get_",
-    "list_",
+    "get",
+    "list",
     "query",
     "lookup",
     "wikipedia",
     "calculate",
-    "unit_convert",
-]
+})
 
 # ============================================================
 # Execution Modes
 # ============================================================
 
 EXECUTION_MODE_AUTO = "auto"
+EXECUTION_MODE_SIMPLE_AUTO = "simple_auto"
 EXECUTION_MODE_QUICK = "quick"
 EXECUTION_MODE_STANDARD = "standard"
 EXECUTION_MODE_DEEP = "deep"
@@ -131,6 +140,7 @@ RECENT_TOOL_LOOKBACK = 6
 
 # Keywords that identify system-injected messages (should not be compressed)
 SYSTEM_MESSAGE_KEYWORDS = [
+    "[EVIDENCE]",
     "[REFLECTION",
     "REFLECTION CHECKPOINT",
     "MANDATORY DIRECTIVE",
@@ -159,6 +169,7 @@ DEFAULT_REASONING_TAGS = [
     "task_plan",
     "findings_update",
     "reflection_checkpoint",
+    "evidence",
 ]
 
 # ============================================================
@@ -173,12 +184,23 @@ TAG_CONTEXT_SUMMARY = "[CONTEXT SUMMARY"
 TAG_CONTENT_REMOVED = "[Content removed to reduce context]"
 TAG_OFFLOADED = "[OFFLOADED:"  # prefix for offloaded content markers
 TAG_TASK_PROGRESS = "[TASK PROGRESS]"
+TAG_EVIDENCE = "[EVIDENCE]"
 
-CONTEXT_COMPRESSION_NOTICE = (
+_CONTEXT_COMPRESSION_BASE = (
     "[CONTEXT NOTE] Some earlier messages have been compressed to manage context size. "
-    "Key findings are preserved in the task progress. "
-    "If you need detailed information from compressed content, use available tools to re-fetch it."
+    "Key findings and extracted evidence are preserved in session memory."
 )
+
+_CONTEXT_COMPRESSION_READ_RESULT = (
+    " If you need the full original content from a compressed/offloaded tool result, "
+    "use read_result(ref) with the file reference or read_result(ref='turn:N') for a specific turn."
+)
+
+def build_context_compression_notice(has_read_result: bool = True) -> str:
+    """根据 read_result 工具是否可用动态生成压缩通知"""
+    if has_read_result:
+        return _CONTEXT_COMPRESSION_BASE + _CONTEXT_COMPRESSION_READ_RESULT
+    return _CONTEXT_COMPRESSION_BASE
 
 # ============================================================
 # Message Types — 结构化消息分类
@@ -202,6 +224,7 @@ class MT:
     TOOL_RESULT = "tool_result"
 
     # === 系统注入（受压缩保护） ===
+    EVIDENCE = "evidence"
     SESSION_MEMORY = "session_memory"
     LONG_TERM_MEMORY = "long_term_memory"
     TASK_PROGRESS = "task_progress"
@@ -221,6 +244,9 @@ class MT:
     CONTEXT_SUMMARY = "context_summary"
     OFFLOADED = "offloaded"
 
+    # === Offload 流程辅助 ===
+    OFFLOAD_PREP = "offload_prep"  # sidecar prompt: 通知 LLM 即将 offload 的消息
+
     # === 内部 LLM 调用（不进入主 message_history） ===
     SUMMARY_PROMPT = "summary_prompt"
     ROUTING = "routing"
@@ -229,6 +255,7 @@ class MT:
 
 # 受压缩保护的消息类型集合（不会被 compact / masking / microcompact 清理）
 PROTECTED_MESSAGE_TYPES = frozenset({
+    MT.EVIDENCE,
     MT.SESSION_MEMORY,
     MT.LONG_TERM_MEMORY,
     MT.TASK_PROGRESS,

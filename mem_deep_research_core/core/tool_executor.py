@@ -78,6 +78,9 @@ class ToolExecutor:
         self.retry_backoff_base = retry_backoff_base
         self._hooks = hook_registry
 
+        # 当前轮次 LLM 回复文本（由 main_loop 每轮设置，传入 on_thinking_generate hook）
+        self._current_assistant_text: str | None = None
+
         # Scrape 结果最大长度
         self.scrape_max_length = 20000
 
@@ -161,19 +164,23 @@ class ToolExecutor:
 
         try:
             # 工具调用开始时输出 REASONING
+            start_description = None
             if self.stream_tool_reasoning:
                 try:
                     start_description = self.tool_result_formatter.get_tool_thinking_description(
-                        tool_name, arguments
+                        tool_name, arguments, assistant_text=self._current_assistant_text
                     )
                     await self.stream_tool_reasoning(tool_name, "START", start_description)
                 except Exception as e:
                     logger.debug(f"Failed to stream start reasoning: {e}")
 
-            # 发送工具调用开始事件
+            # 发送工具调用开始事件（附带人类可读描述供前端展示）
             tool_call_id = None
             if self.stream_tool_call:
-                tool_call_id = await self.stream_tool_call(tool_name, arguments)
+                tool_payload = dict(arguments)
+                if start_description:
+                    tool_payload["_display"] = start_description
+                tool_call_id = await self.stream_tool_call(tool_name, tool_payload)
 
             # Hook: on_tool_start — 可修改 arguments（深拷贝防止污染原始记录）
             arguments = copy.deepcopy(arguments)

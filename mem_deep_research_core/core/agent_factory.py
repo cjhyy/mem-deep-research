@@ -288,7 +288,7 @@ class AgentFactory:
             on_progress("started", {"task_id": task_id, "task": task})
 
         try:
-            final_answer, boxed_answer, log_file = await execute_task_pipeline(
+            final_answer, boxed_answer, log_file, pipeline_status = await execute_task_pipeline(
                 cfg=self.agent_config.cfg,
                 task_name="agent_task",
                 task_id=task_id,
@@ -313,7 +313,7 @@ class AgentFactory:
                 final_answer=final_answer,
                 boxed_answer=boxed_answer,
                 log_path=log_file,
-                status="completed",
+                status=pipeline_status,
                 duration_seconds=duration,
             )
 

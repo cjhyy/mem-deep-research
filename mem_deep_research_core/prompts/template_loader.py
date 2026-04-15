@@ -97,6 +97,10 @@ class PromptTemplateLoader:
 
         if not template_path:
             search_dirs = [str(p) for p in self._search_paths]
+            logger.warning(
+                f"[TemplateLoader] Template '{name}' NOT FOUND | "
+                f"search_paths={search_dirs} cwd={Path.cwd()}"
+            )
             raise FileNotFoundError(f"Template '{name}' not found in: {search_dirs}")
 
         with open(template_path, encoding="utf-8") as f:
@@ -105,7 +109,7 @@ class PromptTemplateLoader:
         if use_cache:
             self._cache[name] = content
 
-        logger.debug(f"Loaded template: {name} from {template_path}")
+        logger.debug(f"[TemplateLoader] Loaded template: {name} from {template_path}")
         return content
 
     def render_template(self, template: str, **variables: Any) -> str:

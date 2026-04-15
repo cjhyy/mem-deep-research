@@ -140,7 +140,7 @@ main_agent:
   response_language: auto        # auto | Chinese | English | Japanese | ...
 
   task_engine:
-    enabled: true
+    enabled: false               # 配置 deep 行为参数，不再单独决定 auto 路由
     reflection_interval: 5
 
   context_manager:
@@ -275,13 +275,13 @@ result = await dr.run("查询用户信息", context={
 
 ```
 DeepResearch.run(query)
-  → Pipeline → AgentFactory → Orchestrator
+  → AgentFactory → Pipeline → Orchestrator
     → PromptBuilder 构建 system prompt
     → MainLoopRunner 执行主循环:
-        LLM 调用 → 工具执行 → Context 管理 → 监控检查
+        路由 effective_mode → LLM 调用 → 工具执行 → Context 管理 → 监控检查
         (子 Agent 复用同一 MainLoopRunner，隔离上下文)
     → SummaryHandler 生成最终摘要
-  → ResearchResult
+  → TaskResult
 ```
 
 详细文档见 [`docs/`](docs/) 目录：
@@ -303,6 +303,10 @@ DeepResearch.run(query)
 | [12-memory-and-todo](docs/12-memory-and-todo.md) | 记忆与任务追踪 |
 | [13-execution-modes](docs/13-execution-modes.md) | 执行模式与语言控制 |
 | [14-api-reference](docs/14-api-reference.md) | API 参考 |
+| [15-technical-roadmap](docs/15-technical-roadmap.md) | 技术 Roadmap |
+| [16-dual-mode-execution-plan](docs/16-dual-mode-execution-plan.md) | Dual-mode 当前状态 |
+| [17-repo-architecture-review](docs/17-repo-architecture-review.md) | 仓库架构评估与演进建议 |
+| [18-offload-evidence-optimization](docs/18-offload-evidence-optimization.md) | Offload 与 Evidence 联动优化方案 |
 
 ## 开发
 

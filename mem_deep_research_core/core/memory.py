@@ -31,6 +31,23 @@ class SourceRecord:
 
 
 @dataclass
+class EvidenceItem:
+    """从工具结果中提炼的高价值证据
+
+    与 key_findings（从 LLM 回复文本提取）不同，evidence 直接从工具原始结果中
+    提炼结构化事实，质量更高、信息密度更大。
+    """
+
+    tool_name: str  # 来源工具
+    turn: int  # 产生的轮次
+    summary: str  # 提炼后的证据摘要
+    key_arg: str = ""  # 关键参数（如搜索词、URL）
+    offload_ref: str = ""  # 如果原始结果被 offload，文件名引用
+    source_url: str = ""  # 证据来源 URL
+    confidence: str = ""  # 置信度: high / medium / low
+
+
+@dataclass
 class SessionMemory:
     """Session 内的结构化记忆
 
@@ -45,11 +62,13 @@ class SessionMemory:
     attempted_strategies: list[str] = field(default_factory=list)
     sources: list[SourceRecord] = field(default_factory=list)
     sub_agent_results: dict[str, str] = field(default_factory=dict)
+    evidence_items: list[EvidenceItem] = field(default_factory=list)
 
     # Limits
     max_findings: int = 20
     max_strategies: int = 15
     max_sources: int = 30
+    max_evidence: int = 30
 
     # Threading lock (not included in repr/eq/hash)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
@@ -80,6 +99,16 @@ class SessionMemory:
                 if len(self.sources) > self.max_sources:
                     self.sources = self.sources[-self.max_sources :]
 
+    def add_evidence(self, item: EvidenceItem):
+        """添加证据项（按 summary 去重，线程安全）"""
+        with self._lock:
+            if item.summary and not any(
+                e.summary == item.summary for e in self.evidence_items
+            ):
+                self.evidence_items.append(item)
+                if len(self.evidence_items) > self.max_evidence:
+                    self.evidence_items = self.evidence_items[-self.max_evidence :]
+
     def add_sub_agent_result(self, agent_name: str, result: str):
         """记录子 Agent 结果（线程安全）"""
         with self._lock:
@@ -93,8 +122,23 @@ class SessionMemory:
             strategies = list(self.attempted_strategies)
             sources = list(self.sources)
             sub_results = dict(self.sub_agent_results)
+            evidence = list(self.evidence_items)
 
         sections = []
+
+        if evidence:
+            lines = []
+            for i, e in enumerate(evidence, 1):
+                header = f"[E{i}] Turn {e.turn} | {e.tool_name}"
+                if e.key_arg:
+                    header += f'("{e.key_arg}")'
+                if e.confidence:
+                    header += f" | {e.confidence}"
+                if e.source_url:
+                    lines.append(f"{header}\n  Source: {e.source_url}\n  {e.summary}")
+                else:
+                    lines.append(f"{header}\n  {e.summary}")
+            sections.append("## Evidence Ledger\n" + "\n".join(lines))
 
         if findings:
             text = "\n".join(f"- {f}" for f in findings)
@@ -123,6 +167,26 @@ class SessionMemory:
 
         return "[SESSION MEMORY]\n\n" + "\n\n".join(sections) + "\n"
 
+    def to_evidence_string(self) -> str:
+        """生成仅含证据的摘要（用于独立注入 message_history，受压缩保护）"""
+        with self._lock:
+            evidence = list(self.evidence_items)
+        if not evidence:
+            return ""
+        lines = []
+        for i, e in enumerate(evidence, 1):
+            header = f"[E{i}] Turn {e.turn} | {e.tool_name}"
+            if e.key_arg:
+                header += f'("{e.key_arg}")'
+            if e.confidence:
+                header += f" | confidence: {e.confidence}"
+            if e.source_url:
+                header += f"\n  Source: {e.source_url}"
+            if e.offload_ref:
+                header += f"\n  Full content: read_result(\"{e.offload_ref}\")"
+            lines.append(f"{header}\n  {e.summary}")
+        return "[EVIDENCE LEDGER]\n\n" + "\n\n".join(lines) + "\n"
+
     def is_empty(self) -> bool:
         with self._lock:
             return (
@@ -130,6 +194,7 @@ class SessionMemory:
                 and not self.attempted_strategies
                 and not self.sources
                 and not self.sub_agent_results
+                and not self.evidence_items
             )
 
     def extract_from_tool_result(self, tool_name: str, tool_result: dict | str):

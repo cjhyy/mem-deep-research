@@ -63,10 +63,10 @@ def create_mcp_server_parameters(
                 with contextlib.suppress(ValueError):
                     tool_cfg_resolved = _loader.load_tool_config(tool)
 
-                # 回退到框架内置配置
+                # 回退到框架内置配置（包内 mem_deep_research_core/config/）
                 if tool_cfg_resolved is None:
                     config_path = (
-                        pathlib.Path(__file__).parent.parent.parent
+                        pathlib.Path(__file__).parent.parent
                         / "config"
                         / "tool"
                         / f"{tool}.yaml"
@@ -145,7 +145,44 @@ def create_mcp_server_parameters(
     return configs, blacklist
 
 
-def _load_agent_prompt(prompt_cfg: dict = None) -> AgentPrompt:
+def _resolve_templates_dir(
+    raw_dir: str | None, project_dir: pathlib.Path | None = None
+) -> pathlib.Path | None:
+    """将 templates_dir 解析为绝对路径。
+
+    解析顺序:
+    1. 已是绝对路径 → 直接使用
+    2. project_dir 可用 → 相对于 project_dir 解析
+    3. 回退到相对于 cwd 解析（向下兼容）
+    """
+    if not raw_dir:
+        return None
+
+    path = pathlib.Path(raw_dir)
+    if path.is_absolute():
+        return path
+
+    # 优先相对于 project_dir
+    if project_dir:
+        resolved = (pathlib.Path(project_dir) / path).resolve()
+        if resolved.is_dir():
+            return resolved
+
+    # 回退到 cwd（本地开发时 cwd 通常就是项目目录）
+    cwd_resolved = path.resolve()
+    if cwd_resolved.is_dir():
+        return cwd_resolved
+
+    logger.warning(
+        f"[_resolve_templates_dir] templates_dir not found: "
+        f"raw={raw_dir} project_dir={project_dir} cwd={pathlib.Path.cwd()}"
+    )
+    return cwd_resolved
+
+
+def _load_agent_prompt(
+    prompt_cfg: dict = None, project_dir: str | pathlib.Path | None = None
+) -> AgentPrompt:
     """加载 Agent 提示词
 
     Args:
@@ -156,6 +193,7 @@ def _load_agent_prompt(prompt_cfg: dict = None) -> AgentPrompt:
             - templates_dir: 自定义模板目录
             - custom_system_template: 自定义系统模板
             - custom_summarize_template: 自定义总结模板
+        project_dir: 项目目录，用于将 templates_dir 相对路径解析为绝对路径
 
     Returns:
         AgentPrompt 实例
@@ -163,11 +201,13 @@ def _load_agent_prompt(prompt_cfg: dict = None) -> AgentPrompt:
     if not prompt_cfg:
         prompt_cfg = {}
 
+    templates_dir = _resolve_templates_dir(prompt_cfg.get("templates_dir"), project_dir)
+
     return AgentPrompt(
         agent_type=prompt_cfg.get("agent_type", "main"),
         tool_format=prompt_cfg.get("tool_format", "xml"),
         presets=prompt_cfg.get("presets", []),
-        templates_dir=prompt_cfg.get("templates_dir"),
+        templates_dir=templates_dir,
         custom_system_template=prompt_cfg.get("custom_system_template"),
         custom_summarize_template=prompt_cfg.get("custom_summarize_template"),
         minimal=prompt_cfg.get("minimal", False),

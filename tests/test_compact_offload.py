@@ -2,9 +2,10 @@
 Integration tests — Compact + Offload + Resume chain.
 
 Covers:
-- ContextManager.offload_large_result: writes file, returns summary
-- ContextManager.restore_offloaded_content: reads file, restores message
-- Offload + restore round-trip
+- ContextManager.backup_large_result: writes file, returns logical ref
+- Sliding window offload: finalize_offload_candidates replaces old results
+- Evidence inlined in OFFLOADED markers
+- restore_single_file: reads backed-up content by ref
 - ObservationMaskingStrategy: masks old tool outputs
 - BinaryReductionStrategy: emergency truncation
 - WindowStrategyPipeline: orchestrates strategies in order
@@ -32,85 +33,179 @@ from mem_deep_research_core.core.window_strategy import (
 # ============================================================
 
 
-class TestOffloadLargeResult:
-    def test_small_result_not_offloaded(self, tmp_path):
-        """Results below threshold pass through unchanged."""
+class TestBackupLargeResult:
+    def test_small_result_not_backed_up(self, tmp_path):
+        """Results below threshold → no backup, returns None."""
         cm = ContextManager(
             config=ContextManagerConfig(result_offload_threshold=1000)
         )
         cm.set_offload_dir(str(tmp_path))
 
-        text = "short result"
-        summary, ref = cm.offload_large_result(text, "search", turn=1)
-        assert summary == text
+        ref = cm.backup_large_result("short result", "search", turn=1)
         assert ref is None
 
-    def test_large_result_offloaded_to_file(self, tmp_path):
-        """Results above threshold → written to file, summary returned."""
+    def test_large_result_backed_up_to_file(self, tmp_path):
+        """Results above threshold → written to file, returns ref."""
         cm = ContextManager(
             config=ContextManagerConfig(result_offload_threshold=100)
         )
         cm.set_offload_dir(str(tmp_path))
 
         large_text = "x" * 500
-        summary, ref = cm.offload_large_result(large_text, "scrape", turn=2)
+        ref = cm.backup_large_result(large_text, "scrape", turn=2)
 
         assert ref is not None
-        assert os.path.isfile(ref)
-        assert TAG_OFFLOADED in summary
-        assert "500" in summary  # chars count in marker
-        assert "Preview:" in summary
+        assert ref.startswith("toolmsg_")
+        assert ref.endswith(".txt")
 
         # File should contain the full text
-        with open(ref) as f:
+        file_path = os.path.join(str(tmp_path), ref)
+        assert os.path.isfile(file_path)
+        with open(file_path) as f:
             assert f.read() == large_text
 
-    def test_offload_disabled_when_threshold_zero(self, tmp_path):
-        """threshold=0 means offload is disabled."""
+        # Registry should have a record
+        assert ref in cm._offload_registry
+        assert cm._offload_registry[ref].state == "backed_up"
+        assert cm._offload_registry[ref].char_count == 500
+
+    def test_backup_disabled_when_threshold_zero(self, tmp_path):
+        """threshold=0 means backup is disabled."""
         cm = ContextManager(
             config=ContextManagerConfig(result_offload_threshold=0)
         )
         cm.set_offload_dir(str(tmp_path))
 
-        text = "x" * 10000
-        summary, ref = cm.offload_large_result(text, "tool", turn=1)
-        assert summary == text
+        ref = cm.backup_large_result("x" * 10000, "tool", turn=1)
         assert ref is None
 
-    def test_offload_no_dir_configured(self):
-        """No offload_dir set → large result passes through."""
+    def test_backup_no_dir_configured(self):
+        """No offload_dir set → no backup."""
         cm = ContextManager(
             config=ContextManagerConfig(result_offload_threshold=50)
         )
-        # No set_offload_dir call
-
-        text = "x" * 200
-        summary, ref = cm.offload_large_result(text, "tool", turn=1)
-        assert summary == text
+        ref = cm.backup_large_result("x" * 200, "tool", turn=1)
         assert ref is None
 
 
-class TestRestoreOffloadedContent:
-    def test_restore_round_trip(self, tmp_path):
-        """offload → restore should reconstruct the original content."""
+class TestSlidingWindowOffload:
+    def test_recent_turns_kept_intact(self, tmp_path):
+        """Messages within keep_recent window should NOT be offloaded."""
+        cm = ContextManager(
+            config=ContextManagerConfig(
+                result_offload_threshold=100,
+                compact_keep_recent=2,
+            )
+        )
+        cm.set_offload_dir(str(tmp_path))
+
+        ref = cm.backup_large_result("A" * 500, "search", turn=1)
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "query"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "thinking"}]},
+            {"role": "user", "content": [{"type": "text", "text": "A" * 500}],
+             "_type": MT.TOOL_RESULT, "_offload_refs": [ref]},
+            {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+        ]
+
+        # current_turn=2, keep_recent=2: turn 1 is within window
+        replaced = cm.finalize_offload_candidates(messages, current_turn=2, keep_recent=2)
+        assert replaced == 0
+        assert "A" * 500 == messages[2]["content"][0]["text"]
+
+    def test_old_turns_offloaded_with_marker(self, tmp_path):
+        """Messages outside keep_recent window should be replaced with OFFLOADED marker."""
+        cm = ContextManager(
+            config=ContextManagerConfig(
+                result_offload_threshold=100,
+                compact_keep_recent=1,
+            )
+        )
+        cm.set_offload_dir(str(tmp_path))
+
+        ref = cm.backup_large_result("B" * 500, "fetch", turn=1)
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "query"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "turn 1"}]},
+            {"role": "user", "content": [{"type": "text", "text": "B" * 500}],
+             "_type": MT.TOOL_RESULT, "_offload_refs": [ref]},
+            {"role": "assistant", "content": [{"type": "text", "text": "turn 2"}]},
+            {"role": "user", "content": [{"type": "text", "text": "recent result"}],
+             "_type": MT.TOOL_RESULT},
+        ]
+
+        # current_turn=3, keep_recent=1: only turn 3 is kept, turn 1 is old
+        replaced = cm.finalize_offload_candidates(messages, current_turn=3, keep_recent=1)
+        assert replaced == 1
+        assert TAG_OFFLOADED in messages[2]["content"][0]["text"]
+        assert ref in messages[2]["content"][0]["text"]
+        assert messages[2]["_type"] == MT.OFFLOADED
+        assert cm._offload_registry[ref].state == "offloaded"
+
+    def test_evidence_inlined_in_marker(self, tmp_path):
+        """OFFLOADED marker should inline evidence if available."""
+        cm = ContextManager(
+            config=ContextManagerConfig(
+                result_offload_threshold=100,
+                compact_keep_recent=1,
+            )
+        )
+        cm.set_offload_dir(str(tmp_path))
+
+        ref = cm.backup_large_result("C" * 500, "search", turn=1)
+        cm.update_offload_evidence(ref, ["key fact 1", "key fact 2"])
+
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "query"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "turn 1"}]},
+            {"role": "user", "content": [{"type": "text", "text": "C" * 500}],
+             "_type": MT.TOOL_RESULT, "_offload_refs": [ref]},
+            {"role": "assistant", "content": [{"type": "text", "text": "turn 2"}]},
+            {"role": "user", "content": [{"type": "text", "text": "recent"}],
+             "_type": MT.TOOL_RESULT},
+        ]
+
+        cm.finalize_offload_candidates(messages, current_turn=3, keep_recent=1)
+        marker_text = messages[2]["content"][0]["text"]
+        assert "Evidence:" in marker_text
+        assert "key fact 1" in marker_text
+        assert "key fact 2" in marker_text
+        assert f'read_result("{ref}")' in marker_text
+
+    def test_read_result_restores_backed_up_content(self, tmp_path):
+        """read_result(ref) should be able to restore backed-up content."""
         cm = ContextManager(
             config=ContextManagerConfig(result_offload_threshold=100)
         )
         cm.set_offload_dir(str(tmp_path))
 
-        original = "A" * 500
-        summary, ref = cm.offload_large_result(original, "fetch", turn=3)
+        original = "D" * 500
+        ref = cm.backup_large_result(original, "fetch", turn=1)
         assert ref is not None
 
-        # Build a message_history with the offloaded summary
-        message_history = [
-            {"role": "user", "content": [{"type": "text", "text": summary}]}
+        content = cm.restore_single_file(ref)
+        assert content == original
+
+    def test_no_backup_means_no_finalize(self, tmp_path):
+        """Messages without _offload_refs should not be touched by finalize."""
+        cm = ContextManager(
+            config=ContextManagerConfig(compact_keep_recent=1)
+        )
+
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "query"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "turn 1"}]},
+            {"role": "user", "content": [{"type": "text", "text": "small result"}],
+             "_type": MT.TOOL_RESULT},
+            {"role": "assistant", "content": [{"type": "text", "text": "turn 2"}]},
         ]
 
-        restored_count = cm.restore_offloaded_content(message_history)
-        assert restored_count == 1
-        assert message_history[0]["content"][0]["text"] == original
+        replaced = cm.finalize_offload_candidates(messages, current_turn=5, keep_recent=1)
+        assert replaced == 0
+        assert messages[2]["content"][0]["text"] == "small result"
 
+
+class TestRestoreOffloadedContent:
     def test_restore_ignores_normal_messages(self, tmp_path):
         """Messages without OFFLOADED marker are not touched."""
         cm = ContextManager(
@@ -134,7 +229,6 @@ class TestRestoreOffloadedContent:
         )
         cm.set_offload_dir(str(tmp_path))
 
-        # Create an offloaded reference manually (file doesn't exist)
         marker = f"{TAG_OFFLOADED}missing_file.txt|999]\nPreview: ...\n"
         message_history = [
             {"role": "user", "content": [{"type": "text", "text": marker}]}
@@ -142,6 +236,59 @@ class TestRestoreOffloadedContent:
 
         restored = cm.restore_offloaded_content(message_history)
         assert restored == 0
+
+    def test_registry_rebuilt_after_restore(self, tmp_path):
+        """After restore, _offload_registry should be rebuilt from message_history."""
+        cm = ContextManager(
+            config=ContextManagerConfig(result_offload_threshold=100)
+        )
+        cm.set_offload_dir(str(tmp_path))
+
+        # Backup a large result (populates registry + writes file)
+        original = "E" * 500
+        ref = cm.backup_large_result(original, "search", turn=1)
+        assert ref is not None
+
+        # Build message_history with an offloaded marker and a restored message
+        marker = f"{TAG_OFFLOADED}{ref}|500]\nFull content: read_result(\"{ref}\")"
+        message_history = [
+            {"role": "user", "content": [{"type": "text", "text": "query"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "turn 1"}]},
+            # This message still has _offload_refs and will be restored
+            {"role": "user", "content": [{"type": "text", "text": marker}],
+             "_offload_refs": [ref]},
+        ]
+
+        # Clear registry to simulate resume (fresh ContextManager)
+        cm._offload_registry.clear()
+        assert len(cm._offload_registry) == 0
+
+        cm.restore_offloaded_content(message_history)
+
+        # Registry should have been rebuilt
+        assert ref in cm._offload_registry
+        assert cm._offload_registry[ref].state == "backed_up"
+
+    def test_registry_rebuilt_for_unrestorable_markers(self, tmp_path):
+        """OFFLOADED markers that can't be restored still get registry entries."""
+        cm = ContextManager(
+            config=ContextManagerConfig(result_offload_threshold=100)
+        )
+        cm.set_offload_dir(str(tmp_path))
+
+        # Marker for a file that doesn't exist on disk
+        ref = "toolmsg_deadbeef.txt"
+        marker = f"{TAG_OFFLOADED}{ref}|1234]\nEvidence:\n- key fact"
+        message_history = [
+            {"role": "user", "content": [{"type": "text", "text": marker}]},
+        ]
+
+        cm.restore_offloaded_content(message_history)
+
+        # Registry should still be rebuilt from the marker metadata
+        assert ref in cm._offload_registry
+        assert cm._offload_registry[ref].state == "offloaded"
+        assert cm._offload_registry[ref].char_count == 1234
 
 
 # ============================================================

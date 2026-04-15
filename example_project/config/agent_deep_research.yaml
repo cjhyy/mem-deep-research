@@ -21,6 +21,8 @@ main_agent:
     agent_type: main
     tool_format: xml
     presets: [task_completion]
+    templates_dir: "config/prompts"
+    custom_system_template: "deep_research_system"
 
   llm:
     provider_class: "ClaudeOpenRouterClient"

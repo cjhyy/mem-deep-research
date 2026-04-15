@@ -26,10 +26,13 @@ Usage:
 
 import contextlib
 import datetime
+import logging
 from pathlib import Path
 from typing import Any
 
 from mem_deep_research_core.prompts.template_loader import PromptTemplateLoader
+
+logger = logging.getLogger(__name__)
 
 
 class AgentPrompt:
@@ -180,7 +183,12 @@ class AgentPrompt:
                     custom_content = extra_context.strip() + "\n\n" + custom_content
                 parts.append(custom_content)
             except FileNotFoundError:
-                pass  # 回退到默认构建
+                logger.warning(
+                    f"[AgentPrompt] Custom system template '{self.custom_system_template}' not found "
+                    f"in search paths: {[str(p) for p in self.loader._search_paths]}. "
+                    f"Falling back to default prompt. "
+                    f"If templates_dir is a relative path, ensure project_dir is set correctly."
+                )
 
         # 2. 默认构建（无 custom 模板或加载失败时）
         if not parts:
@@ -275,7 +283,11 @@ class AgentPrompt:
                     target_language=target_language,
                 )
             except FileNotFoundError:
-                pass
+                logger.warning(
+                    f"[AgentPrompt] Custom summarize template '{self.custom_summarize_template}' "
+                    f"not found in search paths: {[str(p) for p in self.loader._search_paths]}. "
+                    f"Falling back to default summarize prompt."
+                )
 
         # 使用基础模板
         return self.loader.load_and_render(

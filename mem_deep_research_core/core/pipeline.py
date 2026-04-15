@@ -40,7 +40,7 @@ async def execute_task_pipeline(
     sub_agent_llm_client: Any | None = None,
     resume_from: dict | None = None,
     runtime: Any | None = None,
-) -> tuple[str, str, pathlib.Path]:
+) -> tuple[str, str, pathlib.Path, str]:
     """
     Executes the full pipeline for a single task.
 
@@ -115,12 +115,35 @@ async def execute_task_pipeline(
                 sub_agent_llm_client = None
                 logger.info("No sub agents defined, using main agent only for the task")
 
+        # Initialize router LLM client (lightweight model for auto mode task classification)
+        router_llm_client = None
+        router_model = cfg.main_agent.get("llm", {}).get("router_model")
+        if router_model and cfg.main_agent.get("execution_mode", "auto") == "auto":
+            try:
+                from copy import deepcopy
+
+                from omegaconf import OmegaConf
+
+                router_llm_cfg = deepcopy(cfg.main_agent.llm)
+                router_llm_cfg = OmegaConf.to_container(router_llm_cfg, resolve=True)
+                router_llm_cfg["model_name"] = router_model
+                router_llm_cfg["max_tokens"] = 64  # router only needs a few tokens
+                router_llm_cfg["enable_streaming"] = False
+                router_llm_cfg = OmegaConf.create(router_llm_cfg)
+                router_llm_client = LLMClient(
+                    task_id=f"{task_id}_router", llm_config=router_llm_cfg
+                )
+                logger.info(f"[Pipeline] Router LLM client created: model={router_model}")
+            except Exception as e:
+                logger.warning(f"[Pipeline] Failed to create router LLM client: {e}")
+
         # Initialize orchestrator
         orchestrator = Orchestrator(
             main_agent_tool_manager=main_agent_tool_manager,
             sub_agent_tool_managers=sub_agent_tool_managers,
             llm_client=main_agent_llm_client,
             sub_agent_llm_client=sub_agent_llm_client,
+            router_llm_client=router_llm_client,
             output_formatter=output_formatter,
             task_log=task_log,
             cfg=cfg,
@@ -163,6 +186,7 @@ async def execute_task_pipeline(
         for _owns, _client, _label in [
             (_owns_main_client, main_agent_llm_client, "main_agent"),
             (_owns_sub_client, sub_agent_llm_client, "sub_agent"),
+            (True, router_llm_client, "router"),
         ]:
             if _owns and _client is not None:
                 try:
@@ -193,7 +217,7 @@ async def execute_task_pipeline(
 
         logger.debug(f"--- Finished Task Execution: {task_id} ---")
 
-        return final_answer, final_boxed_answer, task_log.log_path
+        return final_answer, final_boxed_answer, task_log.log_path, task_log.status
 
 
 def create_pipeline_components(cfg: DictConfig, logs_dir: str | None = None, *, runtime=None):

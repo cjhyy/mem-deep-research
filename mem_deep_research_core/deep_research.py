@@ -403,7 +403,7 @@ class DeepResearch:
                 "keep_tool_result": -1,
                 "execution_mode": execution_mode,
                 "task_engine": {
-                    "enabled": True,
+                    "enabled": False,
                     "reflection_interval": 3,
                     "require_explicit_planning": True,
                 },

@@ -9,6 +9,10 @@ Auto 模式下的统一路由入口，main_loop 只需调一次 router.route()�
 3. LLM 分类路由 — 用轻量模型判断（需配置 router_model）
 4. 默认 standard
 
+Auto 模式默认使用 adaptive 策略：跳过 LLM 分类，先用 standard 跑第一轮，
+根据第一轮 LLM 的实际行为（有无工具调用、是否直接回答）自动定模式。
+调用 LLMRouter.adaptive_classify() 即可。
+
 路由结果通过 Hook on_route_apply 后处理，可修改 mode / reasoning_effort / thinking_params。
 
 用法：
@@ -155,17 +159,19 @@ class LLMRouter:
         structural = self._structural_route(
             tool_count=tool_count,
             has_sub_agents=has_sub_agents,
-            task_engine_enabled=task_engine_enabled,
         )
         if structural is not None:
             logger.info(f"[LLMRouter] Structural route: {structural.mode}")
             return self._finalize(structural, query, context)
 
-        # 3. LLM 分类（如果有 router client）
-        if self.router_llm_client is not None:
-            llm_result = await self._llm_classify(query, tool_count)
+        # 3. LLM 分类（优先用 router_llm_client，未配置时回退到主 llm_client）
+        classify_client = self.router_llm_client or self.llm_client
+        if classify_client is not None:
+            llm_result = await self._llm_classify(query, tool_count, classify_client)
             if llm_result is not None:
-                logger.info(f"[LLMRouter] LLM classified as: {llm_result.mode}")
+                source = "router" if self.router_llm_client else "main_llm"
+                llm_result.source = source
+                logger.info(f"[LLMRouter] LLM classified as: {llm_result.mode} (via {source})")
                 return self._finalize(llm_result, query, context)
 
         # 4. 默认 standard
@@ -176,21 +182,20 @@ class LLMRouter:
         self,
         tool_count: int,
         has_sub_agents: bool,
-        task_engine_enabled: bool,
     ) -> RouteResult | None:
         """结构信号路由（零成本）。
 
         确定性判断：
-        - task_engine 启用 或 有子 agent → deep
+        - 有显式配置的子 agent → deep（用户意图明确）
         - 无工具 → quick
         - 其他 → 返回 None（交给下一层判断）
         """
-        if task_engine_enabled or has_sub_agents:
+        if has_sub_agents:
             return RouteResult(
                 mode=EXECUTION_MODE_DEEP,
                 reasoning_effort="high",
                 source="structural",
-                metadata={"reason": "task_engine or sub_agents enabled"},
+                metadata={"reason": "sub_agents configured"},
             )
 
         if tool_count == 0:
@@ -203,15 +208,20 @@ class LLMRouter:
 
         return None
 
-    async def _llm_classify(self, query: str, tool_count: int) -> RouteResult | None:
-        """用轻量 LLM 判断任务复杂度"""
+    async def _llm_classify(
+        self, query: str, tool_count: int, client=None
+    ) -> RouteResult | None:
+        """用 LLM 判断任务复杂度。client 由调用方确定并传入。"""
+        if client is None:
+            return None
+
         user_prompt = _ROUTING_USER_TEMPLATE.format(
             query=query[:500],
             tool_count=tool_count,
         )
 
         try:
-            response = await self.router_llm_client.create_message(
+            response = await client.create_message(
                 system_prompt=_ROUTING_SYSTEM_PROMPT,
                 message_history=[
                     {"role": "user", "content": [{"type": "text", "text": user_prompt}]}
@@ -220,10 +230,19 @@ class LLMRouter:
                 keep_tool_result=-1,
             )
 
-            if not response or not response.choices:
+            if not response:
                 return None
 
-            content = getattr(response.choices[0].message, "content", None)
+            # 兼容 OpenAI 风格 (choices[]) 和 Anthropic 风格 (content[])
+            content = None
+            if hasattr(response, "choices") and response.choices:
+                # OpenAI / OpenRouter: response.choices[0].message.content
+                content = getattr(response.choices[0].message, "content", None)
+            elif hasattr(response, "content") and response.content:
+                # Anthropic: response.content is list of content blocks
+                blocks = response.content
+                if blocks and hasattr(blocks[0], "text"):
+                    content = blocks[0].text
             if not content:
                 return None
 
@@ -306,6 +325,83 @@ class LLMRouter:
                 self.llm_client.reasoning_effort = result.reasoning_effort
 
         return result
+
+    # ------------------------------------------------------------------
+    # Adaptive classification — zero-cost, based on first-turn LLM behavior
+    # ------------------------------------------------------------------
+
+    # Threshold: if the first turn produces >= this many tool calls, upgrade to deep
+    ADAPTIVE_DEEP_TOOL_THRESHOLD = 3
+
+    @staticmethod
+    def adaptive_classify(
+        *,
+        should_break: bool,
+        tool_calls: list | None,
+        has_spawn_agent: bool = False,
+        allow_deep: bool = True,
+    ) -> RouteResult:
+        """Classify execution mode from first-turn LLM behavior (zero LLM cost).
+
+        Called after the first main-LLM turn completes. Decides whether the task
+        is quick (already answered), deep (many tools / spawn), or standard.
+
+        Args:
+            should_break: Whether the LLM signalled completion (no more turns needed).
+            tool_calls: Raw tool_calls from the LLM response.
+                        Format: [list_of_calls, list_of_raw_calls] or falsy.
+            has_spawn_agent: Whether any tool call is spawn_agent.
+            allow_deep: If False, clamp deep → standard (used by simple_auto mode).
+
+        Returns:
+            RouteResult with mode and reasoning_effort.
+        """
+        has_tools = bool(
+            tool_calls
+            and len(tool_calls) >= 2
+            and (len(tool_calls[0]) > 0 or len(tool_calls[1]) > 0)
+        )
+        tool_count = len(tool_calls[0]) if has_tools else 0
+
+        # Case 1: LLM answered directly without tools → quick
+        if should_break and not has_tools:
+            return RouteResult(
+                mode=EXECUTION_MODE_QUICK,
+                reasoning_effort="low",
+                source="adaptive",
+                metadata={"reason": "direct_answer_no_tools"},
+            )
+
+        # Case 2: Spawn agent requested or many tool calls → deep (if allowed)
+        if has_spawn_agent or tool_count >= LLMRouter.ADAPTIVE_DEEP_TOOL_THRESHOLD:
+            if allow_deep:
+                return RouteResult(
+                    mode=EXECUTION_MODE_DEEP,
+                    reasoning_effort="high",
+                    source="adaptive",
+                    metadata={
+                        "reason": "spawn_agent"
+                        if has_spawn_agent
+                        else f"tool_count={tool_count}",
+                    },
+                )
+            # Clamped: would be deep but simple_auto caps at standard
+            return RouteResult(
+                mode=EXECUTION_MODE_STANDARD,
+                reasoning_effort="medium",
+                source="adaptive",
+                metadata={
+                    "reason": f"clamped_from_deep(tool_count={tool_count})",
+                },
+            )
+
+        # Case 3: moderate tool usage → standard
+        return RouteResult(
+            mode=EXECUTION_MODE_STANDARD,
+            reasoning_effort="medium",
+            source="adaptive",
+            metadata={"reason": f"tool_count={tool_count}"},
+        )
 
     def _parse_hook_result(self, hook_result) -> RouteResult | None:
         """解析 on_route_classify hook 的返回值"""

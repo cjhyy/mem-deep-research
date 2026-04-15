@@ -128,6 +128,7 @@ class Orchestrator:
         cfg: DictConfig,
         task_log: TaskTracer,
         sub_agent_llm_client: LLMProviderClientBase | None = None,
+        router_llm_client: LLMProviderClientBase | None = None,
         stream_queue: Any | None = None,
         tool_definitions: list[dict[str, Any]] | None = None,
         sub_agent_tool_definitions: dict[str, list[dict[str, Any]]] | None = None,
@@ -146,6 +147,7 @@ class Orchestrator:
         self.sub_agent_tool_managers = sub_agent_tool_managers
         self.llm_client = llm_client
         self.sub_agent_llm_client = sub_agent_llm_client or llm_client
+        self.router_llm_client = router_llm_client
         self.output_formatter = output_formatter
         self.cfg = cfg
         self.task_log = task_log
@@ -394,11 +396,15 @@ class Orchestrator:
         self.context_manager.set_offload_dir(offload_dir)
 
         # Long-term memory (optional, persists across sessions)
-        from mem_deep_research_core.core.memory import LongTermMemory
+        memory_cfg = self.cfg.main_agent.get("memory", {})
+        if memory_cfg.get("enabled", False):
+            from mem_deep_research_core.core.memory import LongTermMemory
 
-        output_dir = self.cfg.get("output_dir", "logs/")
-        memory_dir = os.path.join(output_dir, "memory")
-        self.long_term_memory = LongTermMemory(storage_path=memory_dir)
+            output_dir = self.cfg.get("output_dir", "logs/")
+            memory_dir = os.path.join(output_dir, "memory")
+            self.long_term_memory = LongTermMemory(storage_path=memory_dir)
+        else:
+            self.long_term_memory = None
 
     # Static utilities delegated to message_utils (backward compat)
     _extract_recent_tool_names = staticmethod(extract_recent_tool_names)
@@ -639,21 +645,42 @@ class Orchestrator:
                 f"Deferred tool loading enabled, {len(self.deferred_tool_manager._full_registry)} tools deferred",
             )
 
-        # 4.5. LLM Skill 选择
-        _perf_t0 = time.perf_counter()
-        selected_skill_names = await self.prompt_builder.select_skills(
-            initial_user_content, tool_definitions
-        )
-        self.task_log.record_perf("skill_selection", time.perf_counter() - _perf_t0)
+        # 4.5. Resume: 优先使用保存的 system_prompt（保证上下文一致性）
+        _resumed_prompt = resume_from.get("system_prompt", "") if resume_from else ""
+        if _resumed_prompt:
+            # 跳过 skill 选择和 prompt build，直接使用保存的 system_prompt
+            from mem_deep_research_core.utils.tool_utils import _load_agent_prompt
 
-        # 5. 生成系统提示词
-        _perf_t0 = time.perf_counter()
-        system_prompt, main_agent_prompt_instance, task_engine_cfg = (
-            self.prompt_builder.build_system_prompt(
-                tool_definitions, initial_user_content, selected_skill_names
+            prompt_cfg = self.cfg.main_agent.get("prompt", {})
+            main_agent_prompt_instance = _load_agent_prompt(prompt_cfg)
+            task_engine_cfg_raw = self.cfg.main_agent.get("task_engine", {})
+            task_engine_cfg = (
+                dict(task_engine_cfg_raw) if task_engine_cfg_raw else None
             )
-        )
-        self.task_log.record_perf("system_prompt_build", time.perf_counter() - _perf_t0)
+            system_prompt = _resumed_prompt
+            self.task_log.log_step(
+                "resume_prompt",
+                f"Using saved system_prompt ({len(system_prompt)} chars), "
+                "skipped skill selection and prompt build",
+            )
+            logger.info(
+                f"[Resume] Using saved system_prompt ({len(system_prompt)} chars)"
+            )
+        else:
+            # 正常流程：skill 选择 + prompt build
+            _perf_t0 = time.perf_counter()
+            selected_skill_names = await self.prompt_builder.select_skills(
+                initial_user_content, tool_definitions
+            )
+            self.task_log.record_perf("skill_selection", time.perf_counter() - _perf_t0)
+
+            _perf_t0 = time.perf_counter()
+            system_prompt, main_agent_prompt_instance, task_engine_cfg = (
+                self.prompt_builder.build_system_prompt(
+                    tool_definitions, initial_user_content, selected_skill_names
+                )
+            )
+            self.task_log.record_perf("system_prompt_build", time.perf_counter() - _perf_t0)
 
         # 6. 主循环
         final_answer_text, is_simple_response = await self._run_main_loop(
@@ -692,6 +719,9 @@ class Orchestrator:
 
         main_agent_usage = self.llm_client.get_usage()
         await self.stream_handler.stream_usage_info("main", main_agent_usage, "main_agent_end")
+        self.task_log.record_perf("total_prompt_tokens", main_agent_usage.get("total_prompt_tokens", 0), unit="tokens")
+        self.task_log.record_perf("total_completion_tokens", main_agent_usage.get("total_completion_tokens", 0), unit="tokens")
+        self.task_log.record_perf("total_tokens", main_agent_usage.get("total_tokens", 0), unit="tokens")
 
         if self.sub_agent_llm_client and self.sub_agent_llm_client is not self.llm_client:
             sub_agent_usage = self.sub_agent_llm_client.get_usage()
@@ -745,15 +775,24 @@ class Orchestrator:
             tool_definitions += expose_sub_agents_as_tools(self.cfg.sub_agents)
 
         # 内置工具注入
-        from mem_deep_research_core.core.main_loop import _get_spawn_agent_tool_definition
+        from mem_deep_research_core.core.main_loop import (
+            _get_read_result_tool_definition,
+            _get_spawn_agent_tool_definition,
+        )
         from mem_deep_research_core.core.todo_tracker import TodoTracker
 
-        effective_mode = self.cfg.main_agent.get("execution_mode", "auto")
-        if effective_mode != "quick":
+        # auto 模式注入全部内置工具，路由后由 main_loop 按 effective_mode 裁剪
+        config_mode = self.cfg.main_agent.get("execution_mode", "auto")
+        if config_mode != "quick":
             tool_definitions.append(_get_spawn_agent_tool_definition())
 
         if self.todo_tracker and self.todo_tracker.enabled:
             tool_definitions.append(TodoTracker.get_tool_definition())
+
+        # read_result: offload 启用时注入，让 LLM 可以回捞被压缩/卸载的工具结果
+        cm_cfg = self.cfg.main_agent.get("context_manager", {})
+        if cm_cfg.get("result_offload_threshold", 5000) > 0:
+            tool_definitions.append(_get_read_result_tool_definition())
 
         if not tool_definitions:
             logger.debug("Warning: No tool definitions found.")
@@ -795,6 +834,8 @@ class Orchestrator:
             transcript=self.transcript,
             file_state_cache=self.file_state_cache,
             skill_commands=self.skill_commands,
+            router_llm_client=self.router_llm_client,
+            config_loader=self.runtime.config_loader,
         )
         return MainLoopRunner(ctx)
 

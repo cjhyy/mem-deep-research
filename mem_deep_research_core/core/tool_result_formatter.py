@@ -129,7 +129,9 @@ class ToolResultFormatter:
         self.context = context or {}
         self._hooks = hooks
 
-    def get_tool_thinking_description(self, tool_name: str, arguments: dict = None) -> str:
+    def get_tool_thinking_description(
+        self, tool_name: str, arguments: dict = None, *, assistant_text: str | None = None
+    ) -> str:
         """
         根据工具名称和参数生成 THINKING 节点描述。
 
@@ -138,15 +140,20 @@ class ToolResultFormatter:
         Args:
             tool_name: 工具名称
             arguments: 工具参数
+            assistant_text: 当前轮次 LLM 回复文本（可在 hook 中通过 ctx.extra["assistant_text"] 访问）
 
         Returns:
             用于 THINKING 节点的描述文本
         """
+        extra = {}
+        if assistant_text is not None:
+            extra["assistant_text"] = assistant_text
         ctx = HookContext(
             hook_name="on_thinking_generate",
             tool_name=tool_name,
             arguments=arguments or {},
             context=self.context,
+            extra=extra,
         )
         return self._hooks.call("on_thinking_generate", ctx)
 

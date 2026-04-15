@@ -80,7 +80,7 @@ mypy mem_deep_research_core/
 ```
 mem-deep-research/
 ├── mem_deep_research/               # 包装包（re-export）
-│   └── __init__.py                  # 导出 DeepResearch, ResearchResult
+│   └── __init__.py                  # 导出 DeepResearch, TaskResult
 ├── mem_deep_research_core/          # 框架核心代码
 │   ├── deep_research.py             # 主入口
 │   ├── config_schema.py             # Pydantic 配置

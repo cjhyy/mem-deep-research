@@ -159,7 +159,15 @@ class PromptBuilder:
         if task_engine_cfg is not None:
             task_engine_cfg = dict(task_engine_cfg)
 
-        main_agent_prompt_instance = _load_agent_prompt(prompt_cfg)
+        # evidence_extraction: 自动注入 preset
+        cm_cfg = getattr(self.cfg.main_agent, "context_manager", None)
+        if cm_cfg and getattr(cm_cfg, "enable_evidence_extraction", True):
+            existing_presets = prompt_cfg.get("presets", [])
+            if "evidence_extraction" not in existing_presets:
+                prompt_cfg["presets"] = list(existing_presets) + ["evidence_extraction"]
+
+        project_dir = self._config_loader.get_project_dir()
+        main_agent_prompt_instance = _load_agent_prompt(prompt_cfg, project_dir=project_dir)
 
         # === 静态段：agent 角色 + 工具描述（缓存） ===
         if self._cached_static_prompt is None:

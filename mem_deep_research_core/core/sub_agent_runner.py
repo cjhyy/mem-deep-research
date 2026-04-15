@@ -126,7 +126,8 @@ class SubAgentRunner:
         if "agent_type" not in prompt_cfg:
             prompt_cfg["agent_type"] = "worker"
 
-        prompt_instance = _load_agent_prompt(prompt_cfg)
+        project_dir = self._config_loader.get_project_dir()
+        prompt_instance = _load_agent_prompt(prompt_cfg, project_dir=project_dir)
         system_prompt = prompt_instance.generate_system_prompt_with_mcp_tools(
             mcp_servers=tool_definitions,
             chinese_context=self.chinese_context,

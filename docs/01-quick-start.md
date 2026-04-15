@@ -115,7 +115,7 @@ main_agent:
     enabled: true                   # 任务追踪
 
   task_engine:
-    enabled: true
+    enabled: false                  # 配置 deep 能力参数，不再单独决定 auto 路由
     reflection_interval: 5
 
   context_manager:
@@ -138,10 +138,11 @@ main_agent:
 
 无需额外配置，框架自动处理：
 
-- **执行模式自动选择** — 简单问答 → quick，需要工具 → standard，task_engine → deep
+- **执行模式自动选择** — `auto` 由 `LLMRouter` 基于结构信号和模型分类决定 `quick / standard / deep`
 - **语言自动检测** — 中文问题中文答，英文问题英文答
 - **内置 spawn_agent 工具** — LLM 可自主 spawn 子 agent 处理子任务
 - **内置 update_todo 工具** — LLM 可管理任务列表追踪进度
+- **内置 read_result 工具** — 上下文卸载后可显式回捞大结果
 - **三级 context 压缩** — 自动管理 token，不会爆
 - **循环检测** — 检测重复响应，自动升级策略或终止
 - **SessionMemory** — 自动追踪关键发现、已用策略

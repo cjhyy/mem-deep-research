@@ -807,18 +807,25 @@ class ToolManager(ToolManagerProtocol):
                 )
 
                 if isinstance(result_content, str) and "Unknown tool:" in result_content:
-                    suggested_servers = await self._find_servers_with_tool(tool_name)
-                    if len(suggested_servers) == 1:
-                        logger.info(
-                            f"Auto-correction: Tool '{tool_name}' not found in '{server_name}', trying '{suggested_servers[0]}'"
-                        )
-                        return await self.execute_tool_call(
-                            suggested_servers[0],
-                            tool_name,
-                            arguments,
-                            context=context,
-                            _correction_depth=_correction_depth + 1,
-                        )
+                    if _correction_depth < 1:
+                        suggested_servers = await self._find_servers_with_tool(tool_name)
+                        if len(suggested_servers) == 1 and suggested_servers[0] != server_name:
+                            logger.info(
+                                f"Auto-correction: Tool '{tool_name}' not found in '{server_name}', trying '{suggested_servers[0]}'"
+                            )
+                            return await self.execute_tool_call(
+                                suggested_servers[0],
+                                tool_name,
+                                arguments,
+                                context=context,
+                                _correction_depth=_correction_depth + 1,
+                            )
+                    # Auto-correction exhausted or same server — return error
+                    return {
+                        "server_name": server_name,
+                        "tool_name": tool_name,
+                        "error": f"Tool '{tool_name}' not found on server '{server_name}'. {result_content}",
+                    }
 
                 return {
                     "server_name": server_name,
