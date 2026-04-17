@@ -19,6 +19,11 @@ class StructuredTagExtractor:
     关键设计：跨 chunk 累积标签内容，确保完整提取
     - 当检测到开始标签但没有结束标签时，缓存所有内容
     - 只有当检测到完整的标签对时，才提取为 ReasoningBlock
+
+    支持两种标签类型：
+    - reasoning_tags: 提取内容为 ReasoningBlock（可通过事件发送）
+    - strip_tags: 静默剥离（不生成 ReasoningBlock）。支持带属性的开标签，
+      如 <offload_evidence ref="...">...</offload_evidence>
     """
 
     # Default tags that should be extracted as REASONING blocks
@@ -33,16 +38,18 @@ class StructuredTagExtractor:
     # Safety limit: flush buffer if it grows beyond this size without finding matching tags
     MAX_BUFFER_SIZE = 1_000_000  # 1MB
 
-    def __init__(self, reasoning_tags: list[str] = None):
+    def __init__(self, reasoning_tags: list[str] = None, strip_tags: list[str] = None):
         """
         初始化标签提取器
 
         Args:
             reasoning_tags: 需要提取为 reasoning 的标签列表，如果为 None 则使用默认列表
+            strip_tags: 需要静默剥离的标签列表（支持带属性的开标签），如果为 None 则为空
         """
         self.reasoning_tags = (
             reasoning_tags if reasoning_tags is not None else self.DEFAULT_REASONING_TAGS
         )
+        self.strip_tags: list[str] = strip_tags or []
         self.buffer = ""  # 累积所有输入
         self.pending_blocks: list[ReasoningBlock] = []
         self.in_tag: str | None = None  # 当前正在收集的标签名
@@ -51,6 +58,41 @@ class StructuredTagExtractor:
     def set_reasoning_tags(self, tags: list[str]) -> None:
         """动态更新 reasoning 标签列表"""
         self.reasoning_tags = tags
+
+    def set_strip_tags(self, tags: list[str]) -> None:
+        """动态更新 strip 标签列表"""
+        self.strip_tags = tags
+
+    def _find_attr_open_tag(self, tag_name: str, buf: str, start: int = 0) -> tuple[int, int]:
+        """查找可能带属性的开标签。
+
+        返回 (tag_start_pos, tag_end_pos)，其中 tag_end_pos 指向 '>' 之后的位置。
+        如果没找到返回 (-1, -1)。
+
+        匹配形式: ``<tag_name>`` 或 ``<tag_name attr="...">``
+        """
+        prefix = f"<{tag_name}"
+        pos = start
+        while True:
+            pos = buf.find(prefix, pos)
+            if pos == -1:
+                return (-1, -1)
+            # prefix 之后必须是 '>' 或空白（避免匹配 <evidence_extra> 等）
+            after = pos + len(prefix)
+            if after >= len(buf):
+                # 可能是部分标签，返回位置但 end 未知
+                return (pos, -1)
+            ch = buf[after]
+            if ch == ">":
+                return (pos, after + 1)
+            if ch in (" ", "\t", "\n", "\r"):
+                # 有属性，找到对应的 '>'
+                gt = buf.find(">", after)
+                if gt == -1:
+                    return (pos, -1)  # 部分标签
+                return (pos, gt + 1)
+            # 不是目标标签（如 <evidence_extra>），继续搜索
+            pos = after
 
     def process(self, text: str, is_last: bool = False) -> tuple[str, list[ReasoningBlock]]:
         """
@@ -61,6 +103,8 @@ class StructuredTagExtractor:
         2. 检测完整的标签对，提取内容
         3. 如果有未闭合的标签，保留在 buffer 中等待
         4. 只输出确定不在标签内的文本
+
+        reasoning_tags 提取为 ReasoningBlock；strip_tags 静默丢弃。
         """
         self.buffer += text
 
@@ -73,25 +117,48 @@ class StructuredTagExtractor:
         reasoning_blocks: list[ReasoningBlock] = []
         output_parts = []
 
+        # 合并所有需要处理的标签（reasoning + strip）
+        all_tags = self.reasoning_tags + self.strip_tags
+        strip_set = set(self.strip_tags)
+
         # 循环处理所有完整的标签
         while True:
             # 查找最近的开始标签
             earliest_open = -1
+            earliest_open_end = -1  # '>' 之后的位置
             earliest_tag = None
-            for tag_name in self.reasoning_tags:
-                open_tag = f"<{tag_name}>"
-                pos = self.buffer.find(open_tag)
+            earliest_is_strip = False
+
+            for tag_name in all_tags:
+                is_strip = tag_name in strip_set
+                if is_strip:
+                    # strip_tags 支持带属性的开标签
+                    pos, open_end = self._find_attr_open_tag(tag_name, self.buffer)
+                else:
+                    # reasoning_tags 使用精确匹配
+                    open_tag = f"<{tag_name}>"
+                    pos = self.buffer.find(open_tag)
+                    open_end = pos + len(open_tag) if pos != -1 else -1
+
                 if pos != -1 and (earliest_open == -1 or pos < earliest_open):
                     earliest_open = pos
+                    earliest_open_end = open_end
                     earliest_tag = tag_name
+                    earliest_is_strip = is_strip
 
             if earliest_tag is None:
                 # 没有找到任何开始标签
                 break
 
-            open_tag = f"<{earliest_tag}>"
+            # 开标签未完整（'>' 还没到）— 等待更多数据
+            if earliest_open_end == -1:
+                if earliest_open > 0:
+                    output_parts.append(self.buffer[:earliest_open])
+                    self.buffer = self.buffer[earliest_open:]
+                break
+
             close_tag = f"</{earliest_tag}>"
-            close_pos = self.buffer.find(close_tag, earliest_open + len(open_tag))
+            close_pos = self.buffer.find(close_tag, earliest_open_end)
 
             if close_pos == -1:
                 # 找到开始标签但没有结束标签 - 需要等待更多数据
@@ -106,19 +173,18 @@ class StructuredTagExtractor:
             if earliest_open > 0:
                 output_parts.append(self.buffer[:earliest_open])
 
-            # 2. 提取标签内容
-            content_start = earliest_open + len(open_tag)
-            content_end = close_pos
-            tag_content = self.buffer[content_start:content_end].strip()
-
-            if tag_content:  # 只在有内容时创建 block
-                reasoning_blocks.append(
-                    ReasoningBlock(
-                        tag_name=earliest_tag,
-                        content=tag_content,
-                        uid=f"reasoning_{uuid.uuid4().hex[:12]}",
+            # 2. 提取标签内容（仅 reasoning_tags 生成 ReasoningBlock）
+            if not earliest_is_strip:
+                tag_content = self.buffer[earliest_open_end:close_pos].strip()
+                if tag_content:
+                    reasoning_blocks.append(
+                        ReasoningBlock(
+                            tag_name=earliest_tag,
+                            content=tag_content,
+                            uid=f"reasoning_{uuid.uuid4().hex[:12]}",
+                        )
                     )
-                )
+            # strip_tags: 内容被静默丢弃
 
             # 3. 从 buffer 中移除已处理的部分
             self.buffer = self.buffer[close_pos + len(close_tag) :]
@@ -132,10 +198,10 @@ class StructuredTagExtractor:
         else:
             # 检查是否有部分开始标签在末尾（需要保留等待）
             has_partial = False
-            for tag_name in self.reasoning_tags:
-                open_tag = f"<{tag_name}>"
+            for tag_name in all_tags:
+                open_tag = f"<{tag_name}"  # 用前缀检测部分标签（含 strip_tags）
                 # 检查 buffer 末尾是否是开始标签的前缀
-                for i in range(1, len(open_tag)):
+                for i in range(1, len(open_tag) + 1):
                     if self.buffer.endswith(open_tag[:i]):
                         # 保留可能的部分标签
                         output_parts.append(self.buffer[:-i])
@@ -173,6 +239,7 @@ class TextInterceptor:
         unbreakable_strings: list[str],
         reasoning_callback: Callable | None = None,
         reasoning_tags: list[str] = None,
+        strip_tags: list[str] = None,
     ):
         """
         初始化截流器
@@ -181,10 +248,13 @@ class TextInterceptor:
             unbreakable_strings: 不可被分割的字符串列表（需要过滤的标签）
             reasoning_callback: Optional async callback for REASONING events
             reasoning_tags: 需要提取为 reasoning 的标签列表
+            strip_tags: 需要静默剥离的标签列表（支持带属性的开标签）
         """
         self.unbreakable_strings = unbreakable_strings
         self.buffer = ""
-        self.tag_extractor = StructuredTagExtractor(reasoning_tags=reasoning_tags)
+        self.tag_extractor = StructuredTagExtractor(
+            reasoning_tags=reasoning_tags, strip_tags=strip_tags
+        )
         self.reasoning_callback = reasoning_callback
 
     def set_reasoning_tags(self, tags: list[str]) -> None:

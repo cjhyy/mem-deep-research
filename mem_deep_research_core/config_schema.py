@@ -119,6 +119,10 @@ class InputProcessConfig(BaseModel):
 
     hint_generation: bool = Field(default=False, description="是否启用提示生成")
     hint_llm_base_url: str | None = Field(default=None, description="提示生成 LLM Base URL")
+    file_ref_allowed_dirs: list[str] = Field(
+        default_factory=list,
+        description="@file 引用白名单目录列表，空=不限制（向后兼容）",
+    )
 
 
 class ToolRetryConfig(BaseModel):
@@ -285,6 +289,9 @@ class ContextManagerConfig(BaseModel):
         default=5000, ge=0, description="工具结果超过此字符数时备份到文件，0=禁用。替换由 compact_keep_recent 滑动窗口控制"
     )
     result_offload_dir: str = Field(default="", description="卸载文件目录，空=使用 output_dir")
+    cleanup_offload_on_finish: bool = Field(
+        default=True, description="任务结束后自动清理 offload 文件"
+    )
 
     # Evidence extraction
     enable_evidence_extraction: bool = Field(
@@ -368,7 +375,8 @@ class MainAgentConfig(BaseModel):
             "'quick' 快速模式(≤3轮), 'standard' 多轮工具调用, 'deep' 多轮+反思+子agent"
         ),
     )
-    max_concurrent_subagents: int = Field(default=3, ge=1, description="最大并行子 Agent 数")
+    max_concurrent_subagents: int = Field(default=3, ge=1, description="最大并行子 Agent 数（含 spawn_agent）")
+    parallel_spawn: bool = Field(default=True, description="spawn_agent 是否并行执行，False 则串行")
     generate_summary: bool = Field(
         default=False,
         description="是否在工具调用后生成最终摘要（额外一次 LLM 调用）。默认跳过，直接用最后一轮 assistant 文本。",

@@ -11,7 +11,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from mem_deep_research_core.core.constants import DEFAULT_FILTER_TAGS, DEFAULT_REASONING_TAGS
+from mem_deep_research_core.core.constants import (
+    DEFAULT_FILTER_TAGS,
+    DEFAULT_REASONING_TAGS,
+    DEFAULT_STRIP_TAGS,
+)
 
 logger = logging.getLogger("mem_deep_research")
 
@@ -40,6 +44,10 @@ class InterceptorConfig:
         strip_reasoning_from_output: 是否从最终输出中移除 reasoning 标签内容
             默认: True（reasoning 内容通过事件发送，不在主输出中显示）
 
+        strip_tags: 需要静默剥离的标签列表（从流式输出中移除，不生成 reasoning 事件）
+            支持带属性的开标签，如 <offload_evidence ref="...">
+            默认: ["evidence", "offload_evidence"]
+
         custom_tag_handlers: 自定义标签处理器映射
             格式: {"tag_name": "handler_type"}
             handler_type 可以是: "filter", "reasoning", "passthrough"
@@ -50,6 +58,9 @@ class InterceptorConfig:
 
     # 需要提取为 reasoning 的标签
     reasoning_tags: list[str] = field(default_factory=lambda: list(DEFAULT_REASONING_TAGS))
+
+    # 需要静默剥离的标签（从流式输出中移除，不生成 reasoning 事件）
+    strip_tags: list[str] = field(default_factory=lambda: list(DEFAULT_STRIP_TAGS))
 
     # 输出控制
     show_reasoning: bool = True
@@ -76,6 +87,7 @@ class InterceptorConfig:
             show_tool_calls=config_dict.get("show_tool_calls", True),
             show_text_output=config_dict.get("show_text_output", True),
             strip_reasoning_from_output=config_dict.get("strip_reasoning_from_output", True),
+            strip_tags=config_dict.get("strip_tags", list(DEFAULT_STRIP_TAGS)),
             custom_tag_handlers=config_dict.get("custom_tag_handlers", {}),
         )
 
@@ -88,6 +100,7 @@ class InterceptorConfig:
             "show_tool_calls": self.show_tool_calls,
             "show_text_output": self.show_text_output,
             "strip_reasoning_from_output": self.strip_reasoning_from_output,
+            "strip_tags": self.strip_tags,
             "custom_tag_handlers": self.custom_tag_handlers,
         }
 

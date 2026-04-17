@@ -114,7 +114,7 @@ class TaskTracer(BaseModel):
             value: Metric value
             unit: Unit of measurement (default: "s" for seconds)
         """
-        self.perf_metrics[key] = {"value": round(value, 4), "unit": unit}
+        self.perf_metrics[key] = {"value": round(value, 4) if isinstance(value, (int, float)) else value, "unit": unit}
 
     def append_perf(self, key: str, value: float, unit: str = "s") -> None:
         """Append a value to a list-type performance metric (e.g., per-tool-call timings).

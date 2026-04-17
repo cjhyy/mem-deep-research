@@ -193,7 +193,8 @@ class ToolManager(ToolManagerProtocol):
         # Persistent MCP session pool
         self._persistent_sessions: dict[str, ClientSession] = {}
         self._session_transports: dict[str, tuple] = {}  # store (read, write) or similar
-        self._exit_stack = contextlib.AsyncExitStack()
+        self._session_context_fingerprints: dict[str, str] = {}  # context fingerprint at session creation
+        self._session_exit_stacks: dict[str, contextlib.AsyncExitStack] = {}  # per-server exit stack
         self._session_locks: dict[str, asyncio.Lock] = {}  # Guards session creation
         self._call_locks: dict[str, asyncio.Lock] = {}  # Guards call_tool per-server (stdio not concurrent-safe)
         self._global_lock = asyncio.Lock()
@@ -233,6 +234,27 @@ class ToolManager(ToolManagerProtocol):
             self._tool_definitions_cache.clear()
             logger.info("[ToolManager] Cleared all tool definitions cache")
 
+    @staticmethod
+    def _compute_context_fingerprint(context: dict[str, Any] | None) -> str:
+        """Compute a stable fingerprint from env-relevant context fields.
+
+        Only considers string-valued, non-internal fields — exactly the set
+        that ``_default_env_inject`` would write into subprocess env vars.
+        Returns a hex digest; empty string for empty/None context.
+        """
+        if not context:
+            return ""
+        import hashlib
+        skip_keys = {"_secure", "meta_chat_history", "mode", "role_purpose"}
+        parts: list[str] = []
+        for key in sorted(context):
+            if key in skip_keys or key.startswith("_"):
+                continue
+            val = get_real_value(context, key)
+            if val and isinstance(val, str):
+                parts.append(f"{key}={val}")
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16] if parts else ""
+
     def set_context(self, context: dict[str, Any] | None) -> None:
         """
         Set the user context for MCP tool calls.
@@ -267,17 +289,36 @@ class ToolManager(ToolManagerProtocol):
         Supports stdio, streamable-http, and sse transports.
         Uses per-server locks to prevent concurrent creation of the same session.
 
+        For stdio sessions, detects context changes (e.g. different USER_ID)
+        and automatically recreates the session to prevent silent context leakage.
+
         Returns:
             (session, was_cached) — was_cached=True if the session was reused from pool.
         """
-        # Fast path: session already exists
-        if server_name in self._persistent_sessions:
+        transport = self.server_transport.get(server_name, "stdio")
+
+        # Fast path for non-stdio: context not baked into subprocess, reuse freely
+        if transport != "stdio" and server_name in self._persistent_sessions:
             return self._persistent_sessions[server_name], True
 
         lock = await self._get_session_lock(server_name)
         async with lock:
-            # Double-check after acquiring lock
-            if server_name in self._persistent_sessions:
+            # For stdio sessions, check if context has changed since session was created.
+            # Env vars are baked into the subprocess at creation time — if context changes,
+            # we must tear down and rebuild the session.
+            # This check MUST be inside the lock to avoid racing with concurrent callers.
+            if transport == "stdio" and server_name in self._persistent_sessions:
+                new_fp = self._compute_context_fingerprint(context or self._context or {})
+                old_fp = self._session_context_fingerprints.get(server_name, "")
+                if new_fp != old_fp:
+                    logger.info(
+                        f"[ToolManager] Context changed for stdio server '{server_name}' "
+                        f"(fingerprint {old_fp[:8]}→{new_fp[:8]}), recreating session"
+                    )
+                    await self._invalidate_session(server_name)
+                else:
+                    return self._persistent_sessions[server_name], True
+            elif server_name in self._persistent_sessions:
                 return self._persistent_sessions[server_name], True
 
             server_params = self.server_dict.get(server_name)
@@ -291,6 +332,10 @@ class ToolManager(ToolManagerProtocol):
 
             _sess_start = _time.perf_counter()
 
+            # Each server gets its own exit stack so sessions can be torn down
+            # independently (e.g. when context changes for stdio servers).
+            exit_stack = contextlib.AsyncExitStack()
+
             if transport == "inprocess":
                 # In-process: import the module and create a FastMCP Client session
                 module_info = self.server_module_info.get(server_name, {})
@@ -298,6 +343,7 @@ class ToolManager(ToolManagerProtocol):
                 object_name = module_info.get("object", "mcp")
 
                 if not module_path:
+                    await exit_stack.aclose()
                     raise ValueError(f"No module specified for in-process server '{server_name}'")
 
                 import importlib
@@ -309,10 +355,11 @@ class ToolManager(ToolManagerProtocol):
                 from fastmcp import Client
 
                 client = Client(mcp_app)
-                await self._exit_stack.enter_async_context(client)
+                await exit_stack.enter_async_context(client)
                 session = _InProcessSessionAdapter(client)
 
                 self._persistent_sessions[server_name] = session
+                self._session_exit_stacks[server_name] = exit_stack
                 _sess_elapsed = _time.perf_counter() - _sess_start
                 logger.info(
                     f"[ToolManager] In-process session created for '{server_name}' in {_sess_elapsed:.3f}s"
@@ -324,27 +371,33 @@ class ToolManager(ToolManagerProtocol):
                     effective_ctx = context or self._context or {}
                     updated_params = update_server_params_with_context(server_params, effective_ctx, hook_registry=self._hook_registry)
                     transport_ctx = stdio_client(updated_params)
-                    read, write = await self._exit_stack.enter_async_context(transport_ctx)
+                    read, write = await exit_stack.enter_async_context(transport_ctx)
+                    # Record fingerprint so we can detect context changes later
+                    self._session_context_fingerprints[server_name] = (
+                        self._compute_context_fingerprint(effective_ctx)
+                    )
                 elif isinstance(server_params, str) and server_params.startswith(
                     ("http://", "https://")
                 ):
                     if transport == "streamable-http" and HAS_STREAMABLE_HTTP:
                         transport_ctx = streamablehttp_client(server_params, headers=headers)
-                        read, write, _ = await self._exit_stack.enter_async_context(transport_ctx)
+                        read, write, _ = await exit_stack.enter_async_context(transport_ctx)
                     else:
                         transport_ctx = sse_client(server_params)
-                        read, write = await self._exit_stack.enter_async_context(transport_ctx)
+                        read, write = await exit_stack.enter_async_context(transport_ctx)
                 else:
+                    await exit_stack.aclose()
                     raise TypeError(
                         f"Unknown server params type for {server_name}: {type(server_params)}"
                     )
 
-                session = await self._exit_stack.enter_async_context(
+                session = await exit_stack.enter_async_context(
                     ClientSession(read, write, sampling_callback=None)
                 )
                 await session.initialize()
 
                 self._persistent_sessions[server_name] = session
+                self._session_exit_stacks[server_name] = exit_stack
                 _sess_elapsed = _time.perf_counter() - _sess_start
                 logger.info(
                     f"[ToolManager] Persistent session created for '{server_name}' (transport={transport}) in {_sess_elapsed:.3f}s"
@@ -355,26 +408,36 @@ class ToolManager(ToolManagerProtocol):
                 logger.error(
                     f"[ToolManager] Failed to create persistent session for '{server_name}': {e}"
                 )
+                await exit_stack.aclose()
                 raise
             except Exception as e:
                 logger.error(
                     f"[ToolManager] Unexpected error creating session for '{server_name}': "
                     f"{type(e).__name__}: {e}"
                 )
+                await exit_stack.aclose()
                 raise
 
     async def _invalidate_session(self, server_name: str) -> None:
-        """Remove a cached session (e.g., after a connection error).
+        """Remove a cached session and close its transport resources.
 
-        Note: The actual transport cleanup happens when close_sessions() is called,
-        since AsyncExitStack manages all contexts together.
+        Each session has its own AsyncExitStack, so we can tear it down
+        independently without affecting other servers.
         """
         self._persistent_sessions.pop(server_name, None)
+        self._session_context_fingerprints.pop(server_name, None)
+        exit_stack = self._session_exit_stacks.pop(server_name, None)
+        if exit_stack is not None:
+            try:
+                await exit_stack.aclose()
+            except Exception as e:
+                logger.warning(f"[ToolManager] Error closing session stack for '{server_name}': {e}")
         logger.info(f"[ToolManager] Invalidated session for '{server_name}'")
 
     async def close_sessions(self) -> None:
-        """Close all persistent sessions, browser session, and reset the exit stack."""
+        """Close all persistent sessions, browser session, and per-server exit stacks."""
         self._persistent_sessions.clear()
+        self._session_context_fingerprints.clear()
         self._session_locks.clear()
         # Close browser session if it was created
         if self.browser_session is not None:
@@ -383,11 +446,13 @@ class ToolManager(ToolManagerProtocol):
             except Exception as e:
                 logger.warning(f"[ToolManager] Error closing browser session: {e}")
             self.browser_session = None
-        try:
-            await self._exit_stack.aclose()
-        except Exception as e:
-            logger.warning(f"[ToolManager] Error closing sessions: {e}")
-        self._exit_stack = contextlib.AsyncExitStack()
+        # Close all per-server exit stacks
+        for name, stack in list(self._session_exit_stacks.items()):
+            try:
+                await stack.aclose()
+            except Exception as e:
+                logger.warning(f"[ToolManager] Error closing session stack for '{name}': {e}")
+        self._session_exit_stacks.clear()
         logger.info("[ToolManager] All persistent sessions closed")
 
     def __del__(self):

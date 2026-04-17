@@ -1,7 +1,4 @@
-{{#if task_failed}}
-**Important: You have either exhausted the context token limit or reached the maximum number of interaction turns without arriving at a conclusive answer. Therefore, you failed to complete the task. You Must explicitly state that you failed to complete the task in your response.**
-
-{{/if}}
+{{task_failed_message}}
 This is a direct instruction to you (the assistant), not the result of a tool call.
 
 We are now ending this session. You must NOT initiate any further tool use. Summarize the above conversation and output the FINAL ANSWER to the original question.

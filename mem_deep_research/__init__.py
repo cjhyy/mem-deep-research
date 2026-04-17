@@ -35,5 +35,10 @@ CLI:
 
 from mem_deep_research_core.deep_research import DeepResearch, TaskResult
 
-__version__ = "1.2.1"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("mem-deep-research")
+except Exception:
+    __version__ = "1.2.3"  # fallback when not installed as package
 __all__ = ["DeepResearch", "TaskResult", "__version__"]

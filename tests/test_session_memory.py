@@ -56,7 +56,18 @@ class TestSessionMemoryBasic:
         mem = SessionMemory()
         mem.add_sub_agent_result("agent-1", "result 1")
         mem.add_sub_agent_result("agent-1", "result updated")
-        assert mem.sub_agent_results == {"agent-1": "result updated"}
+        # Both results are preserved (append, not overwrite)
+        assert mem.sub_agent_results == [("agent-1", "result 1"), ("agent-1", "result updated")]
+
+    def test_add_sub_agent_result_multiple_spawns(self):
+        """Multiple spawn_agent calls should all be preserved."""
+        mem = SessionMemory()
+        mem.add_sub_agent_result("spawn_agent", "tanka core test result")
+        mem.add_sub_agent_result("spawn_agent", "jira test result")
+        mem.add_sub_agent_result("spawn_agent", "gitlab test result")
+        assert len(mem.sub_agent_results) == 3
+        assert mem.sub_agent_results[0] == ("spawn_agent", "tanka core test result")
+        assert mem.sub_agent_results[2] == ("spawn_agent", "gitlab test result")
 
     def test_is_empty(self):
         mem = SessionMemory()

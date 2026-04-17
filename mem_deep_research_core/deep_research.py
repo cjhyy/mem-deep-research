@@ -294,16 +294,39 @@ class DeepResearch:
         else:
             return "openrouter"  # default fallback
 
+    # Fields whose absence means the framework cannot function at all.
+    _CRITICAL_CONFIG_FIELDS = {"provider_class", "model_name"}
+
     def _validate_config(self) -> None:
-        """验证配置是否符合 schema，严重错误阻断，轻微问题仅警告"""
+        """验证配置是否符合 schema，核心字段缺失时阻断初始化"""
         try:
+            from pydantic import ValidationError as PydanticValidationError
+
             from mem_deep_research_core.config_schema import validate_agent_config
 
             config_dict = OmegaConf.to_container(self._cfg, resolve=False)
             validate_agent_config(config_dict)
-        except (ValueError, TypeError) as e:
-            # Schema validation errors — log as error but don't block (may have optional fields)
-            logger.error(f"Config validation failed: {e}")
+        except PydanticValidationError as e:
+            # Check if any critical field is among the errors
+            critical_errors = []
+            non_critical_errors = []
+            for err in e.errors():
+                field_path = ".".join(str(p) for p in err.get("loc", []))
+                field_name = err["loc"][-1] if err.get("loc") else ""
+                if field_name in self._CRITICAL_CONFIG_FIELDS:
+                    critical_errors.append(f"  {field_path}: {err['msg']}")
+                else:
+                    non_critical_errors.append(f"  {field_path}: {err['msg']}")
+            if non_critical_errors:
+                logger.warning(
+                    f"Config validation warnings ({len(non_critical_errors)}):\n"
+                    + "\n".join(non_critical_errors)
+                )
+            if critical_errors:
+                raise ValueError(
+                    "Config validation failed on critical fields:\n"
+                    + "\n".join(critical_errors)
+                ) from e
         except ImportError as e:
             logger.warning(f"Config validation skipped (schema not available): {e}")
         except Exception as e:

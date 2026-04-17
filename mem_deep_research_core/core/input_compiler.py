@@ -59,7 +59,24 @@ class InputCompiler:
         hooks: HookRegistry 实例
         enable_url_extraction: 是否启用 URL 提取
         enable_file_refs: 是否启用文件引用展开
+        file_ref_allowed_dirs: Allowlist of directories for @file refs.
+            Empty list = unrestricted (backward compatible).
+            When set, only files under these directories can be read.
     """
+
+    # Filenames always blocked regardless of allowlist
+    _SENSITIVE_PATTERNS = {
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".env.staging",
+        "credentials.json",
+        "id_rsa",
+        "id_dsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_ed448",
+    }
 
     def __init__(
         self,
@@ -67,10 +84,12 @@ class InputCompiler:
         hooks: HookRegistry,
         enable_url_extraction: bool = True,
         enable_file_refs: bool = True,
+        file_ref_allowed_dirs: list[str] | None = None,
     ):
         self.hooks = hooks
         self.enable_url_extraction = enable_url_extraction
         self.enable_file_refs = enable_file_refs
+        self._file_ref_allowed_dirs = file_ref_allowed_dirs or []
 
     def compile(
         self,
@@ -153,15 +172,43 @@ class InputCompiler:
 
         return result
 
-    @staticmethod
-    def _read_file(path: str) -> str | None:
-        """尝试读取文件内容"""
+    def _read_file(self, path: str) -> str | None:
+        """尝试读取文件内容（带安全检查）"""
         import os
 
-        if not os.path.isfile(path):
+        resolved = os.path.realpath(path)
+        basename = os.path.basename(resolved)
+
+        # Block known sensitive files
+        if basename in self._SENSITIVE_PATTERNS or basename.startswith(".env"):
+            logger.warning(f"[InputCompiler] Blocked sensitive file reference: {path}")
+            return None
+
+        # Block SSH private keys (exact match already in _SENSITIVE_PATTERNS,
+        # this catches variants like id_rsa_work without blocking id_mapping.csv)
+        _SSH_KEY_PREFIXES = ("id_rsa", "id_dsa", "id_ed25519", "id_ecdsa", "id_ed448")
+        if basename.startswith(_SSH_KEY_PREFIXES) and not basename.endswith(".pub"):
+            logger.warning(f"[InputCompiler] Blocked private key reference: {path}")
+            return None
+
+        # Enforce allowlist if configured
+        if self._file_ref_allowed_dirs:
+            allowed = False
+            for allowed_dir in self._file_ref_allowed_dirs:
+                allowed_resolved = os.path.realpath(allowed_dir)
+                if resolved.startswith(allowed_resolved + os.sep) or resolved == allowed_resolved:
+                    allowed = True
+                    break
+            if not allowed:
+                logger.warning(
+                    f"[InputCompiler] File ref '{path}' outside allowed directories, skipping"
+                )
+                return None
+
+        if not os.path.isfile(resolved):
             return None
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
+            with open(resolved, encoding="utf-8", errors="replace") as f:
                 content = f.read()
             # 限制文件内容大小
             if len(content) > 50000:

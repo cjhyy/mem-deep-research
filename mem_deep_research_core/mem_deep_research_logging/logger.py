@@ -379,7 +379,7 @@ def bootstrap_logger(
                 ),
                 rich_tracebacks=True,
                 tracebacks_suppress=[hydra],
-                tracebacks_show_locals=True,
+                tracebacks_show_locals=False,
                 show_level=False,
             )
             formatter = logging.Formatter("[%(levelname)s] %(message)s")

@@ -280,7 +280,7 @@ class ConfigLoader:
         需要已初始化的 skill_injector（用于获取 matcher）和有效的 API key。
 
         Args:
-            cfg: Agent 配置（DictConfig），需要包含 main_agent.openai_api_key
+            cfg: Agent 配置（DictConfig），需要包含 main_agent.llm.api_key
                  和 main_agent.skill_selection 配置
 
         Returns:
@@ -304,10 +304,15 @@ class ConfigLoader:
                     logger.info("[ConfigLoader] LLM skill selection is disabled")
                     return None
 
-                # 获取 API key
-                api_key = cfg.main_agent.get("openai_api_key")
+                # 获取 API key: main_agent.llm.api_key > env OPENAI_API_KEY
+                llm_cfg = cfg.main_agent.get("llm", {})
+                api_key = (
+                    llm_cfg.get("api_key")
+                    or llm_cfg.get("openai_api_key")
+                    or os.environ.get("OPENAI_API_KEY")
+                )
                 if not api_key:
-                    logger.info("[ConfigLoader] No openai_api_key, LLM skill selector not available")
+                    logger.info("[ConfigLoader] No API key in main_agent.llm, LLM skill selector not available")
                     return None
 
                 # 获取已初始化的 skill injector 来取 matcher

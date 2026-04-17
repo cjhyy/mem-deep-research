@@ -167,6 +167,10 @@ class Orchestrator:
             self.response_language = "Chinese"
         # chinese_context 内部标志：当 response_language 明确为 Chinese 时为 True
         self.chinese_context = self.response_language == "Chinese"
+        # Always sync to context so hooks can read language settings without KeyError.
+        # In "auto" mode this will be updated by MainLoopRunner after LLM detection.
+        self.context["response_language"] = self.response_language
+        self.context["chinese_context"] = self.chinese_context
 
         self.execution_mode = self.cfg.main_agent.get("execution_mode", "auto")
 
@@ -234,6 +238,7 @@ class Orchestrator:
         self.key_message_interceptor = TextInterceptor(
             interceptor_config.get_all_filter_keywords(),
             reasoning_tags=interceptor_config.reasoning_tags,
+            strip_tags=interceptor_config.strip_tags,
         )
         self.message_interceptor = MessageInterceptorHandler(
             config=interceptor_config,
@@ -245,7 +250,9 @@ class Orchestrator:
         )
 
         # 最终消息拦截器
-        self._final_message_interceptor = TextInterceptor(["<use_mcp_tool>"])
+        self._final_message_interceptor = TextInterceptor(
+            ["<use_mcp_tool>"], strip_tags=interceptor_config.strip_tags
+        )
 
     def _init_monitoring_and_tools(self):
         """初始化执行监控器、工具执行器和子 Agent 运行器"""
@@ -377,6 +384,7 @@ class Orchestrator:
             inline_skill_selector=self.inline_skill_selector,
             hooks=self._hooks,
             config_loader=self.runtime.config_loader,
+            response_language=self.response_language,
         )
 
     def _init_context_manager(self):
@@ -587,7 +595,11 @@ class Orchestrator:
         # 0.5. 输入编译链
         from mem_deep_research_core.core.input_compiler import InputCompiler
 
-        input_compiler = InputCompiler(hooks=self._hooks)
+        input_cfg = ensure_dict(self.cfg.main_agent.get("input_process", {}))
+        input_compiler = InputCompiler(
+            hooks=self._hooks,
+            file_ref_allowed_dirs=input_cfg.get("file_ref_allowed_dirs", []),
+        )
         compile_result = input_compiler.compile(task_description, context=self.context)
         task_description = compile_result.query
 
@@ -746,6 +758,11 @@ class Orchestrator:
 
         logger.debug(f"\n{'=' * 20} Task {task_id} Finished {'=' * 20}")
         self.task_log.log_step("task_completed", f"Task {task_id} completed successfully")
+
+        # Cleanup offload files after task is done
+        removed = self.context_manager.cleanup_offload_files()
+        if removed:
+            self.task_log.log_step("offload_cleanup", f"Removed {removed} offload files")
 
         return final_summary, final_boxed_answer
 

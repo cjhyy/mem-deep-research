@@ -61,7 +61,7 @@ class SessionMemory:
     key_findings: list[str] = field(default_factory=list)
     attempted_strategies: list[str] = field(default_factory=list)
     sources: list[SourceRecord] = field(default_factory=list)
-    sub_agent_results: dict[str, str] = field(default_factory=dict)
+    sub_agent_results: list[tuple[str, str]] = field(default_factory=list)
     evidence_items: list[EvidenceItem] = field(default_factory=list)
 
     # Limits
@@ -110,9 +110,9 @@ class SessionMemory:
                     self.evidence_items = self.evidence_items[-self.max_evidence :]
 
     def add_sub_agent_result(self, agent_name: str, result: str):
-        """记录子 Agent 结果（线程安全）"""
+        """记录子 Agent 结果（追加，线程安全）"""
         with self._lock:
-            self.sub_agent_results[agent_name] = result
+            self.sub_agent_results.append((agent_name, result))
 
     def to_context_string(self) -> str:
         """生成可注入到消息历史的记忆摘要（线程安全快照）"""
@@ -121,7 +121,7 @@ class SessionMemory:
             findings = list(self.key_findings)
             strategies = list(self.attempted_strategies)
             sources = list(self.sources)
-            sub_results = dict(self.sub_agent_results)
+            sub_results = list(self.sub_agent_results)
             evidence = list(self.evidence_items)
 
         sections = []
@@ -156,11 +156,12 @@ class SessionMemory:
             sections.append(f"## Sources Collected\n{text}")
 
         if sub_results:
-            text = "\n".join(
-                f"### {name}\n{result[:200]}..." if len(result) > 200 else f"### {name}\n{result}"
-                for name, result in sub_results.items()
-            )
-            sections.append(f"## Sub-Agent Results\n{text}")
+            lines = []
+            for i, (name, result) in enumerate(sub_results, 1):
+                header = f"### {name} #{i}" if len(sub_results) > 1 else f"### {name}"
+                body = f"{result[:200]}..." if len(result) > 200 else result
+                lines.append(f"{header}\n{body}")
+            sections.append(f"## Sub-Agent Results\n" + "\n".join(lines))
 
         if not sections:
             return ""

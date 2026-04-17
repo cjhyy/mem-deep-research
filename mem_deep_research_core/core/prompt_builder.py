@@ -41,10 +41,12 @@ class PromptBuilder:
         *,
         hooks: HookRegistry,
         config_loader: ConfigLoader,
+        response_language: str = "auto",
     ):
         self.cfg = cfg
         self.context = context
         self.chinese_context = chinese_context
+        self.response_language = response_language
         self.inline_skill_selector = inline_skill_selector
         self._template_loader = PromptTemplateLoader()
         self._hooks = hooks
@@ -74,9 +76,23 @@ class PromptBuilder:
         add_message_id = parse_bool_config(self.cfg.main_agent.get("add_message_id", False))
 
         try:
+            # Resolve API key: input_process may override, otherwise fall back to
+            # main_agent.llm.api_key / openai_api_key / env OPENAI_API_KEY.
+            import os
+
+            llm_cfg = self.cfg.main_agent.get("llm", {})
+            api_key = (
+                llm_cfg.get("api_key")
+                or llm_cfg.get("openai_api_key")
+                or os.environ.get("OPENAI_API_KEY", "")
+            )
+            if not api_key:
+                logger.warning("Hint generation skipped: no API key found in main_agent.llm")
+                return ""
+
             hint_content = await extract_hints(
                 task_description,
-                self.cfg.main_agent.openai_api_key,
+                api_key,
                 self.chinese_context,
                 add_message_id,
                 self.cfg.main_agent.input_process.get(
@@ -177,6 +193,7 @@ class PromptBuilder:
                 chinese_context=self.chinese_context,
                 extra_context=extra_context,
                 task_engine_cfg=task_engine_cfg,
+                response_language=self.response_language,
             )
             self._cached_static_prompt = static_prompt
             self._cached_prompt_instance = main_agent_prompt_instance

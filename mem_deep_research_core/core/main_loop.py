@@ -136,10 +136,17 @@ def _get_spawn_agent_tool_definition() -> dict:
             {
                 "name": BUILTIN_TOOL_SPAWN_AGENT,
                 "description": (
-                    "Spawn a temporary sub-agent to handle a complex subtask independently. "
-                    "The sub-agent has its own isolated context and the same tools as you. "
-                    "Use this for tasks that require deep investigation or would benefit from a fresh context window. "
-                    "The sub-agent will return its final answer as the tool result."
+                    "Spawn a temporary sub-agent to handle ONE focused subtask independently. "
+                    "The sub-agent has isolated context and the same tools as you.\n\n"
+                    "WHEN TO USE:\n"
+                    "- The overall task has multiple INDEPENDENT subtasks that can run in parallel "
+                    "(spawn one agent per subtask, not one agent for everything).\n"
+                    "- A subtask requires deep investigation that would consume too much of your context window.\n\n"
+                    "WHEN NOT TO USE:\n"
+                    "- The task is simple enough to do yourself in a few tool calls.\n"
+                    "- You would put ALL the work into a single spawn — that just adds overhead with no benefit. "
+                    "Either split into multiple spawns or do it yourself.\n\n"
+                    "The sub-agent returns its final answer as the tool result."
                 ),
                 "schema": {
                     "type": "object",
@@ -147,6 +154,11 @@ def _get_spawn_agent_tool_definition() -> dict:
                         "task_description": {
                             "type": "string",
                             "description": "Detailed description of the subtask for the sub-agent to complete",
+                        },
+                        "max_turns": {
+                            "type": "integer",
+                            "description": "Maximum execution turns (1-10, default 5). "
+                            "Each spawn should be a focused subtask — split large work into multiple spawns instead of raising this.",
                         },
                     },
                     "required": ["task_description"],
@@ -315,6 +327,37 @@ def _strip_evidence_from_last_assistant(message_history: list) -> None:
                     t = item.get("text", "")
                     if "<evidence>" in t or "<offload_evidence" in t:
                         item["text"] = _clean(t)
+        break
+
+
+_RE_RESPONSE_LANGUAGE = re.compile(
+    r"<response_language>\s*([\w]+)\s*</response_language>", re.IGNORECASE
+)
+
+
+def _extract_response_language(text: str) -> str | None:
+    """Extract language from <response_language>X</response_language> tag."""
+    m = _RE_RESPONSE_LANGUAGE.search(text)
+    return m.group(1).strip() if m else None
+
+
+def _strip_response_language_tag(text: str) -> str:
+    """Remove <response_language> tag from text."""
+    return _RE_RESPONSE_LANGUAGE.sub("", text).strip()
+
+
+def _strip_tag_from_last_assistant(message_history: list) -> None:
+    """Remove <response_language> tag from the last assistant message in history."""
+    for msg in reversed(message_history):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and "<response_language>" in content:
+            msg["content"] = _strip_response_language_tag(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and "<response_language>" in item.get("text", ""):
+                    item["text"] = _strip_response_language_tag(item["text"])
         break
 
 
@@ -598,16 +641,9 @@ class MainLoopRunner:
             },
         )
 
-        # Auto-detect response language from query (hook can override via on_agent_start)
-        if self.response_language == "auto":
-            from mem_deep_research_core.core.user_context import detect_language_by_chars
-
-            # Prefer original_query (raw user text) over task_description which may
-            # contain English wrapper text that dilutes CJK character ratio
-            lang_text = (self.context or {}).get("original_query") or task_description
-            self.response_language = detect_language_by_chars(lang_text)
-            self.chinese_context = self.response_language == "Chinese"
-            logger.info(f"[Language] Auto-detected: {self.response_language}")
+        # Language detection is deferred to first LLM reply (see turn_count == 1 block)
+        # when response_language == "auto". The LLM emits <response_language>X</response_language>
+        # and we parse it. Fallback: char-based detection from query text.
 
         # Recall long-term memory if available
         if self.long_term_memory:
@@ -775,6 +811,7 @@ class MainLoopRunner:
         last_assistant_text = ""
         _context_limit_retries = 0
         _reflection_pending = False  # 上一轮末尾注入了反思 prompt，下轮允许无工具回复
+        self._spawn_executed = False  # spawn_agent 执行标记，由 _execute_tools 设置
         _perf_main_loop_start = time.perf_counter()
         _perf_total_llm_time = 0.0
         _perf_total_tool_time = 0.0
@@ -830,7 +867,31 @@ class MainLoopRunner:
 
             # 监控前检查
             terminate_reason = await self.monitor.pre_turn_check()
-            if terminate_reason == "soft_timeout":
+            if self._spawn_executed and terminate_reason:
+                # Grace turn after spawn_agent: override hard termination so LLM can
+                # process spawn results and produce a final answer. Inject urgency hint
+                # but do NOT break — the LLM must run at least once.
+                logger.info(
+                    f"[{self.agent_name}] Grace turn after spawn_agent — "
+                    f"overriding {terminate_reason}, allowing one more LLM call"
+                )
+                message_history.append(
+                    {
+                        "role": "user",
+                        "_type": MT.TOKEN_WARNING,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "[TIME WARNING] 子任务已全部完成，结果已就绪。"
+                                    "请立即基于以上子任务结果输出最终汇总答案，不要再调用工具。"
+                                ),
+                            }
+                        ],
+                    }
+                )
+                self._spawn_executed = False
+            elif terminate_reason == "soft_timeout":
                 # 软超时：注入催促 hint，继续执行
                 remaining = int(
                     self.monitor.config.max_total_time - self.monitor.get_elapsed_time()
@@ -851,7 +912,8 @@ class MainLoopRunner:
                     }
                 )
             elif terminate_reason:
-                # 硬超时或其他终止原因：跳出循环，走摘要流程
+                # 硬超时或其他终止原因：标记失败，跳出循环走摘要流程
+                task_failed = True
                 break
 
             # Microcompact: 每轮 LLM 调用前清理旧 tool_result（零成本）
@@ -866,8 +928,9 @@ class MainLoopRunner:
             if offload_candidates:
                 candidate_lines = []
                 for c in offload_candidates:
+                    tools = ", ".join(c.get("tool_names", [])) or "unknown"
                     candidate_lines.append(
-                        f'- ref="{c["ref"]}" (turn {c["turn"]}, {c["chars"]} chars)'
+                        f'- ref="{c["ref"]}" tool={tools} (turn {c["turn"]}, {c["chars"]} chars)'
                     )
                 sidecar = (
                     "[OFFLOAD PREP]\n\n"
@@ -881,6 +944,24 @@ class MainLoopRunner:
                     "</offload_evidence>\n\n"
                     "Candidates:\n" + "\n".join(candidate_lines)
                 )
+                # Hook: on_offload_evidence_prep — append tool-specific guidance
+                if self.hooks.has_hooks("on_offload_evidence_prep"):
+                    hook_result = self.hooks.call(
+                        "on_offload_evidence_prep",
+                        HookContext(
+                            hook_name="on_offload_evidence_prep",
+                            turn_number=turn_count,
+                            context=self.context,
+                            extra={"candidates": offload_candidates, "sidecar": sidecar},
+                        ),
+                    )
+                    if isinstance(hook_result, str):
+                        sidecar = hook_result
+                    elif hook_result is not None:
+                        logger.warning(
+                            f"[Hook] on_offload_evidence_prep returned {type(hook_result).__name__} "
+                            f"instead of str, ignoring (return a string to override sidecar prompt)"
+                        )
                 message_history.append({
                     "role": "user",
                     "_type": MT.OFFLOAD_PREP,
@@ -970,6 +1051,39 @@ class MainLoopRunner:
             last_assistant_text = assistant_response_text or ""
             if assistant_response_text is not None:
                 _context_limit_retries = 0
+
+            # Extract <response_language> tag from LLM reply (typically turn 1, but LLM may delay)
+            if (
+                self.response_language == "auto"
+                and assistant_response_text
+            ):
+                detected = _extract_response_language(assistant_response_text)
+                if detected:
+                    self.response_language = detected
+                    self.chinese_context = detected == "Chinese"
+                    logger.info(f"[Language] LLM declared: {detected}")
+                    # Strip the tag from assistant text and message history
+                    assistant_response_text = _strip_response_language_tag(assistant_response_text)
+                    last_assistant_text = assistant_response_text
+                    _strip_tag_from_last_assistant(message_history)
+                else:
+                    # Fallback to char-based detection
+                    from mem_deep_research_core.core.user_context import (
+                        detect_language_by_chars,
+                    )
+                    lang_text = (self.context or {}).get("original_query") or task_description
+                    self.response_language = detect_language_by_chars(lang_text)
+                    self.chinese_context = self.response_language == "Chinese"
+                    logger.info(f"[Language] Fallback char-detection: {self.response_language}")
+                # Sync to context so hooks can read it
+                if self.context is not None:
+                    self.context["response_language"] = self.response_language
+                    self.context["chinese_context"] = self.chinese_context
+            elif assistant_response_text and "<response_language>" in assistant_response_text:
+                # Language already resolved but LLM emitted tag again — strip it
+                assistant_response_text = _strip_response_language_tag(assistant_response_text)
+                last_assistant_text = assistant_response_text
+                _strip_tag_from_last_assistant(message_history)
 
             # max_output_tokens 续写恢复：output 被截断时注入续写提示
             _output_truncated = getattr(self.llm_client, "_output_truncated_flag", None)
@@ -1087,6 +1201,24 @@ class MainLoopRunner:
                 next_skills = self.inline_skill_selector.update_pending_skills(
                     assistant_response_text
                 )
+                # Strip <next_skills> tag from assistant text and message history
+                stripped = self.inline_skill_selector.strip_next_skills_tag(
+                    assistant_response_text
+                )
+                if stripped != assistant_response_text:
+                    assistant_response_text = stripped
+                    # Sync to message_history
+                    for msg in reversed(message_history):
+                        if msg.get("role") != "assistant":
+                            continue
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and "<next_skills>" in content:
+                            msg["content"] = self.inline_skill_selector.strip_next_skills_tag(content)
+                        elif isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict) and "<next_skills>" in item.get("text", ""):
+                                    item["text"] = self.inline_skill_selector.strip_next_skills_tag(item["text"])
+                        break
                 if next_skills:
                     # 检查 injection mode: meta_message 或 system_prompt
                     injection_mode = self.cfg.main_agent.get("skill_selection", {}).get(
@@ -1223,7 +1355,7 @@ class MainLoopRunner:
                     f"[{self.agent_name}] LLM call failed, task_failed=True (turn {turn_count})"
                 )
                 task_failed = True
-                continue
+                break
 
             # 检查是否有工具调用
             if (
@@ -1481,6 +1613,11 @@ class MainLoopRunner:
                         }
                     )
 
+            # Sync last_assistant_text after all cleaning passes (evidence, offload,
+            # response_language) so the simple-response path returns clean text.
+            if assistant_response_text is not None:
+                last_assistant_text = assistant_response_text
+
             # Hook: on_turn_end
             tool_calls_count = len(tool_calls[0]) if tool_calls and len(tool_calls) > 0 else 0
             self.hooks.call(
@@ -1736,8 +1873,9 @@ class MainLoopRunner:
 
         calls_to_process = tool_calls[0][:max_tool_calls]
 
-        # Handle built-in tools (update_todo)
+        # Handle built-in tools (update_todo, spawn_agent, read_result)
         builtin_results = []
+        spawn_calls = []
         remaining_calls = []
         for call in calls_to_process:
             if call["tool_name"] == BUILTIN_TOOL_SEARCH and self.deferred_tool_manager:
@@ -1766,11 +1904,21 @@ class MainLoopRunner:
                     }
                 )
                 builtin_results.append((call["id"], tool_result_for_llm))
-            elif call["tool_name"] == "update_todo" and self.todo_tracker:
-                logger.info(
-                    f"[{self.agent_name}] Builtin: update_todo action={call['arguments'].get('action', '?')}"
-                )
-                result_text = self.todo_tracker.update_from_tool_call(call["arguments"])
+            elif call["tool_name"] == "update_todo":
+                if self.todo_tracker:
+                    logger.info(
+                        f"[{self.agent_name}] Builtin: update_todo action={call['arguments'].get('action', '?')}"
+                    )
+                    result_text = self.todo_tracker.update_from_tool_call(call["arguments"])
+                else:
+                    logger.warning(
+                        f"[{self.agent_name}] update_todo called but todo_tracker is not available "
+                        f"(this agent does not have a todo tracker enabled)"
+                    )
+                    result_text = (
+                        "Error: update_todo tool does not exist in this agent. "
+                        "Do NOT call it again. Focus on your task using the tools available to you."
+                    )
                 tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
                     {
                         "server_name": "builtin",
@@ -1780,24 +1928,7 @@ class MainLoopRunner:
                 )
                 builtin_results.append((call["id"], tool_result_for_llm))
             elif call["tool_name"] == BUILTIN_TOOL_SPAWN_AGENT:
-                task_desc = call["arguments"].get("task_description", str(call["arguments"]))
-                logger.info(f"[{self.agent_name}] Builtin: spawn_agent task={task_desc[:80]}")
-                try:
-                    spawn_result = await self._run_spawned_agent(task_desc, keep_tool_result)
-                except Exception as e:
-                    logger.error(f"spawn_agent failed: {e}")
-                    spawn_result = f"[Spawn Error] {str(e)[:500]}"
-                self.session_memory.add_sub_agent_result(
-                    BUILTIN_TOOL_SPAWN_AGENT, spawn_result[:500]
-                )
-                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
-                    {
-                        "server_name": "builtin",
-                        "tool_name": BUILTIN_TOOL_SPAWN_AGENT,
-                        "result": spawn_result,
-                    }
-                )
-                builtin_results.append((call["id"], tool_result_for_llm))
+                spawn_calls.append(call)
             elif call["tool_name"] == BUILTIN_TOOL_READ_RESULT:
                 ref = call["arguments"].get("ref", "")
                 logger.info(f"[{self.agent_name}] Builtin: read_result ref={ref}")
@@ -1812,6 +1943,11 @@ class MainLoopRunner:
                 builtin_results.append((call["id"], tool_result_for_llm))
             else:
                 remaining_calls.append(call)
+
+        # Execute spawn_agent calls (parallel by default, serial if configured)
+        if spawn_calls:
+            spawn_results = await self._execute_spawn_calls(spawn_calls, keep_tool_result)
+            builtin_results.extend(spawn_results)
 
         all_tool_results_with_id.extend(builtin_results)
 
@@ -1879,6 +2015,21 @@ class MainLoopRunner:
                     tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
                         tool_result
                     )
+                    # Backup large sub-agent results for read_result recovery
+                    sa_text = (
+                        tool_result_for_llm.get("text", "")
+                        if isinstance(tool_result_for_llm, dict)
+                        else ""
+                    )
+                    if isinstance(sa_text, str):
+                        sa_ref = self.context_manager.backup_large_result(
+                            sa_text,
+                            tool_name=tool_name,
+                            turn=self.context_manager._current_turn,
+                        )
+                        if sa_ref:
+                            tool_result_for_llm["_offload_ref"] = sa_ref
+                            tool_result_for_llm["_offload_chars"] = len(sa_text)
                     all_tool_results_with_id.append((call_id, tool_result_for_llm))
 
                 # Resume main agent stream
@@ -2135,7 +2286,81 @@ class MainLoopRunner:
 
         return all_results
 
-    async def _run_spawned_agent(self, task_description: str, keep_tool_result: int) -> str:
+    async def _execute_spawn_calls(
+        self, spawn_calls: list[dict], keep_tool_result: int
+    ) -> list[tuple[str, dict]]:
+        """Execute spawn_agent calls — parallel (with semaphore) or serial based on config."""
+
+        async def _run_one_spawn(call):
+            task_desc = call["arguments"].get("task_description", str(call["arguments"]))
+            spawn_max_turns = call["arguments"].get("max_turns")
+            logger.info(f"[{self.agent_name}] spawn_agent task={task_desc[:80]}")
+            try:
+                async with self._sub_agent_semaphore:
+                    spawn_result = await self._run_spawned_agent(
+                        task_desc, keep_tool_result, max_turns=spawn_max_turns
+                    )
+            except Exception as e:
+                logger.error(f"spawn_agent failed: {e}")
+                spawn_result = f"[Spawn Error] {str(e)[:500]}"
+
+            self.monitor.state.last_progress_time = time.time()
+            self.monitor.state.stall_warned = False
+            self._spawn_executed = True
+            self.session_memory.add_sub_agent_result(
+                BUILTIN_TOOL_SPAWN_AGENT, spawn_result[:500]
+            )
+
+            tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                {
+                    "server_name": "builtin",
+                    "tool_name": BUILTIN_TOOL_SPAWN_AGENT,
+                    "result": spawn_result,
+                }
+            )
+            result_text = (
+                tool_result_for_llm.get("text", "")
+                if isinstance(tool_result_for_llm, dict)
+                else ""
+            )
+            if isinstance(result_text, str):
+                ref = self.context_manager.backup_large_result(
+                    result_text,
+                    tool_name=BUILTIN_TOOL_SPAWN_AGENT,
+                    turn=self.context_manager._current_turn,
+                )
+                if ref:
+                    tool_result_for_llm["_offload_ref"] = ref
+                    tool_result_for_llm["_offload_chars"] = len(result_text)
+            return (call["id"], tool_result_for_llm)
+
+        parallel = getattr(self.cfg.main_agent, "parallel_spawn", True)
+
+        if parallel and len(spawn_calls) > 1:
+            logger.info(
+                f"[{self.agent_name}] Executing {len(spawn_calls)} spawn_agent calls in parallel "
+                f"(semaphore={self._sub_agent_semaphore._value})"
+            )
+            results = await asyncio.gather(
+                *[_run_one_spawn(c) for c in spawn_calls], return_exceptions=True
+            )
+            out = []
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    logger.error(f"spawn_agent parallel task failed: {r}")
+                    out.append((
+                        spawn_calls[i]["id"],
+                        {"type": "text", "text": f"[Spawn Error] {str(r)[:500]}"},
+                    ))
+                else:
+                    out.append(r)
+            return out
+        else:
+            return [await _run_one_spawn(c) for c in spawn_calls]
+
+    async def _run_spawned_agent(
+        self, task_description: str, keep_tool_result: int, *, max_turns: int | None = None
+    ) -> str:
         """Run a temporary spawned agent — delegates to SubAgentRunner.spawn()."""
         if self.spawn_depth >= MAX_SPAWN_DEPTH:
             return (
@@ -2165,19 +2390,21 @@ class MainLoopRunner:
             config_loader=self.config_loader,
         )
 
-        # Tool definitions: remove spawn_agent if child can't spawn further
+        # Tool definitions: remove builtin tools that spawned agents cannot handle
         next_depth = self.spawn_depth + 1
+        # Always remove update_todo (spawned agents have no todo_tracker)
+        # Remove spawn_agent if child can't spawn further
+        tools_to_remove = {"update_todo"}
         if next_depth >= MAX_SPAWN_DEPTH:
-            spawn_tool_defs = [
-                td
-                for td in (self._current_tool_definitions or [])
-                if not any(
-                    t.get("name") == BUILTIN_TOOL_SPAWN_AGENT
-                    for t in td.get("tools", [td]) if isinstance(t, dict)
-                )
-            ]
-        else:
-            spawn_tool_defs = list(self._current_tool_definitions or [])
+            tools_to_remove.add(BUILTIN_TOOL_SPAWN_AGENT)
+        spawn_tool_defs = [
+            td
+            for td in (self._current_tool_definitions or [])
+            if not any(
+                t.get("name") in tools_to_remove
+                for t in td.get("tools", [td]) if isinstance(t, dict)
+            )
+        ]
 
         return await spawner.spawn(
             task_description,
@@ -2195,6 +2422,8 @@ class MainLoopRunner:
             spawn_depth=next_depth,
             hooks_instance=self.hooks,
             parent_system_prompt=getattr(self, "_current_system_prompt", None),
+            max_turns=max_turns,
+            parent_context_manager=self.context_manager,
         )
 
     async def _run_fork_skill(self, skill_command) -> str:

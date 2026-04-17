@@ -81,8 +81,9 @@ BUILTIN_TOOL_SPAWN_AGENT = "spawn_agent"
 BUILTIN_TOOL_SEARCH = "tool_search"
 BUILTIN_TOOL_READ_RESULT = "read_result"
 
-# Maximum nesting depth for spawned agents (prevents exponential resource consumption)
-MAX_SPAWN_DEPTH = 2
+# Maximum nesting depth for spawned agents.
+# 1 = only main agent can spawn; spawned agents cannot spawn further.
+MAX_SPAWN_DEPTH = 1
 
 # Tools that are safe to execute concurrently (read-only, no side effects).
 # Matched by segment: tool_name is split on "_" and "-", then checked for exact
@@ -169,7 +170,14 @@ DEFAULT_REASONING_TAGS = [
     "task_plan",
     "findings_update",
     "reflection_checkpoint",
+]
+
+# Default strip tags — silently removed from stream output (not emitted as reasoning events).
+# Supports attribute-bearing open tags like <offload_evidence ref="...">.
+DEFAULT_STRIP_TAGS = [
     "evidence",
+    "offload_evidence",
+    "response_language",
 ]
 
 # ============================================================

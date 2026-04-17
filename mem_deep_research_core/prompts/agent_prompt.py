@@ -111,6 +111,7 @@ class AgentPrompt:
         chinese_context: bool = False,
         task_engine_cfg: dict | None = None,
         extra_context: str = "",
+        response_language: str = "auto",
         **kwargs,
     ) -> str:
         """
@@ -249,6 +250,17 @@ class AgentPrompt:
             except FileNotFoundError:
                 pass
 
+        # 8. Language detection (always appended, cannot be overridden by custom templates)
+        if response_language == "auto":
+            parts.append(
+                "## Language\n\n"
+                "On your **first reply only**, emit a `<response_language>` tag declaring "
+                "the language you will use for this session, based on the user's query language:\n\n"
+                "```\n<response_language>Chinese</response_language>\n```\n\n"
+                "Supported values: `Chinese`, `English`, `Japanese`, `Korean`, or any other "
+                "language matching the user's input. After the first reply, do not emit this tag again."
+            )
+
         return "\n\n".join(parts)
 
     def generate_summarize_prompt(
@@ -272,15 +284,32 @@ class AgentPrompt:
         Returns:
             完整的总结 prompt
         """
+        # Build the task_failed conditional block in Python instead of
+        # Handlebars syntax (which render_template does not support).
+        task_failed_message = ""
+        if task_failed:
+            task_failed_message = (
+                "**Important: You have either exhausted the context token limit "
+                "or reached the maximum number of interaction turns without arriving "
+                "at a conclusive answer. Therefore, you failed to complete the task. "
+                "You Must explicitly state that you failed to complete the task in "
+                "your response.**\n"
+            )
+
+        template_vars = dict(
+            task_description=task_description,
+            task_failed=task_failed,
+            task_failed_message=task_failed_message,
+            chinese_context=chinese_context,
+            target_language=target_language,
+        )
+
         # 尝试加载自定义模板
         if self.custom_summarize_template:
             try:
                 return self.loader.load_and_render(
                     self.custom_summarize_template,
-                    task_description=task_description,
-                    task_failed=task_failed,
-                    chinese_context=chinese_context,
-                    target_language=target_language,
+                    **template_vars,
                 )
             except FileNotFoundError:
                 logger.warning(
@@ -292,10 +321,7 @@ class AgentPrompt:
         # 使用基础模板
         return self.loader.load_and_render(
             "base/summarize",
-            task_description=task_description,
-            task_failed=task_failed,
-            chinese_context=chinese_context,
-            target_language=target_language,
+            **template_vars,
         )
 
     def expose_agent_as_tool(self, subagent_name: str, **kwargs) -> dict:

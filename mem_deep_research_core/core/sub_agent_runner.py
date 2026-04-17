@@ -11,13 +11,14 @@
 
 import json
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
 from omegaconf import DictConfig, OmegaConf
 
-from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX
-from mem_deep_research_core.core.context_manager import ContextManager
+from mem_deep_research_core.core.constants import SUB_AGENT_PREFIX, ensure_dict
+from mem_deep_research_core.core.context_manager import ContextManager, ContextManagerConfig
 from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.llm_call_handler import LLMCallHandler, SummaryHandler
 from mem_deep_research_core.core.main_loop import MainLoopContext, MainLoopRunner
@@ -30,6 +31,17 @@ from mem_deep_research_core.tool.manager import ToolManager
 from mem_deep_research_core.utils.external_loader import ConfigLoader
 from mem_deep_research_core.utils.io_utils import OutputFormatter
 from mem_deep_research_core.utils.tool_utils import _load_agent_prompt
+
+# Regex to strip the ## Language detection section from parent system prompt.
+# Sub-agents inherit a resolved language and should not re-detect.
+_RE_LANGUAGE_SECTION = re.compile(
+    r"\n\n## Language\n\n.*?(?=\n\n## |\Z)", re.DOTALL
+)
+
+
+def _strip_language_section(prompt: str) -> str:
+    """Remove the ## Language section injected for auto-detection."""
+    return _RE_LANGUAGE_SECTION.sub("", prompt)
 
 logger = logging.getLogger("mem_deep_research")
 
@@ -89,6 +101,48 @@ class SubAgentRunner:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _create_context_manager(
+        self,
+        llm_client,
+        *,
+        parent_context_manager: ContextManager | None = None,
+    ) -> ContextManager:
+        """Create a ContextManager that inherits the main agent's configuration.
+
+        Reads ``main_agent.context_manager`` from the full config so that
+        sub-agents use the same compact/dedup/offload settings as the main agent.
+
+        When *parent_context_manager* is provided, the offload directory is
+        inherited directly from the parent's resolved ``_offload_dir`` instead
+        of being re-derived from config.  This prevents path mismatches when
+        the parent uses a custom offload dir that differs from the config default.
+        """
+        import os
+
+        cm_cfg_dict = {}
+        if self.cfg:
+            main_agent = self.cfg.get("main_agent", {})
+            cm_cfg_dict = ensure_dict(main_agent.get("context_manager", {}) if main_agent else {})
+        cm_config = ContextManagerConfig(**cm_cfg_dict) if cm_cfg_dict else ContextManagerConfig()
+        cm = ContextManager(config=cm_config, hooks=self._hooks)
+
+        if hasattr(llm_client, "_estimate_tokens"):
+            cm.set_token_estimator(llm_client._estimate_tokens)
+
+        # Inherit offload dir from parent if available (already resolved),
+        # otherwise fall back to config → output_dir default.
+        if parent_context_manager is not None and parent_context_manager._offload_dir:
+            offload_dir = parent_context_manager._offload_dir
+        else:
+            offload_dir = cm_cfg_dict.get("result_offload_dir", "")
+            if not offload_dir and self.cfg:
+                output_dir = self.cfg.get("output_dir", "logs/")
+                offload_dir = os.path.join(output_dir, "offloaded_results")
+        if offload_dir:
+            cm.set_offload_dir(offload_dir)
+
+        return cm
+
     @staticmethod
     def _parse_task_description(raw_arguments) -> str:
         """Extract task_description from LLM tool call arguments."""
@@ -131,6 +185,7 @@ class SubAgentRunner:
         system_prompt = prompt_instance.generate_system_prompt_with_mcp_tools(
             mcp_servers=tool_definitions,
             chinese_context=self.chinese_context,
+            response_language=self.response_language,
         )
 
         # Inject skills
@@ -222,9 +277,7 @@ class SubAgentRunner:
 
             # --- Create isolated components for this sub-agent ---
 
-            context_manager = ContextManager()
-            if hasattr(self.sub_agent_llm_client, "_estimate_tokens"):
-                context_manager.set_token_estimator(self.sub_agent_llm_client._estimate_tokens)
+            context_manager = self._create_context_manager(self.sub_agent_llm_client)
 
             monitor = ExecutionMonitor(
                 config=MonitoringConfig(),
@@ -351,6 +404,8 @@ class SubAgentRunner:
         spawn_depth: int = 0,
         hooks_instance=None,
         parent_system_prompt: str | None = None,
+        max_turns: int | None = None,
+        parent_context_manager: ContextManager | None = None,
     ) -> str:
         """Spawn a temporary agent inheriting parent's LLM client and tools.
 
@@ -368,6 +423,7 @@ class SubAgentRunner:
             spawn_depth: Current nesting depth for the spawned agent.
             hooks_instance: HookRegistry instance (defaults to module-level singleton).
             parent_system_prompt: Reuse parent's rendered system prompt (cache optimization).
+            max_turns: Maximum turns for this spawn. If None, inherits from parent config.
         """
         from omegaconf import OmegaConf
 
@@ -383,9 +439,9 @@ class SubAgentRunner:
 
         logger.debug(f"\n=== Spawning Agent: {display_name} ===")
 
-        context_manager = ContextManager()
-        if hasattr(parent_llm_client, "_estimate_tokens"):
-            context_manager.set_token_estimator(parent_llm_client._estimate_tokens)
+        context_manager = self._create_context_manager(
+            parent_llm_client, parent_context_manager=parent_context_manager
+        )
 
         monitor = ExecutionMonitor(
             config=MonitoringConfig(),
@@ -407,11 +463,17 @@ class SubAgentRunner:
         )
         summary_handler.context = self.context
 
+        # Resolve spawn limits: LLM-provided > parent config > hardcoded default
+        # Spawn agents handle focused subtasks — keep turns tight (cap at 10).
+        parent_main = self.cfg.get("main_agent", {}) if self.cfg else {}
+        _default_max_tool_calls = parent_main.get("max_tool_calls_per_turn", 5)
+        effective_max_turns = max(1, min(max_turns or 5, 10))
+
         spawn_cfg = OmegaConf.create(
             {
                 "main_agent": {
-                    "max_turns": 15,
-                    "max_tool_calls_per_turn": 5,
+                    "max_turns": effective_max_turns,
+                    "max_tool_calls_per_turn": _default_max_tool_calls,
                     "keep_tool_result": keep_tool_result,
                 }
             }
@@ -423,12 +485,15 @@ class SubAgentRunner:
         prompt_instance = _load_agent_prompt({"agent_type": "worker", "tool_format": "xml"})
         # Reuse parent's system prompt for cache optimization (byte-exact hit)
         if parent_system_prompt:
-            system_prompt = parent_system_prompt
+            # Strip the ## Language detection section — sub-agent already has a resolved
+            # response_language and should not emit <response_language> tags.
+            system_prompt = _strip_language_section(parent_system_prompt)
             logger.debug(f"[Spawn] Reusing parent system prompt ({len(system_prompt)} chars)")
         else:
             system_prompt = prompt_instance.generate_system_prompt_with_mcp_tools(
                 mcp_servers=parent_tool_definitions,
                 chinese_context=self.chinese_context,
+                response_language=self.response_language,
             )
 
         ctx = MainLoopContext(
@@ -452,13 +517,20 @@ class SubAgentRunner:
             handle_llm_call=parent_callbacks.get("handle_llm_call") or _noop_async,
             handle_summary=parent_callbacks.get("handle_summary") or _noop_async,
             intercept_key_message=parent_callbacks.get("intercept_key_message") or _noop_async,
-            streaming_final_message=parent_callbacks.get("streaming_final_message") or _noop_async,
+            streaming_final_message=_noop_async,  # spawned agent must NOT stream its output; result returns as tool result
             stream_tool_reasoning=parent_callbacks.get("stream_tool_reasoning") or _noop_async,
             extract_recent_tool_names=extract_recent_tool_names,
             deduplicate_trailing_messages=deduplicate_trailing_messages,
             spawn_depth=spawn_depth,
             hooks=hooks_instance or self._hooks,
         )
+
+        # Inject language instruction so sub-agent responds in the correct language
+        # (task_description from LLM is often English even when user query is Chinese)
+        if self.response_language and self.response_language not in ("auto", "English"):
+            task_description = (
+                f"[Language: respond in {self.response_language}]\n\n{task_description}"
+            )
 
         message_history = [
             {"role": "user", "content": [{"type": "text", "text": task_description}]}
@@ -481,6 +553,9 @@ class SubAgentRunner:
             logger.error(f"Spawned agent '{display_name}' failed: {e}", exc_info=True)
             return f"[Spawn Error] {display_name} failed: {str(e)[:500]}"
         finally:
+            # Merge sub-agent's offload registry into parent for cleanup
+            if parent_context_manager is not None:
+                parent_context_manager.merge_offload_registry(context_manager)
             if message_history:
                 session_key = f"spawn_{display_name}"
                 self.task_log.sub_agent_message_history_sessions[session_key] = {

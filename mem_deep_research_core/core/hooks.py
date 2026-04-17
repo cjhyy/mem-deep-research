@@ -130,6 +130,7 @@ class HookRegistry:
         # 存储
         "on_result_offload",  # 大结果卸载 (可覆盖存储后端: 文件/内存/S3/Redis)
         "on_result_restore",  # 卸载结果恢复 (可覆盖读取后端)
+        "on_offload_evidence_prep",  # offload evidence sidecar prompt 构建 (可追加 tool-specific 指导)
         # 输入编译
         "on_query_compile",  # 用户 query 编译后 (可修改 query / 追加 attachments)
     ]

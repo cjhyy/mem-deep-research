@@ -38,7 +38,12 @@ from mem_deep_research_core.exceptions import (
     ToolTimeoutError,
 )
 
-__version__ = "1.2.0"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("mem-deep-research")
+except Exception:
+    __version__ = "1.2.3"  # fallback when not installed as package
 __author__ = "maki maki"
 
 __all__ = [

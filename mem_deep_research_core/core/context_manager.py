@@ -219,6 +219,7 @@ class ContextManagerConfig:
     # Result offloading
     result_offload_threshold: int = 5000  # 0 = disabled
     result_offload_dir: str = ""
+    cleanup_offload_on_finish: bool = True
 
     # Evidence extraction
     enable_evidence_extraction: bool = True
@@ -607,6 +608,69 @@ class ContextManager:
             return None
 
     # ============================================================
+    # Offload cleanup
+    # ============================================================
+
+    def cleanup_offload_files(self) -> int:
+        """删除 registry 中记录的 offload 文件。任务结束后调用。
+
+        Returns:
+            删除的文件数
+        """
+        if not self.config.cleanup_offload_on_finish:
+            return 0
+
+        import os
+
+        offload_dir = self._offload_dir or self.config.result_offload_dir
+        if not offload_dir or not os.path.isdir(offload_dir):
+            return 0
+
+        removed = 0
+        for ref in list(self._offload_registry):
+            file_path = os.path.join(offload_dir, ref)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                    removed += 1
+            except OSError as e:
+                logger.warning(f"[Context] Failed to remove offload file {ref}: {e}")
+
+        self._offload_registry.clear()
+
+        # Remove the directory only if empty (safe for concurrent tasks)
+        try:
+            if os.path.isdir(offload_dir) and not os.listdir(offload_dir):
+                os.rmdir(offload_dir)
+        except OSError:
+            pass
+
+        if removed:
+            logger.info(f"[Context] Cleaned up {removed} offload files from {offload_dir}")
+        return removed
+
+    def merge_offload_registry(self, other: "ContextManager") -> None:
+        """将另一个 ContextManager 的 offload registry 合并进来。
+
+        用于 sub-agent 结束后，将其 offload 记录合并到 main agent，
+        确保 cleanup_offload_files() 能清理 sub-agent 创建的文件。
+
+        On ref collision (extremely rare — UUID-based), the incoming record
+        overwrites so the sub-agent's file is not orphaned.
+        """
+        merged = 0
+        for ref, record in other._offload_registry.items():
+            if ref in self._offload_registry:
+                logger.warning(
+                    f"[Context] Offload registry collision on ref={ref}, "
+                    f"overwriting with sub-agent record to prevent orphan file"
+                )
+            self._offload_registry[ref] = record
+            merged += 1
+        if merged:
+            logger.debug(f"[Context] Merged {merged} offload records from sub-agent")
+
+    # ============================================================
     # Microcompact: 每轮自动清理旧 tool_result（零 LLM 成本）
     # ============================================================
 
@@ -777,6 +841,7 @@ class ContextManager:
                         "turn": estimated_turn,
                         "chars": record.char_count,
                         "msg_index": i,
+                        "tool_names": record.tool_names,
                     })
 
         if candidates:

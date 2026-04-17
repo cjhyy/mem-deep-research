@@ -89,10 +89,11 @@ class MessageInterceptorHandler:
         """根据配置创建拦截器实例"""
         filter_keywords = self.config.get_all_filter_keywords()
         reasoning_tags = self.config.reasoning_tags
+        strip_tags = self.config.strip_tags
 
         # 主拦截器（用于工具调用阶段）
         self.key_message_interceptor = TextInterceptor(
-            filter_keywords, reasoning_tags=reasoning_tags
+            filter_keywords, reasoning_tags=reasoning_tags, strip_tags=strip_tags
         )
         # 最终消息拦截器重置（确保 update_config 后不使用旧实例）
         self._final_message_interceptor: TextInterceptor | None = None
@@ -240,7 +241,9 @@ class MessageInterceptorHandler:
             # 确保使用独立的 interceptor 实例
             if self._final_message_interceptor is None:
                 self._final_message_interceptor = TextInterceptor(
-                    self.config.get_all_filter_keywords(), reasoning_tags=self.config.reasoning_tags
+                    self.config.get_all_filter_keywords(),
+                    reasoning_tags=self.config.reasoning_tags,
+                    strip_tags=self.config.strip_tags,
                 )
 
             result, reasoning_blocks = self._final_message_interceptor.process(message, is_last)
