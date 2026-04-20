@@ -246,7 +246,12 @@ class GPTOpenAIClient(LLMProviderClientBase):
             raise ValueError(f"Unsupported finish reason: {llm_response.choices[0].finish_reason}")
         logger.debug(f"LLM Response: {truncate_for_log(assistant_response_text)}")
 
-        return assistant_response_text, False
+        # Claude Code-style loop exit: trust finish_reason.
+        finish_reason = llm_response.choices[0].finish_reason
+        should_break = finish_reason != "tool_calls"
+        if should_break:
+            logger.debug(f"[GPT] finish_reason={finish_reason!r} → should_break=True")
+        return assistant_response_text, should_break
 
     def extract_tool_calls_info(self, llm_response, assistant_response_text):
         """Extract tool call information from OpenAI LLM response"""

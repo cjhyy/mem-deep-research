@@ -326,7 +326,13 @@ class OpenAICompatibleClient(LLMProviderClientBase):
     def process_llm_response(
         self, llm_response, message_history, agent_type="main"
     ) -> tuple[str, bool]:
-        """Process OpenAI LLM response."""
+        """Process OpenAI LLM response.
+
+        Returns ``(text, should_break)``. ``should_break=True`` means the loop
+        should terminate. Only ``finish_reason="tool_calls"`` keeps the loop
+        running; everything else (``stop`` / ``length`` / others) means LLM
+        finished or was stopped.
+        """
         if not llm_response or not llm_response.choices:
             error_msg = "LLM did not return a valid response."
             logger.error(f"Should never happen: {error_msg}")
@@ -361,7 +367,12 @@ class OpenAICompatibleClient(LLMProviderClientBase):
         message_history.append({"role": "assistant", "content": history_content})
         logger.debug(f"LLM Response: {truncate_for_log(assistant_response_text)}")
 
-        return assistant_response_text, False
+        # Claude Code-style loop exit: trust finish_reason.
+        # Only "tool_calls" means the loop should continue (LLM wants tools run).
+        should_break = finish_reason != "tool_calls"
+        if should_break:
+            logger.debug(f"[OpenAI] finish_reason={finish_reason!r} → should_break=True")
+        return assistant_response_text, should_break
 
     def extract_tool_calls_info(self, llm_response, assistant_response_text):
         """Extract tool call information from OpenAI LLM response.

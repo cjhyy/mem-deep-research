@@ -157,9 +157,8 @@ class TestMainLoopWithToolCalls:
 
     @pytest.mark.asyncio
     async def test_tool_call_then_final_answer(self):
-        """Turn 1: LLM returns tool call → Turn 2: LLM returns final answer (no tools;
-        since tools were previously executed, grace turn nudge is injected)
-        → Turn 3: still no tools → break."""
+        """Turn 1: LLM returns tool call → Turn 2: LLM returns final answer (no tools)
+        → loop exits immediately (no grace turn)."""
         tool_calls_turn1 = [
             [{"server_name": "calc", "tool_name": "add", "arguments": {"a": 1, "b": 2}, "id": "c1"}],
             [],  # empty second batch
@@ -167,8 +166,7 @@ class TestMainLoopWithToolCalls:
 
         runner, call_log = _build_runner([
             ("Let me calculate...", False, tool_calls_turn1),
-            ("The answer is 3.", False, None),  # no tools → grace turn
-            ("The answer is 3.", False, None),  # still no tools → break
+            ("The answer is 3.", False, None),  # no tools → break
         ])
 
         # MainLoop calls execute_single_tool directly (not execute_tool_calls)
@@ -193,7 +191,7 @@ class TestMainLoopWithToolCalls:
 
         # Result comes from mock_summary, not directly from LLM response
         assert result is not None
-        assert len(call_log) == 3  # tool turn + final answer + grace turn confirmation
+        assert len(call_log) == 2  # tool turn + final answer (no grace turn)
         # Second call should have more history (tool result added)
         assert call_log[1]["history_len"] > call_log[0]["history_len"]
 
@@ -210,8 +208,7 @@ class TestMainLoopWithToolCalls:
 
         runner, call_log = _build_runner([
             ("Computing both...", False, tool_calls),
-            ("Results: 3 and 12.", False, None),  # no tools → grace turn
-            ("Results: 3 and 12.", False, None),  # still no tools → break
+            ("Results: 3 and 12.", False, None),  # no tools → break
         ])
 
         call_count = 0
@@ -235,7 +232,7 @@ class TestMainLoopWithToolCalls:
             keep_tool_result=-1,
         )
 
-        assert len(call_log) == 3  # tool turn + final answer + grace turn
+        assert len(call_log) == 2  # tool turn + final answer
         assert call_count == 2  # Both tools were executed
 
     @pytest.mark.asyncio
@@ -248,8 +245,7 @@ class TestMainLoopWithToolCalls:
 
         runner, call_log = _build_runner([
             ("Trying tool...", False, tool_calls),
-            ("Tool failed, but I know the answer.", False, None),  # grace turn
-            ("Tool failed, but I know the answer.", False, None),  # break
+            ("Tool failed, but I know the answer.", False, None),  # no tools → break
         ])
 
         runner.tool_executor.execute_single_tool = AsyncMock(
@@ -273,7 +269,7 @@ class TestMainLoopWithToolCalls:
 
         # Should complete without crashing
         assert result is not None
-        assert len(call_log) == 3  # tool turn + final answer + grace turn
+        assert len(call_log) == 2  # tool turn + final answer
 
 
 # ============================================================

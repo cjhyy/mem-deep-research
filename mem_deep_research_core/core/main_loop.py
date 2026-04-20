@@ -39,7 +39,6 @@ from mem_deep_research_core.core.constants import (
     EXECUTION_MODE_SIMPLE_AUTO,
     EXECUTION_MODE_STANDARD,
     make_msg,
-    MAX_CONSECUTIVE_NO_TOOL_TURNS,
     MAX_CONTEXT_LIMIT_RETRIES,
     MAX_FINDING_CHARS,
     MAX_SPAWN_DEPTH,
@@ -735,7 +734,6 @@ class MainLoopRunner:
         total_tool_calls_executed = 0
         last_assistant_text = ""
         _context_limit_retries = 0
-        _consecutive_no_tool_turns = 0  # grace turn 计数：连续无工具调用轮次
         _reflection_pending = False  # 上一轮末尾注入了反思 prompt，下轮允许无工具回复
         self._spawn_executed = False  # spawn_agent 执行标记，由 _execute_tools 设置
         _perf_main_loop_start = time.perf_counter()
@@ -1154,7 +1152,23 @@ class MainLoopRunner:
 
             # 处理 LLM 响应
             if assistant_response_text is not None:
-                if should_break:
+                # 防御：即使 should_break=True，若响应里仍带 tool_use block，
+                # 先执行工具再退出（应对 provider 返回不规范的罕见情况）。
+                _has_pending_tool_calls = (
+                    tool_calls
+                    and tool_calls != "context_limit"
+                    and len(tool_calls) >= 2
+                    and (len(tool_calls[0]) > 0 or len(tool_calls[1]) > 0)
+                )
+                # 反思轮豁免：LLM 只输出反思文字（无 tool_use），stop_reason=end_turn
+                # 但反思 prompt 刚注入，应让 LLM 下一轮基于反思决定动作。
+                if _reflection_pending and not _has_pending_tool_calls:
+                    logger.info(
+                        f"[{self.agent_name}] Reflection turn: LLM output reflection text without tools, continuing (turn {turn_count})"
+                    )
+                    _reflection_pending = False
+                    continue
+                if should_break and not _has_pending_tool_calls:
                     logger.info(
                         f"[{self.agent_name}] LLM signaled completion (turn {turn_count}, task_failed={task_failed})"
                     )
@@ -1231,83 +1245,14 @@ class MainLoopRunner:
                 and (len(tool_calls[0]) > 0 or len(tool_calls[1]) > 0)
             )
             if not _has_tool_calls:
-                # 反思轮豁免：LLM 可能只输出反思文字，下一轮再调工具
-                if _reflection_pending:
-                    _reflection_pending = False
-                    _consecutive_no_tool_turns = 0
-                    logger.info(
-                        f"[{self.agent_name}] No tool calls after reflection, continuing (turn {turn_count})"
-                    )
-                    continue
-
-                # 快速路径：从未调用过工具 → 直接回答，无需 grace turn
-                # 仅在 quick 模式启用：standard/deep 模式下首轮无工具调用可能是 LLM 遗忘，
-                # 应走 grace turn 恢复路径而非直接终止。
-                if is_quick_mode and total_tool_calls_executed == 0:
-                    logger.info(
-                        f"[{self.agent_name}] No tool calls and none executed previously, "
-                        f"treating as direct answer (turn {turn_count})"
-                    )
-                    break
-
-                _consecutive_no_tool_turns += 1
-
-                if _consecutive_no_tool_turns >= MAX_CONSECUTIVE_NO_TOOL_TURNS:
-                    # Grace turns 耗尽，终止
-                    logger.info(
-                        f"[{self.agent_name}] No tool calls for {_consecutive_no_tool_turns} consecutive turns, "
-                        f"ending (turn {turn_count}, task_failed={task_failed})"
-                    )
-                    break
-
-                # Grace turn：注入 nudge 提示，给 LLM 再一轮机会
-                # 替换上一条 nudge（避免多条堆积，只需检查末尾）
-                if message_history and message_history[-1].get("_type") == MT.NO_TOOL_NUDGE:
-                    message_history.pop()
-                nudge_text = (
-                    "[NO TOOL CALLS DETECTED] Your previous response contained no tool calls. "
-                    "If the task is complete, provide your final answer directly. "
-                    "If not, proceed with the next tool call now."
-                ) if not self.chinese_context else (
-                    "[未检测到工具调用] 你的上一轮回复没有调用任何工具。"
-                    "如果任务已完成，请直接给出最终回答。"
-                    "如果尚未完成，请立即执行下一步工具调用。"
-                )
-                message_history.append(make_msg("user", nudge_text, MT.NO_TOOL_NUDGE))
+                # 反思豁免和 should_break 处理已在上方完成。
+                # 能到这里说明响应既无 tool_use 也没触发 should_break（罕见 provider 异常），
+                # 防御性退出。
                 logger.info(
-                    f"[{self.agent_name}] No tool calls, grace turn {_consecutive_no_tool_turns}/{MAX_CONSECUTIVE_NO_TOOL_TURNS} "
-                    f"— nudge injected (turn {turn_count})"
+                    f"[{self.agent_name}] No tool calls — exiting loop "
+                    f"(turn {turn_count}, task_failed={task_failed})"
                 )
-                # Token budget check: if context is already near threshold, run full
-                # manage_context (incl. summarize) so the grace turn's next LLM call
-                # doesn't overflow. Fall back to microcompact when budget is safe.
-                ratio = self.context_manager.get_context_ratio(
-                    system_prompt, message_history, self.llm_client.max_context_length
-                )
-                if ratio >= self.context_manager.config.compact_at_ratio:
-                    action = self.context_manager.manage_context(
-                        message_history,
-                        turn_count,
-                        system_prompt,
-                        self.llm_client.max_context_length,
-                    )
-                    if action == "need_summarize":
-                        await self.context_manager.apply_summarize(
-                            message_history,
-                            turn_count,
-                            system_prompt,
-                            self.llm_client.max_context_length,
-                            llm_call_fn=self._context_summarize_call,
-                        )
-                else:
-                    keep_recent = self.context_manager.config.compact_keep_recent
-                    self.context_manager.microcompact(
-                        message_history, turn_count, keep_recent=keep_recent
-                    )
-                continue
-            else:
-                # 有工具调用，重置计数器
-                _consecutive_no_tool_turns = 0
+                break
 
             # 跨轮次去重过滤
             calls_to_execute = tool_calls[0][:max_tool_calls]

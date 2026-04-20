@@ -38,12 +38,6 @@ SUMMARY_GENERATION_TIMEOUT = 120
 # Max retry attempts for context limit recovery
 MAX_CONTEXT_LIMIT_RETRIES = 2
 
-# Max consecutive no-tool-call turns before forced termination.
-# The loop terminates after N consecutive responses without tool calls.
-# Before termination, the first N-1 turns inject a nudge prompt to give the LLM
-# another chance. Example: N=2 means 1 nudge + 1 break.
-MAX_CONSECUTIVE_NO_TOOL_TURNS = 2
-
 # Max context reduction retries in SummaryHandler
 MAX_SUMMARY_CONTEXT_RETRIES = 5
 
@@ -266,7 +260,6 @@ class MT:
 
     # === 系统提示（不受压缩保护，可被清理） ===
     LOOP_HINT = "loop_hint"
-    NO_TOOL_NUDGE = "no_tool_nudge"
     TRUNCATION_RECOVERY = "truncation_recovery"
     INLINE_SKILL = "inline_skill"
 

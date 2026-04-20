@@ -4,33 +4,59 @@
 > 旧文档已降级为历史参考，顶部标注 `[DEPRECATED — 见 doc-20]`。
 >
 > 生成时间：2026-04-17
-> 最后更新：2026-04-20（Phase 1 bug 状态核对 + 新发现项）
+> 最后更新：2026-04-20（Grace turn 机制整体移除）
 > 基于：Arena 三模型评审（Claude Opus / Gemini 3.1-pro-preview / DeepSeek-R1）
 
-## Phase 1 进度快照（2026-04-20）
+## Phase 1 进度快照（2026-04-20 最终）
 
-| Bug | 状态 | 证据 |
-|-----|------|------|
-| BUG-01 Grace Turn 绕过 context 管理 | ✅ 已修复 | `main_loop.py:1281-1306` — 注入 nudge 前 token 预算检查 + 满阈值走 `manage_context` |
-| BUG-02 Nudge 去重破坏角色交替 | ✅ 已修复 | `main_loop.py:1265-1266` — 仅检查末尾一条 |
-| BUG-03 常量注释误导 | ✅ 已修复 | `constants.py:41-45` — 注释已明确 "N=2 means 1 nudge + 1 break" |
+### ⭐ 根本性改动：Grace turn 机制已整体移除
+
+在 Phase 1 收尾阶段，通过性能分析（"link 了哪些数据源" 查询 20s 中有 6s 浪费在 grace turn nudge）重新审视了 `771fcf7` 引入的 grace turn 机制，得出结论：**trade-off 反了** —— 用 100% 任务多等一次 LLM call (~6s) 换 <1% 场景的补救。
+
+**修复方向（对齐 Claude Code 设计）**：循环退出完全交给 LLM 通过 API `stop_reason` / `finish_reason` 明说，框架只读信号不做推断：
+
+- `stop_reason == "tool_use"` / `finish_reason == "tool_calls"` → LLM 要调工具，循环继续
+- `stop_reason == "end_turn"` → LLM 明说完成，循环退出
+- `"max_tokens"` / `"length"` / `"refusal"` 等 → 非正常完成，同样退出（交给上层处理）
+
+**改动**：
+1. 四个 provider 的 `process_llm_response` 从"永远返回 `should_break=False`"改为"按 `stop_reason` / `finish_reason` 返回真实值"（`claude_anthropic_client.py`, `openai_compatible_client.py`, `gpt_openai_client.py`, `deepseek_openrouter_client.py` 基类委托）
+2. `main_loop.py` 删除 grace turn 整块（75 行 → 6 行），`should_break` 在 line 1155 主导退出，无 tool call 保底退出
+3. `constants.py` 删除 `MAX_CONSECUTIVE_NO_TOOL_TURNS` + `MT.NO_TOOL_NUDGE`
+4. 测试从"3 LLM calls（含 grace turn 确认）"改为"2 LLM calls"
+
+**语义**：LLM 通过 API 明确表达意图，框架尊重。不推断、不 nudge、不强行再问。
+
+**影响**：
+- `main_loop.py` 删除 grace turn 分支（75 行 → 6 行）
+- `constants.py` 删除 `MAX_CONSECUTIVE_NO_TOOL_TURNS` 常量 + `MT.NO_TOOL_NUDGE` 消息类型
+- 相关测试从 "3 LLM calls（含 grace turn 确认）" 改为 "2 LLM calls"
+- BUG-01 / BUG-03 / BUG-08 的修复代码一并删除（源头不存在，bug 自然消失）
+
+**语义**：LLM 的判断优先。无 tool call 直接 break。反思检查点豁免（`_reflection_pending`）保留。Deep 模式通过反思检查点主动问 LLM "还要做什么"，比 grace turn nudge 更有信息量。
+
+### Bug 最终状态
+
+| Bug | 最终状态 | 说明 |
+|-----|---------|------|
+| BUG-01 Grace Turn 绕过 context 管理 | 🗑️ 代码移除 | Grace turn 整体删除后不存在 |
+| BUG-02 Nudge 去重破坏角色交替 | 🗑️ 代码移除 | 同上 |
+| BUG-03 常量注释误导 | 🗑️ 代码移除 | `MAX_CONSECUTIVE_NO_TOOL_TURNS` 已删 |
 | BUG-04 子 Agent 配置继承不完整 | ✅ 已修复 | `sub_agent_runner.py:104-175` — inherit_with_override 四层合并 |
-| BUG-05 Registry merge 静默丢弃 | ✅ 已修复 | `context_manager.py:655-674` — collision WARNING + 覆盖写入，不丢条目 |
-| BUG-06 MCP 会话跨任务串号 | ⚠️ 设计争议 | `tool/manager.py:286-378` — context fingerprint 机制已修复串号；但默认 `_default_env_inject` 自动将顶层 context 注入 env 的设计本身可议（见 BUG-09） |
-| BUG-07 配置契约 fail-fast | ✅ 已修复 | `deep_research.py:297-341` — critical 字段缺失抛 `ConfigValidationError`，catch-all 已移除 |
-| BUG-08 Fast-path 与 Grace Turn 冲突 | ✅ 已修复 | `main_loop.py:1246` — 加 `is_quick_mode` gate |
-
-**额外完成（Review 发现）**：
-- BUG-10 `main_loop.py:2017` agent_calls gather 加 `return_exceptions=True` + 异常归一化
-- BUG-11 `agent_factory.py:357-384` close() 异常隔离，所有 tool_manager 必定尝试清理
-- BUG-12 `todo_tracker.py` / `file_state_cache.py` / `transcript.py` 加 `threading.Lock`，iteration 快照化
-- BUG-14 `response_language` 加 Pydantic `field_validator` 软验证
-- BUG-16 `llm_call_handler.py:478` 硬编码 0.6 → `CONTEXT_REDUCTION_TARGET_RATIO`
-- BUG-17 命名 sub-agent offload 孤儿：`SubAgentRunner.run()` 接受 `parent_context_manager`，finally 块 merge registry
+| BUG-05 Registry merge 静默丢弃 | ✅ 已修复 | `context_manager.py:655-674` — collision WARNING + 覆盖写入 |
+| BUG-06 MCP 会话跨任务串号 | ⚠️ 设计争议 | `tool/manager.py:286-378` — context fingerprint 已修串号；默认 `_default_env_inject` 行为见 BUG-09 |
+| BUG-07 配置契约 fail-fast | ✅ 已修复 | `deep_research.py:297-341` — critical 字段抛 `ConfigValidationError` |
+| BUG-08 Fast-path 与 Grace Turn 冲突 | 🗑️ 代码移除 | Fast-path 本身也随 grace turn 一起删 |
+| BUG-10 gather 缺 return_exceptions | ✅ 已修复 | `main_loop.py` agent_calls gather 加 `return_exceptions=True` + 异常归一化 |
+| BUG-11 AgentFactory.close() 异常未隔离 | ✅ 已修复 | `agent_factory.py:357-384` — 每个 tool_manager 独立 try/except |
+| BUG-12 三模块缺锁 | ✅ 已修复 | `todo_tracker.py` / `file_state_cache.py` / `transcript.py` 加 `threading.Lock` |
+| BUG-14 response_language 未约束 | ✅ 已修复 | Pydantic `field_validator` 软验证 |
+| BUG-16 硬编码 0.6 | ✅ 已修复 | `llm_call_handler.py` → `CONTEXT_REDUCTION_TARGET_RATIO` |
+| BUG-17 命名 sub-agent offload 孤儿 | ✅ 已修复 | `SubAgentRunner.run()` 接受 `parent_context_manager`，finally merge |
 
 **复核结论**：
 - BUG-13 scrape_max_length：**非 bug**，配置优先级已正确
-- BUG-15 `@file` 白名单：**复核已实现**，多层防护已在 input_compiler.py + config_schema.py 中
+- BUG-15 `@file` 白名单：**复核已实现**，多层防护已在 `input_compiler.py` + `config_schema.py` 中
 - BUG-18~21（Review agent 汇报）：**均非 bug**，属已有设计或误判
 
 **测试**：543 passed，零 regression。
@@ -43,7 +69,8 @@
 
 | 风险维度 | 代表问题 | 影响 | 2026-04-20 状态 |
 |---------|---------|------|-----------|
-| 运行时状态一致性 | Grace Turn 绕过上下文管理 | 长任务 Token 溢出 | ✅ 已修复 |
+| 运行时状态一致性 | Grace Turn 绕过上下文管理 | 长任务 Token 溢出 | 🗑️ Grace turn 机制整体移除，问题源头消失 |
+| 主循环性能 | Grace turn 让所有任务多等 ~6s | 简单任务延迟翻倍 | 🗑️ 移除 grace turn 后简单任务直接 break |
 | 多任务隔离失效 | MCP 会话串号、子 Agent 配置继承不完整 | 静默行为偏离 | ✅ 串号已修（fingerprint）；子 Agent 已修（inherit_with_override） |
 | 配置契约分裂 | 多条读取路径、校验非 fail-fast | 调试成本极高 | ⚠️ critical 字段 fail-fast 完成；多路径读取未收口 |
 | 并发安全 | 三个模块缺锁、gather 缺 return_exceptions、close 不隔离 | 资源泄漏、死锁 | ✅ Review 发现项全部修复 |
@@ -93,7 +120,11 @@ Phase 3  v1.4.0        质量体系与长期演进        ~4-6 周
 
 ### Bug 修复清单
 
-#### BUG-01 Grace Turn 绕过上下文管理 🔴 ✅ 已修复（2026-04-20）
+#### BUG-01 Grace Turn 绕过上下文管理 🗑️ 代码移除（2026-04-20）
+
+**说明**：此 bug 修复代码已随 grace turn 机制整体删除，不再适用。以下为历史记录。
+
+
 
 **位置**：`main_loop.py:1279-1283`
 
@@ -114,7 +145,11 @@ continue
 
 ---
 
-#### BUG-02 Nudge 去重逻辑破坏消息角色交替 🔴 ✅ 已修复
+#### BUG-02 Nudge 去重逻辑破坏消息角色交替 🗑️ 代码移除（2026-04-20）
+
+**说明**：Nudge 机制已随 grace turn 整体删除，此 bug 不再存在。以下为历史记录。
+
+
 
 **位置**：`main_loop.py`（nudge 去重的反向扫描 + `list.pop(i)`）
 
@@ -136,7 +171,11 @@ else:
 
 ---
 
-#### BUG-03 常量命名语义误导（off-by-one）🟡 ✅ 已修复
+#### BUG-03 常量命名语义误导（off-by-one）🗑️ 代码移除（2026-04-20）
+
+**说明**：`MAX_CONSECUTIVE_NO_TOOL_TURNS` 常量已删除，此 bug 不再存在。以下为历史记录。
+
+
 
 **位置**：`constants.py`
 
@@ -225,7 +264,11 @@ def merge_offload_registry(self, child_registry: dict) -> None:
 
 ---
 
-#### BUG-08 快速路径与 Grace Turn 首轮冲突 🟡 ✅ 已修复（2026-04-20）
+#### BUG-08 快速路径与 Grace Turn 首轮冲突 🗑️ 代码移除（2026-04-20）
+
+**说明**：Fast-path 分支与 grace turn 一起删除。循环退出由 `stop_reason` / `finish_reason` 信号决定（见 grace turn 移除说明），LLM 通过 API 明确表达意图，框架尊重。以下为历史记录。
+
+
 
 **位置**：`main_loop.py`
 
@@ -399,14 +442,15 @@ main_agent:
 
 ### Phase 1 出口标准
 
-- [x] BUG-01 ~ BUG-05、BUG-07、BUG-08 修复完成
-- [x] Review 新发现 BUG-10、BUG-11、BUG-12 修复完成
-- [ ] BUG-06 / BUG-09 设计决策
-- [ ] BUG-13 ~ BUG-16 修复
-- [ ] 全部回归测试通过（当前 543 passed）
+- [x] BUG-04 / BUG-05 / BUG-07 修复完成
+- [x] BUG-01 / BUG-02 / BUG-03 / BUG-08：grace turn 机制整体移除，源头消失
+- [x] Review 新发现 BUG-10 / BUG-11 / BUG-12 / BUG-14 / BUG-16 / BUG-17 修复完成
+- [x] 全部回归测试通过（543 passed，零 regression）
+- [ ] BUG-06 / BUG-09 设计决策（MCP 默认 context→env 注入）
+- [ ] BUG-13 复核已证非 bug；BUG-15 复核已证已实现
 - [ ] `ruff check` 零错误
-- [ ] 版本号统一为 `v1.2.3`
-- [ ] CHANGELOG 更新，包含配置迁移指南（BUG-07 方案 B 涉及 breaking change）
+- [ ] 版本号 bump + release（v1.2.5 或更高，含 grace turn 移除的 breaking notice）
+- [ ] CHANGELOG 更新，包含 BUG-07 方案 B 的配置迁移指南 + grace turn 移除说明
 
 ---
 

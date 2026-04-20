@@ -166,7 +166,14 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
     def process_llm_response(
         self, llm_response, message_history, agent_type="main"
     ) -> tuple[str, bool]:
-        """Process Anthropic LLM response"""
+        """Process Anthropic LLM response.
+
+        Returns ``(text, should_break)``. ``should_break=True`` means the loop
+        should terminate:
+        - LLM response is missing/empty (API error)
+        - ``stop_reason`` != ``"tool_use"`` (LLM signaled completion via end_turn,
+          or was stopped by max_tokens / refusal / context overflow / pause_turn)
+        """
         if not llm_response:
             logger.debug("[ERROR] LLM call failed, skipping this response.")
             return "", True
@@ -197,7 +204,13 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
 
         logger.debug(f"LLM Response: {truncate_for_log(assistant_response_text)}")
 
-        return assistant_response_text, False
+        # Claude Code-style loop exit: trust stop_reason.
+        # Only "tool_use" means the loop should continue (LLM wants tools run).
+        stop_reason = getattr(llm_response, "stop_reason", None)
+        should_break = stop_reason != "tool_use"
+        if should_break:
+            logger.debug(f"[Anthropic] stop_reason={stop_reason!r} → should_break=True")
+        return assistant_response_text, should_break
 
     def extract_tool_calls_info(self, llm_response, assistant_response_text):
         """Extract tool call information from Anthropic LLM response"""
