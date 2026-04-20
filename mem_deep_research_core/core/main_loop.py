@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import dataclasses
 import json as _json
 import logging
 import re
@@ -28,6 +29,7 @@ from mem_deep_research_core.core.constants import (
     CONCURRENT_SAFE_TOOL_SEGMENTS,
     build_context_compression_notice,
     DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+    DEFAULT_RESULT_OFFLOAD_THRESHOLD,
     DEFAULT_TASK_TOKEN_BUDGET,
     DEFAULT_TEMPERATURE_BOOST,
     DEFAULT_TEMPERATURE_BOOST_CAP,
@@ -36,10 +38,16 @@ from mem_deep_research_core.core.constants import (
     EXECUTION_MODE_QUICK,
     EXECUTION_MODE_SIMPLE_AUTO,
     EXECUTION_MODE_STANDARD,
+    make_msg,
+    MAX_CONSECUTIVE_NO_TOOL_TURNS,
     MAX_CONTEXT_LIMIT_RETRIES,
+    MAX_FINDING_CHARS,
     MAX_SPAWN_DEPTH,
+    MIN_FINDING_LINE_LEN,
     QUICK_MODE_MAX_TURNS,
+    SESSION_MEMORY_FINDING_KEYWORDS,
     SUB_AGENT_PREFIX,
+    SYNTHETIC_TURN_ID,
     TAG_COLLECTED_SOURCES,
     TAG_OFFLOADED,
     TAG_TASK_PLAN,
@@ -307,29 +315,6 @@ def _extract_evidence_tags(
     return _RE_EVIDENCE.sub("", assistant_text).strip()
 
 
-def _strip_evidence_from_last_assistant(message_history: list) -> None:
-    """清理 message_history 中最后一条 assistant 消息里的 evidence 相关标签。"""
-
-    def _clean(text: str) -> str:
-        text = _RE_EVIDENCE.sub("", text)
-        text = _RE_OFFLOAD_EVIDENCE.sub("", text)
-        return text.strip()
-
-    for msg in reversed(message_history):
-        if msg.get("role") != "assistant":
-            continue
-        content = msg.get("content", "")
-        if isinstance(content, str) and ("<evidence>" in content or "<offload_evidence" in content):
-            msg["content"] = _clean(content)
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict):
-                    t = item.get("text", "")
-                    if "<evidence>" in t or "<offload_evidence" in t:
-                        item["text"] = _clean(t)
-        break
-
-
 _RE_RESPONSE_LANGUAGE = re.compile(
     r"<response_language>\s*([\w]+)\s*</response_language>", re.IGNORECASE
 )
@@ -346,19 +331,47 @@ def _strip_response_language_tag(text: str) -> str:
     return _RE_RESPONSE_LANGUAGE.sub("", text).strip()
 
 
-def _strip_tag_from_last_assistant(message_history: list) -> None:
-    """Remove <response_language> tag from the last assistant message in history."""
+def _clean_last_assistant(
+    message_history: list,
+    contains: str | tuple[str, ...],
+    cleaner: Callable[[str], str],
+) -> None:
+    """Clean the last assistant message in history by applying *cleaner* to text
+    that contains any of the *contains* markers.
+
+    Unified helper — replaces the former _strip_evidence_from_last_assistant and
+    _strip_tag_from_last_assistant functions.
+    """
     for msg in reversed(message_history):
         if msg.get("role") != "assistant":
             continue
         content = msg.get("content", "")
-        if isinstance(content, str) and "<response_language>" in content:
-            msg["content"] = _strip_response_language_tag(content)
+        if isinstance(content, str) and any(c in content for c in (contains if isinstance(contains, tuple) else (contains,))):
+            msg["content"] = cleaner(content)
         elif isinstance(content, list):
             for item in content:
-                if isinstance(item, dict) and "<response_language>" in item.get("text", ""):
-                    item["text"] = _strip_response_language_tag(item["text"])
+                if isinstance(item, dict):
+                    t = item.get("text", "")
+                    if any(c in t for c in (contains if isinstance(contains, tuple) else (contains,))):
+                        item["text"] = cleaner(t)
         break
+
+
+def _clean_evidence(text: str) -> str:
+    """Remove evidence / offload_evidence tags from text."""
+    text = _RE_EVIDENCE.sub("", text)
+    text = _RE_OFFLOAD_EVIDENCE.sub("", text)
+    return text.strip()
+
+
+def _strip_evidence_from_last_assistant(message_history: list) -> None:
+    """清理 message_history 中最后一条 assistant 消息里的 evidence 相关标签。"""
+    _clean_last_assistant(message_history, ("<evidence>", "<offload_evidence"), _clean_evidence)
+
+
+def _strip_tag_from_last_assistant(message_history: list) -> None:
+    """Remove <response_language> tag from the last assistant message in history."""
+    _clean_last_assistant(message_history, "<response_language>", _strip_response_language_tag)
 
 
 class TokenBudgetTracker:
@@ -406,8 +419,16 @@ class TokenBudgetTracker:
         return self._total_tokens_used / self.budget
 
     def record_usage(self, prompt_tokens: int = 0, completion_tokens: int = 0):
-        """记录一次 LLM 调用的 token 消耗"""
+        """记录一次 LLM 调用的 token 消耗（增量方式）"""
         self._total_tokens_used += prompt_tokens + completion_tokens
+
+    def sync_total(self, total: int) -> None:
+        """将总消耗同步为外部累计值（如 LLM client 的 total_tokens）。
+
+        仅当 *total* 大于当前值时更新，避免回退。
+        """
+        if total > self._total_tokens_used:
+            self._total_tokens_used = total
 
     def check(self) -> str | None:
         """检查预算状态
@@ -431,6 +452,44 @@ class TokenBudgetTracker:
     def reset(self):
         self._total_tokens_used = 0
         self._warned = False
+
+
+@dataclasses.dataclass
+class _RunState:
+    """Mutable run-local state shared between run phases.
+
+    Keeps the per-run variables out of ``self`` so they cannot leak across
+    concurrent calls.
+    """
+
+    effective_mode: str = EXECUTION_MODE_STANDARD
+    is_deep_mode: bool = False
+    is_quick_mode: bool = False
+    task_failed: bool = False
+    total_tool_calls_executed: int = 0
+    last_assistant_text: str = ""
+
+    # Adaptive routing
+    adaptive_pending: bool = False
+    adaptive_allow_deep: bool = True
+
+    # Turn management
+    turn_counter: TurnCounter | None = None
+    max_turns: int = 0
+    max_tool_calls: int = 0
+
+    # Token budget
+    token_budget: TokenBudgetTracker = dataclasses.field(default_factory=TokenBudgetTracker)
+
+    # Grace turn tracking
+    context_limit_retries: int = 0
+    consecutive_no_tool_turns: int = 0
+    reflection_pending: bool = False
+
+    # Performance tracking
+    perf_main_loop_start: float = 0.0
+    perf_total_llm_time: float = 0.0
+    perf_total_tool_time: float = 0.0
 
 
 class MainLoopRunner:
@@ -558,58 +617,8 @@ class MainLoopRunner:
             self.inline_skill_selector.reset()
 
         # Resume: restore state from previous run
-        _resume_turn_offset = 0
         if resume_from:
-            prev_history = resume_from.get("message_history", [])
-            if prev_history:
-                message_history.clear()
-                message_history.extend(prev_history)
-            _resume_turn_offset = resume_from.get("last_turn", 0)
-            # Restore session memory snapshot
-            snapshot = resume_from.get("session_memory_snapshot", "")
-            if snapshot:
-                for line in snapshot.split("\n"):
-                    line = line.strip().lstrip("- ")
-                    if line:
-                        self.session_memory.add_finding(line)
-            # Restore todo tracker state
-            todo_state = resume_from.get("todo_state")
-            if todo_state and self.todo_tracker is not None:
-                from mem_deep_research_core.core.todo_tracker import TodoTracker
-
-                self.todo_tracker = TodoTracker.from_dict(
-                    todo_state, enabled=self.todo_tracker.enabled
-                )
-                logger.info(
-                    f"[Resume] Restored todo tracker: {len(self.todo_tracker._items)} items"
-                )
-
-            # Restore offloaded content (replace previews with full text)
-            restored = self.context_manager.restore_offloaded_content(message_history)
-            if restored > 0:
-                logger.info(f"[Resume] Restored {restored} offloaded results")
-
-            # Inject resume notice into conversation
-            message_history.append(
-                {
-                    "role": "user",
-                    "_type": MT.RESUME_NOTICE,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                f"[RESUME NOTICE] This task was previously interrupted at turn {_resume_turn_offset}. "
-                                f"The conversation history above contains all prior work. "
-                                f"Please continue from where you left off and complete the remaining work."
-                            ),
-                        }
-                    ],
-                }
-            )
-            logger.info(
-                f"[Resume] Restored state from turn {_resume_turn_offset}, "
-                f"message_history={len(message_history)} messages"
-            )
+            self._restore_resume_state(resume_from, message_history)
 
         # TurnCounter 延迟到路由后创建（reflection 由 effective_mode 驱动）
         turn_counter = None  # initialized after mode resolution
@@ -650,96 +659,18 @@ class MainLoopRunner:
             memories = self.long_term_memory.recall(task_description, top_k=5)
             if memories:
                 memory_text = "\n".join(f"- {m.value}" for m in memories)
-                message_history.append(
-                    {
-                        "role": "user",
-                        "_type": MT.LONG_TERM_MEMORY,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"[LONG-TERM MEMORY]\nRelevant past knowledge:\n{memory_text}",
-                            }
-                        ],
-                    }
-                )
+                message_history.append(make_msg(
+                    "user",
+                    f"[LONG-TERM MEMORY]\nRelevant past knowledge:\n{memory_text}",
+                    MT.LONG_TERM_MEMORY,
+                ))
 
-        # Resolve execution mode
-        # auto / simple_auto 使用 adaptive 策略：结构信号（零成本）→ hook → 第一轮后根据 LLM 行为定模式
-        # simple_auto 与 auto 的区别：adaptive 阶段不会升级到 deep（clamp 到 standard）
-        # 非 auto 模式直接使用配置值
-        effective_mode = self.execution_mode
-        _adaptive_pending = False  # True = auto 模式待第一轮后定模式
-        _adaptive_allow_deep = True  # simple_auto 时为 False
-
-        if effective_mode in (EXECUTION_MODE_AUTO, EXECUTION_MODE_SIMPLE_AUTO):
-            _adaptive_allow_deep = effective_mode == EXECUTION_MODE_AUTO
-
-            from mem_deep_research_core.core.llm_router import LLMRouter
-
-            router = LLMRouter(
-                hooks=self.hooks,
-                llm_client=self.llm_client,
-            )
-
-            # 1. Hook: on_route_classify（用户完全自定义）
-            _deterministic_result = None
-            if self.hooks.has_hooks("on_route_classify"):
-                from mem_deep_research_core.core.hooks import HookContext as _HC
-
-                _tool_count = sum(
-                    len(s.get("tools", [])) for s in tool_definitions if isinstance(s, dict)
-                )
-                hook_ctx = _HC(
-                    hook_name="on_route_classify",
-                    query=task_description,
-                    context=self.context or {},
-                    extra={
-                        "tool_count": _tool_count,
-                        "has_sub_agents": bool(getattr(self.cfg, "sub_agents", None)),
-                        "task_engine_enabled": bool(
-                            task_engine_cfg and task_engine_cfg.get("enabled")
-                        ),
-                    },
-                )
-                hook_result = self.hooks.call("on_route_classify", hook_ctx)
-                _deterministic_result = router._parse_hook_result(hook_result)
-
-            # 2. 结构信号路由（零成本）
-            if _deterministic_result is None:
-                _deterministic_result = router._structural_route(
-                    tool_count=sum(
-                        len(s.get("tools", [])) for s in tool_definitions if isinstance(s, dict)
-                    ),
-                    has_sub_agents=bool(getattr(self.cfg, "sub_agents", None)),
-                )
-
-            if _deterministic_result is not None:
-                # simple_auto: 结构信号判定 deep 时，clamp 到 standard
-                if not _adaptive_allow_deep and _deterministic_result.mode == EXECUTION_MODE_DEEP:
-                    _deterministic_result.mode = EXECUTION_MODE_STANDARD
-                    _deterministic_result.reasoning_effort = "medium"
-                # finalize（注入 thinking_params 等）
-                route_result = router._finalize(
-                    _deterministic_result, task_description, self.context
-                )
-                effective_mode = route_result.mode
-                logger.info(
-                    f"[{self.agent_name}] Auto route (deterministic): {effective_mode} "
-                    f"(source={route_result.source})"
-                )
-            else:
-                # 无确定性信号 → adaptive：先用 standard 跑第一轮，之后根据行为定模式
-                effective_mode = EXECUTION_MODE_STANDARD
-                _adaptive_pending = True
-                logger.info(
-                    f"[{self.agent_name}] Auto route: adaptive pending, "
-                    f"starting as standard (will finalize after turn 1)"
-                )
-
-        logger.info(
-            f"[{self.agent_name}] Execution mode: {effective_mode} (config={self.execution_mode})"
-        )
-        self.task_log.record_perf("config_mode", self.execution_mode, unit="")
+        # Resolve execution mode (auto / simple_auto routing, or direct config)
+        rs = _RunState()
+        self._resolve_execution_mode(task_description, tool_definitions, task_engine_cfg, rs)
+        effective_mode = rs.effective_mode
+        _adaptive_pending = rs.adaptive_pending
+        _adaptive_allow_deep = rs.adaptive_allow_deep
 
         # Deep 能力由 effective_mode 驱动（auto 路由到 deep 时也激活）
         is_deep_mode = effective_mode == EXECUTION_MODE_DEEP
@@ -788,15 +719,9 @@ class MainLoopRunner:
                 llm_client=self.llm_client,
             )
             if plan:
-                message_history.append(
-                    {
-                        "role": "user",
-                        "_type": MT.PLAN,
-                        "content": [
-                            {"type": "text", "text": f"{TAG_TASK_PLAN}\n{plan.to_context_string()}"}
-                        ],
-                    }
-                )
+                message_history.append(make_msg(
+                    "user", f"{TAG_TASK_PLAN}\n{plan.to_context_string()}", MT.PLAN,
+                ))
                 self.task_log.log_step(
                     "auto_planning",
                     f"Generated research plan with {len(plan.sub_questions)} sub-questions",
@@ -810,6 +735,7 @@ class MainLoopRunner:
         total_tool_calls_executed = 0
         last_assistant_text = ""
         _context_limit_retries = 0
+        _consecutive_no_tool_turns = 0  # grace turn 计数：连续无工具调用轮次
         _reflection_pending = False  # 上一轮末尾注入了反思 prompt，下轮允许无工具回复
         self._spawn_executed = False  # spawn_agent 执行标记，由 _execute_tools 设置
         _perf_main_loop_start = time.perf_counter()
@@ -842,11 +768,7 @@ class MainLoopRunner:
 
             # Inject session memory context (survives context compression)
             if not self.session_memory.is_empty():
-                memory_msg = {
-                    "role": "user",
-                    "_type": MT.SESSION_MEMORY,
-                    "content": [{"type": "text", "text": self.session_memory.to_context_string()}],
-                }
+                memory_msg = make_msg("user", self.session_memory.to_context_string(), MT.SESSION_MEMORY)
                 # Replace previous session memory message (avoid duplicates)
                 for i in range(len(message_history) - 1, -1, -1):
                     if message_history[i].get("_type") == MT.SESSION_MEMORY:
@@ -875,42 +797,24 @@ class MainLoopRunner:
                     f"[{self.agent_name}] Grace turn after spawn_agent — "
                     f"overriding {terminate_reason}, allowing one more LLM call"
                 )
-                message_history.append(
-                    {
-                        "role": "user",
-                        "_type": MT.TOKEN_WARNING,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "[TIME WARNING] 子任务已全部完成，结果已就绪。"
-                                    "请立即基于以上子任务结果输出最终汇总答案，不要再调用工具。"
-                                ),
-                            }
-                        ],
-                    }
-                )
+                message_history.append(make_msg(
+                    "user",
+                    "[TIME WARNING] 子任务已全部完成，结果已就绪。"
+                    "请立即基于以上子任务结果输出最终汇总答案，不要再调用工具。",
+                    MT.TOKEN_WARNING,
+                ))
                 self._spawn_executed = False
             elif terminate_reason == "soft_timeout":
                 # 软超时：注入催促 hint，继续执行
                 remaining = int(
                     self.monitor.config.max_total_time - self.monitor.get_elapsed_time()
                 )
-                message_history.append(
-                    {
-                        "role": "user",
-                        "_type": MT.TOKEN_WARNING,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"[TIME WARNING] 剩余时间约 {remaining}s。请尽快总结当前已有的发现和结论，"
-                                    "如果核心任务已完成请直接给出最终答案。"
-                                ),
-                            }
-                        ],
-                    }
-                )
+                message_history.append(make_msg(
+                    "user",
+                    f"[TIME WARNING] 剩余时间约 {remaining}s。请尽快总结当前已有的发现和结论，"
+                    "如果核心任务已完成请直接给出最终答案。",
+                    MT.TOKEN_WARNING,
+                ))
             elif terminate_reason:
                 # 硬超时或其他终止原因：标记失败，跳出循环走摘要流程
                 task_failed = True
@@ -962,11 +866,7 @@ class MainLoopRunner:
                             f"[Hook] on_offload_evidence_prep returned {type(hook_result).__name__} "
                             f"instead of str, ignoring (return a string to override sidecar prompt)"
                         )
-                message_history.append({
-                    "role": "user",
-                    "_type": MT.OFFLOAD_PREP,
-                    "content": [{"type": "text", "text": sidecar}],
-                })
+                message_history.append(make_msg("user", sidecar, MT.OFFLOAD_PREP))
                 _offload_prep_injected = True
 
             # LLM 调用
@@ -1003,11 +903,8 @@ class MainLoopRunner:
             # Token budget: 记录本轮消耗并检查
             if token_budget.enabled:
                 usage = self.llm_client.get_usage()
-                # 用增量：总消耗 - 之前记录的
                 current_total = usage.get("total_tokens", 0)
-                if current_total > token_budget.total_used:
-                    increment = current_total - token_budget.total_used
-                    token_budget._total_tokens_used = current_total
+                token_budget.sync_total(current_total)
                 budget_status = token_budget.check()
                 if budget_status == "exceeded":
                     logger.warning(
@@ -1018,22 +915,13 @@ class MainLoopRunner:
                     break
                 elif budget_status == "warning":
                     remaining_tokens = token_budget.remaining
-                    message_history.append(
-                        {
-                            "role": "user",
-                            "_type": MT.TOKEN_WARNING,
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": (
-                                        f"[TOKEN BUDGET WARNING] You have used {token_budget.usage_ratio:.0%} of your token budget "
-                                        f"({token_budget.total_used}/{token_budget.budget} tokens, ~{remaining_tokens} remaining). "
-                                        f"Please wrap up your research and provide a final answer soon."
-                                    ),
-                                }
-                            ],
-                        }
-                    )
+                    message_history.append(make_msg(
+                        "user",
+                        f"[TOKEN BUDGET WARNING] You have used {token_budget.usage_ratio:.0%} of your token budget "
+                        f"({token_budget.total_used}/{token_budget.budget} tokens, ~{remaining_tokens} remaining). "
+                        f"Please wrap up your research and provide a final answer soon.",
+                        MT.TOKEN_WARNING,
+                    ))
 
             self._record_event(
                 "llm_response",
@@ -1086,29 +974,22 @@ class MainLoopRunner:
                 _strip_tag_from_last_assistant(message_history)
 
             # max_output_tokens 续写恢复：output 被截断时注入续写提示
-            _output_truncated = getattr(self.llm_client, "_output_truncated_flag", None)
-            if _output_truncated is True:
+            # Use the base class interface when available; fall back to direct attribute
+            # access for test mocks that don't inherit LLMProviderClientBase.
+            _output_truncated = getattr(self.llm_client, "_output_truncated_flag", None) is True
+            if _output_truncated:
                 self.llm_client._output_truncated_flag = False
-            if _output_truncated is True and assistant_response_text and not tool_calls:
+            if _output_truncated and assistant_response_text and not tool_calls:
                 logger.info(
                     f"[{self.agent_name}] Output truncated (finish_reason=length), "
                     f"injecting continuation prompt (turn {turn_count})"
                 )
-                message_history.append(
-                    {
-                        "role": "user",
-                        "_type": MT.TRUNCATION_RECOVERY,
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "[OUTPUT TRUNCATED] Your previous response was cut off due to length limits. "
-                                    "Please continue from where you left off. Do not repeat what you already said."
-                                ),
-                            }
-                        ],
-                    }
-                )
+                message_history.append(make_msg(
+                    "user",
+                    "[OUTPUT TRUNCATED] Your previous response was cut off due to length limits. "
+                    "Please continue from where you left off. Do not repeat what you already said.",
+                    MT.TRUNCATION_RECOVERY,
+                ))
                 self._record_event(
                     "llm_response",
                     {
@@ -1185,9 +1066,7 @@ class MainLoopRunner:
                     recent_tool_names=recent_tools,
                     chinese=self.chinese_context,
                 )
-                message_history.append(
-                    {"role": "user", "_type": MT.LOOP_HINT, "content": [{"type": "text", "text": hint_text}]}
-                )
+                message_history.append(make_msg("user", hint_text, MT.LOOP_HINT))
                 temp_boost = getattr(
                     self.monitor.config, "temperature_boost", DEFAULT_TEMPERATURE_BOOST
                 )
@@ -1234,30 +1113,18 @@ class MainLoopRunner:
                                 if sc.context_mode == "fork":
                                     # Fork: spawn 子 agent 执行
                                     fork_result = await self._run_fork_skill(sc)
-                                    message_history.append(
-                                        {
-                                            "role": "user",
-                                            "_type": MT.INLINE_SKILL,
-                                            "content": [
-                                                {
-                                                    "type": "text",
-                                                    "text": f"[Skill Result: {skill_name}]\n{fork_result}",
-                                                }
-                                            ],
-                                        }
-                                    )
+                                    message_history.append(make_msg(
+                                        "user",
+                                        f"[Skill Result: {skill_name}]\n{fork_result}",
+                                        MT.INLINE_SKILL,
+                                    ))
                                     logger.info(f"[InlineSkill] Fork skill '{skill_name}' completed")
                                 else:
                                     # Inline: 渲染 prompt，注入 meta message
                                     rendered = await sc.get_prompt()
-                                    message_history.append(
-                                        {
-                                            "role": "user",
-                                            "_type": MT.INLINE_SKILL,
-                                            "content": [{"type": "text", "text": rendered}],
-                                            "_meta": True,
-                                        }
-                                    )
+                                    message_history.append(make_msg(
+                                        "user", rendered, MT.INLINE_SKILL, _meta=True,
+                                    ))
                                     logger.info(
                                         f"[InlineSkill] Injected meta message for skill '{skill_name}'"
                                 )
@@ -1358,22 +1225,89 @@ class MainLoopRunner:
                 break
 
             # 检查是否有工具调用
-            if (
-                not tool_calls
-                or len(tool_calls) < 2
-                or (len(tool_calls[0]) == 0 and len(tool_calls[1]) == 0)
-            ):
-                # 反思轮允许无工具回复：LLM 可能只输出反思文字，下一轮再调工具
+            _has_tool_calls = (
+                tool_calls
+                and len(tool_calls) >= 2
+                and (len(tool_calls[0]) > 0 or len(tool_calls[1]) > 0)
+            )
+            if not _has_tool_calls:
+                # 反思轮豁免：LLM 可能只输出反思文字，下一轮再调工具
                 if _reflection_pending:
                     _reflection_pending = False
+                    _consecutive_no_tool_turns = 0
                     logger.info(
                         f"[{self.agent_name}] No tool calls after reflection, continuing (turn {turn_count})"
                     )
                     continue
-                logger.info(
-                    f"[{self.agent_name}] No tool calls, ending (turn {turn_count}, task_failed={task_failed})"
+
+                # 快速路径：从未调用过工具 → 直接回答，无需 grace turn
+                # 仅在 quick 模式启用：standard/deep 模式下首轮无工具调用可能是 LLM 遗忘，
+                # 应走 grace turn 恢复路径而非直接终止。
+                if is_quick_mode and total_tool_calls_executed == 0:
+                    logger.info(
+                        f"[{self.agent_name}] No tool calls and none executed previously, "
+                        f"treating as direct answer (turn {turn_count})"
+                    )
+                    break
+
+                _consecutive_no_tool_turns += 1
+
+                if _consecutive_no_tool_turns >= MAX_CONSECUTIVE_NO_TOOL_TURNS:
+                    # Grace turns 耗尽，终止
+                    logger.info(
+                        f"[{self.agent_name}] No tool calls for {_consecutive_no_tool_turns} consecutive turns, "
+                        f"ending (turn {turn_count}, task_failed={task_failed})"
+                    )
+                    break
+
+                # Grace turn：注入 nudge 提示，给 LLM 再一轮机会
+                # 替换上一条 nudge（避免多条堆积，只需检查末尾）
+                if message_history and message_history[-1].get("_type") == MT.NO_TOOL_NUDGE:
+                    message_history.pop()
+                nudge_text = (
+                    "[NO TOOL CALLS DETECTED] Your previous response contained no tool calls. "
+                    "If the task is complete, provide your final answer directly. "
+                    "If not, proceed with the next tool call now."
+                ) if not self.chinese_context else (
+                    "[未检测到工具调用] 你的上一轮回复没有调用任何工具。"
+                    "如果任务已完成，请直接给出最终回答。"
+                    "如果尚未完成，请立即执行下一步工具调用。"
                 )
-                break
+                message_history.append(make_msg("user", nudge_text, MT.NO_TOOL_NUDGE))
+                logger.info(
+                    f"[{self.agent_name}] No tool calls, grace turn {_consecutive_no_tool_turns}/{MAX_CONSECUTIVE_NO_TOOL_TURNS} "
+                    f"— nudge injected (turn {turn_count})"
+                )
+                # Token budget check: if context is already near threshold, run full
+                # manage_context (incl. summarize) so the grace turn's next LLM call
+                # doesn't overflow. Fall back to microcompact when budget is safe.
+                ratio = self.context_manager.get_context_ratio(
+                    system_prompt, message_history, self.llm_client.max_context_length
+                )
+                if ratio >= self.context_manager.config.compact_at_ratio:
+                    action = self.context_manager.manage_context(
+                        message_history,
+                        turn_count,
+                        system_prompt,
+                        self.llm_client.max_context_length,
+                    )
+                    if action == "need_summarize":
+                        await self.context_manager.apply_summarize(
+                            message_history,
+                            turn_count,
+                            system_prompt,
+                            self.llm_client.max_context_length,
+                            llm_call_fn=self._context_summarize_call,
+                        )
+                else:
+                    keep_recent = self.context_manager.config.compact_keep_recent
+                    self.context_manager.microcompact(
+                        message_history, turn_count, keep_recent=keep_recent
+                    )
+                continue
+            else:
+                # 有工具调用，重置计数器
+                _consecutive_no_tool_turns = 0
 
             # 跨轮次去重过滤
             calls_to_execute = tool_calls[0][:max_tool_calls]
@@ -1503,22 +1437,10 @@ class MainLoopRunner:
             if assistant_response_text:
                 for line in assistant_response_text.split("\n"):
                     line = line.strip()
-                    if len(line) > 30 and any(
-                        kw in line.lower()
-                        for kw in [
-                            "found",
-                            "result",
-                            "answer",
-                            "conclusion",
-                            "shows",
-                            "indicates",
-                            "发现",
-                            "结果",
-                            "结论",
-                            "表明",
-                        ]
+                    if len(line) > MIN_FINDING_LINE_LEN and any(
+                        kw in line.lower() for kw in SESSION_MEMORY_FINDING_KEYWORDS
                     ):
-                        self.session_memory.add_finding(line[:200])
+                        self.session_memory.add_finding(line[:MAX_FINDING_CHARS])
 
             # Record tool strategies
             for call in to_execute:
@@ -1603,15 +1525,9 @@ class MainLoopRunner:
                 recent_texts = [str(m.get("content", "")) for m in message_history[-3:]]
                 if not any("[CONTEXT NOTE]" in t for t in recent_texts):
                     cm_cfg = self.cfg.main_agent.get("context_manager", {})
-                    has_read_result = cm_cfg.get("result_offload_threshold", 5000) > 0
+                    has_read_result = cm_cfg.get("result_offload_threshold", DEFAULT_RESULT_OFFLOAD_THRESHOLD) > 0
                     notice = build_context_compression_notice(has_read_result=has_read_result)
-                    message_history.append(
-                        {
-                            "role": "user",
-                            "_type": MT.CONTEXT_COMPRESSION,
-                            "content": [{"type": "text", "text": notice}],
-                        }
-                    )
+                    message_history.append(make_msg("user", notice, MT.CONTEXT_COMPRESSION))
 
             # Sync last_assistant_text after all cleaning passes (evidence, offload,
             # response_language) so the simple-response path returns clean text.
@@ -1680,9 +1596,7 @@ class MainLoopRunner:
                     if modified_prompt is not None and isinstance(modified_prompt, str):
                         reflection_prompt = modified_prompt
 
-                message_history.append(
-                    {"role": "user", "_type": MT.REFLECTION, "content": [{"type": "text", "text": reflection_prompt}]}
-                )
+                message_history.append(make_msg("user", reflection_prompt, MT.REFLECTION))
                 _reflection_pending = True
                 self.task_log.log_step(
                     "reflection_checkpoint", f"Injected at turn {turn_count}", "info"
@@ -1754,18 +1668,11 @@ class MainLoopRunner:
         # 注入引用信息到消息历史
         citation_summary = self.context_manager.source_registry.get_citation_summary()
         if citation_summary:
-            message_history.append(
-                {
-                    "role": "user",
-                    "_type": MT.CITATION_SUMMARY,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"{TAG_COLLECTED_SOURCES}\n{citation_summary}\n\nPlease include these sources in your final summary where relevant.",
-                        }
-                    ],
-                }
-            )
+            message_history.append(make_msg(
+                "user",
+                f"{TAG_COLLECTED_SOURCES}\n{citation_summary}\n\nPlease include these sources in your final summary where relevant.",
+                MT.CITATION_SUMMARY,
+            ))
             self.task_log.log_step(
                 "citation_injection",
                 f"Injected {len(self.context_manager.source_registry.get_all_sources())} sources into message history",
@@ -1854,6 +1761,140 @@ class MainLoopRunner:
             self.task_log.record_perf("summary_duration", time.perf_counter() - _perf_summary_start)
 
         return final_answer_text, is_simple_response
+
+    # ------------------------------------------------------------------
+    # Run setup helpers (extracted from run())
+    # ------------------------------------------------------------------
+
+    def _restore_resume_state(
+        self, resume_from: dict, message_history: list
+    ) -> None:
+        """Restore state from a previous interrupted run (checkpoint resume)."""
+        prev_history = resume_from.get("message_history", [])
+        if prev_history:
+            message_history.clear()
+            message_history.extend(prev_history)
+        _resume_turn_offset = resume_from.get("last_turn", 0)
+
+        # Restore session memory snapshot
+        snapshot = resume_from.get("session_memory_snapshot", "")
+        if snapshot:
+            for line in snapshot.split("\n"):
+                line = line.strip().lstrip("- ")
+                if line:
+                    self.session_memory.add_finding(line)
+
+        # Restore todo tracker state
+        todo_state = resume_from.get("todo_state")
+        if todo_state and self.todo_tracker is not None:
+            from mem_deep_research_core.core.todo_tracker import TodoTracker
+
+            self.todo_tracker = TodoTracker.from_dict(
+                todo_state, enabled=self.todo_tracker.enabled
+            )
+            logger.info(
+                f"[Resume] Restored todo tracker: {len(self.todo_tracker._items)} items"
+            )
+
+        # Restore offloaded content (replace previews with full text)
+        restored = self.context_manager.restore_offloaded_content(message_history)
+        if restored > 0:
+            logger.info(f"[Resume] Restored {restored} offloaded results")
+
+        # Inject resume notice into conversation
+        message_history.append(make_msg(
+            "user",
+            f"[RESUME NOTICE] This task was previously interrupted at turn {_resume_turn_offset}. "
+            f"The conversation history above contains all prior work. "
+            f"Please continue from where you left off and complete the remaining work.",
+            MT.RESUME_NOTICE,
+        ))
+        logger.info(
+            f"[Resume] Restored state from turn {_resume_turn_offset}, "
+            f"message_history={len(message_history)} messages"
+        )
+
+    def _resolve_execution_mode(
+        self,
+        task_description: str,
+        tool_definitions: list,
+        task_engine_cfg: dict | None,
+        rs: "_RunState",
+    ) -> None:
+        """Resolve the effective execution mode from config + routing signals.
+
+        Mutates *rs* in-place: sets effective_mode, adaptive_pending,
+        adaptive_allow_deep.
+        """
+        rs.effective_mode = self.execution_mode
+        rs.adaptive_pending = False
+        rs.adaptive_allow_deep = True
+
+        if rs.effective_mode in (EXECUTION_MODE_AUTO, EXECUTION_MODE_SIMPLE_AUTO):
+            rs.adaptive_allow_deep = rs.effective_mode == EXECUTION_MODE_AUTO
+
+            from mem_deep_research_core.core.llm_router import LLMRouter
+
+            router = LLMRouter(hooks=self.hooks, llm_client=self.llm_client)
+
+            # 1. Hook: on_route_classify（用户完全自定义）
+            _deterministic_result = None
+            if self.hooks.has_hooks("on_route_classify"):
+                _tool_count = sum(
+                    len(s.get("tools", [])) for s in tool_definitions if isinstance(s, dict)
+                )
+                hook_ctx = HookContext(
+                    hook_name="on_route_classify",
+                    query=task_description,
+                    context=self.context or {},
+                    extra={
+                        "tool_count": _tool_count,
+                        "has_sub_agents": bool(getattr(self.cfg, "sub_agents", None)),
+                        "task_engine_enabled": bool(
+                            task_engine_cfg and task_engine_cfg.get("enabled")
+                        ),
+                    },
+                )
+                hook_result = self.hooks.call("on_route_classify", hook_ctx)
+                _deterministic_result = router._parse_hook_result(hook_result)
+
+            # 2. 结构信号路由（零成本）
+            if _deterministic_result is None:
+                _deterministic_result = router._structural_route(
+                    tool_count=sum(
+                        len(s.get("tools", [])) for s in tool_definitions if isinstance(s, dict)
+                    ),
+                    has_sub_agents=bool(getattr(self.cfg, "sub_agents", None)),
+                )
+
+            if _deterministic_result is not None:
+                if not rs.adaptive_allow_deep and _deterministic_result.mode == EXECUTION_MODE_DEEP:
+                    _deterministic_result.mode = EXECUTION_MODE_STANDARD
+                    _deterministic_result.reasoning_effort = "medium"
+                route_result = router._finalize(
+                    _deterministic_result, task_description, self.context
+                )
+                rs.effective_mode = route_result.mode
+                logger.info(
+                    f"[{self.agent_name}] Auto route (deterministic): {rs.effective_mode} "
+                    f"(source={route_result.source})"
+                )
+            else:
+                rs.effective_mode = EXECUTION_MODE_STANDARD
+                rs.adaptive_pending = True
+                logger.info(
+                    f"[{self.agent_name}] Auto route: adaptive pending, "
+                    f"starting as standard (will finalize after turn 1)"
+                )
+
+        logger.info(
+            f"[{self.agent_name}] Execution mode: {rs.effective_mode} (config={self.execution_mode})"
+        )
+        self.task_log.record_perf("config_mode", self.execution_mode, unit="")
+
+    # ------------------------------------------------------------------
+    # Tool execution
+    # ------------------------------------------------------------------
 
     async def _execute_tools(
         self,
@@ -1985,7 +2026,10 @@ class MainLoopRunner:
                     async with self._sub_agent_semaphore:
                         try:
                             result = await self.sub_agent_runner.run(
-                                call["server_name"], call["arguments"], keep_tool_result
+                                call["server_name"],
+                                call["arguments"],
+                                keep_tool_result,
+                                parent_context_manager=self.context_manager,
                             )
                             return call["id"], call["server_name"], call["tool_name"], result
                         except Exception as e:
@@ -1999,7 +2043,28 @@ class MainLoopRunner:
 
                 agent_results = await asyncio.gather(
                     *[_run_one_agent(c) for c in agent_calls],
+                    return_exceptions=True,
                 )
+
+                # Normalize any unexpected exceptions (e.g., CancelledError escaping
+                # the inner try) into error tuples so the rest of the pipeline
+                # (offload/transcript/semaphore release) runs to completion.
+                _normalized: list = []
+                for i, item in enumerate(agent_results):
+                    if isinstance(item, BaseException):
+                        call = agent_calls[i]
+                        logger.error(
+                            f"Sub-agent '{call['server_name']}' raised unhandled: {item!r}"
+                        )
+                        _normalized.append((
+                            call["id"],
+                            call["server_name"],
+                            call["tool_name"],
+                            f"[Sub-agent Error] {str(item)[:500]}",
+                        ))
+                    else:
+                        _normalized.append(item)
+                agent_results = _normalized
 
                 for item in agent_results:
                     call_id, server_name, tool_name, sub_result = item
@@ -2015,21 +2080,7 @@ class MainLoopRunner:
                     tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
                         tool_result
                     )
-                    # Backup large sub-agent results for read_result recovery
-                    sa_text = (
-                        tool_result_for_llm.get("text", "")
-                        if isinstance(tool_result_for_llm, dict)
-                        else ""
-                    )
-                    if isinstance(sa_text, str):
-                        sa_ref = self.context_manager.backup_large_result(
-                            sa_text,
-                            tool_name=tool_name,
-                            turn=self.context_manager._current_turn,
-                        )
-                        if sa_ref:
-                            tool_result_for_llm["_offload_ref"] = sa_ref
-                            tool_result_for_llm["_offload_chars"] = len(sa_text)
+                    self._maybe_offload_result(tool_result_for_llm, tool_name)
                     all_tool_results_with_id.append((call_id, tool_result_for_llm))
 
                 # Resume main agent stream
@@ -2081,13 +2132,7 @@ class MainLoopRunner:
             return
 
         # 注入 verify prompt 到 message_history
-        message_history.append(
-            {
-                "role": "user",
-                "_type": MT.REFLECTION,
-                "content": [{"type": "text", "text": verify_prompt}],
-            }
-        )
+        message_history.append(make_msg("user", verify_prompt, MT.REFLECTION))
 
         # 调用 LLM 做 verify
         try:
@@ -2095,7 +2140,7 @@ class MainLoopRunner:
                 system_prompt,
                 message_history,
                 [],  # verify 不需要工具
-                999,
+                SYNTHETIC_TURN_ID,
                 "Deep verify checkpoint",
                 agent_type=self.agent_name,
             )
@@ -2204,6 +2249,24 @@ class MainLoopRunner:
         segments = set(re.split(r"[_\-]+", tool_name.lower()))
         return bool(segments & CONCURRENT_SAFE_TOOL_SEGMENTS)
 
+    def _maybe_offload_result(self, tool_result_for_llm: dict, tool_name: str) -> None:
+        """Backup large tool results to file and attach offload metadata.
+
+        Shared by regular tool execution, sub-agent result handling, and spawn_agent.
+        """
+        result_text = (
+            tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
+        )
+        if isinstance(result_text, str):
+            ref = self.context_manager.backup_large_result(
+                result_text,
+                tool_name=tool_name,
+                turn=self.context_manager._current_turn,
+            )
+            if ref:
+                tool_result_for_llm["_offload_ref"] = ref
+                tool_result_for_llm["_offload_chars"] = len(result_text)
+
     async def _execute_one_regular_tool(self, call: dict) -> tuple[str, dict]:
         """执行单个普通工具并返回 (call_id, formatted_result)"""
         tool_result, _ = await self.tool_executor.execute_single_tool(
@@ -2214,22 +2277,7 @@ class MainLoopRunner:
             agent_name=self.agent_name,
         )
         tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
-
-        # Backup large results to file (不替换 history，由滑动窗口统一处理)
-        result_text = (
-            tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
-        )
-        if isinstance(result_text, str):
-            ref = self.context_manager.backup_large_result(
-                result_text,
-                tool_name=call["tool_name"],
-                turn=self.context_manager._current_turn,
-            )
-            if ref:
-                # 挂 metadata 到结果上，供后续 message_history 中的消息携带
-                tool_result_for_llm["_offload_ref"] = ref
-                tool_result_for_llm["_offload_chars"] = len(result_text)
-
+        self._maybe_offload_result(tool_result_for_llm, call["tool_name"])
         return call["id"], tool_result_for_llm
 
     async def _execute_regular_tools_concurrent(
@@ -2318,20 +2366,7 @@ class MainLoopRunner:
                     "result": spawn_result,
                 }
             )
-            result_text = (
-                tool_result_for_llm.get("text", "")
-                if isinstance(tool_result_for_llm, dict)
-                else ""
-            )
-            if isinstance(result_text, str):
-                ref = self.context_manager.backup_large_result(
-                    result_text,
-                    tool_name=BUILTIN_TOOL_SPAWN_AGENT,
-                    turn=self.context_manager._current_turn,
-                )
-                if ref:
-                    tool_result_for_llm["_offload_ref"] = ref
-                    tool_result_for_llm["_offload_chars"] = len(result_text)
+            self._maybe_offload_result(tool_result_for_llm, BUILTIN_TOOL_SPAWN_AGENT)
             return (call["id"], tool_result_for_llm)
 
         parallel = getattr(self.cfg.main_agent, "parallel_spawn", True)
@@ -2444,7 +2479,7 @@ class MainLoopRunner:
             summarize_system_prompt,
             summarize_messages,
             [],
-            999,
+            SYNTHETIC_TURN_ID,
             purpose,
             agent_type=self.agent_name,
         )

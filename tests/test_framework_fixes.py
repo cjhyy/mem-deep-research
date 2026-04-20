@@ -266,8 +266,9 @@ class TestConfigValidationFailFast:
         dr._validate_config()
 
     def test_missing_critical_field_raises(self):
-        """Missing provider_class should raise ValueError."""
+        """Missing provider_class should raise ConfigValidationError."""
         from mem_deep_research_core.deep_research import DeepResearch
+        from mem_deep_research_core.exceptions import ConfigValidationError
 
         dr = DeepResearch.__new__(DeepResearch)
         dr._cfg = OmegaConf.create({
@@ -279,7 +280,7 @@ class TestConfigValidationFailFast:
                 "prompt": {"agent_type": "main"},
             }
         })
-        with pytest.raises(ValueError, match="critical"):
+        with pytest.raises(ConfigValidationError, match="critical"):
             dr._validate_config()
 
 

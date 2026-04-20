@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.2.4 (2026-04-20)
+
+**Phase 1 稳定性修复** — 基于代码 Review 定位的运行时安全与配置契约修复。
+
+### Runtime Safety
+- **BUG-01 Grace Turn context budget check**: 注入 nudge 前按 token 比率检查，超阈值走完整 `manage_context`（含 summarize），否则降级为 microcompact
+- **BUG-08 Fast-path gating**: `total_tool_calls_executed==0` 早退只在 `quick` 模式生效；`standard`/`deep` 模式走 grace turn 恢复
+- **BUG-10 gather safety**: `agent_calls` gather 加 `return_exceptions=True` + 异常归一化，防 CancelledError 泄漏 MCP 会话和信号量
+- **BUG-11 AgentFactory.close() isolation**: 每个 tool_manager close 隔离 try/except，一个失败不阻塞其他清理
+- **BUG-12 concurrency locks**: TodoTracker / FileStateCache / Transcript 加 `threading.Lock`，迭代路径快照化
+
+### Sub-Agent Lifecycle
+- **BUG-04 inherit_with_override**: 子 Agent ContextManager 四层合并（defaults ← main_agent ← parent 快照 ← sub_agent 覆盖），stale YAML key 防御过滤
+- **BUG-17 named sub-agent offload orphan**: `SubAgentRunner.run()` 接受 `parent_context_manager`；finally 合并 offload registry，命名 sub-agent 的 offload 文件能被父 Agent 的 cleanup 清理
+
+### Config Contract
+- **BUG-07 fail-fast (scheme B)**: critical 字段（`llm.provider_class` / `llm.model_name`）缺失抛 `ConfigValidationError`；non-critical 字段 WARNING + 默认值；catch-all 已移除
+- **BUG-14 response_language 软校验**: `field_validator` 对未知语言 WARNING 但不阻塞，保留检测 fallback 和自定义语言空间
+- **BUG-16 constant extraction**: `llm_call_handler.py` 硬编码 `0.6` 替换为 `CONTEXT_REDUCTION_TARGET_RATIO`
+
+### Docs
+- `docs/20-roadmap.md`: Phase 1 状态快照 + BUG-01~17 核验记录 + BUG-06/09/15 设计决策留档
+- 543 tests 全过，零 regression
+
+## v1.2.3 (2026-04-17)
+
+**Runtime isolation & sub-agent lifecycle** — 见对应 commit。
+
+## v1.2.2 (2026-04-14)
+
+**Evidence extraction & sliding window offload** — 见对应 commit。
+
+## v1.2.1 (2026-04-10)
+
+**on_final_answer hook & generate_summary config** — 见对应 commit。
+
 ## v1.2.0 (2026-04-08)
 
 **Phase 1 内核收敛完成** — 运行时隔离、消息类型系统、稳定性修复、集成测试骨架。

@@ -508,3 +508,15 @@ class LLMProviderClientBase(ABC):
             "total_tokens": total_prompt + total_completion,
             "request_count": len(self._usage_records),
         }
+
+    def get_output_truncated(self) -> bool:
+        """Check if the last LLM response was truncated due to output length limits.
+
+        Providers that detect truncation should override this method.
+        Default returns False (no truncation detected).
+        """
+        return getattr(self, "_output_truncated_flag", False) or False
+
+    def clear_output_truncated(self) -> None:
+        """Reset the output truncated flag after handling recovery."""
+        self._output_truncated_flag = False

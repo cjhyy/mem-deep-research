@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 
 from mem_deep_research_core.core.answer_handler import post_process_final_answer
 from mem_deep_research_core.core.constants import (
+    DEFAULT_RESULT_OFFLOAD_THRESHOLD,
     DEFAULT_SCRAPE_MAX_LENGTH,
     ensure_dict,
     parse_bool_config,
@@ -808,7 +809,7 @@ class Orchestrator:
 
         # read_result: offload 启用时注入，让 LLM 可以回捞被压缩/卸载的工具结果
         cm_cfg = self.cfg.main_agent.get("context_manager", {})
-        if cm_cfg.get("result_offload_threshold", 5000) > 0:
+        if cm_cfg.get("result_offload_threshold", DEFAULT_RESULT_OFFLOAD_THRESHOLD) > 0:
             tool_definitions.append(_get_read_result_tool_definition())
 
         if not tool_definitions:

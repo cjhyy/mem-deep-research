@@ -38,6 +38,12 @@ SUMMARY_GENERATION_TIMEOUT = 120
 # Max retry attempts for context limit recovery
 MAX_CONTEXT_LIMIT_RETRIES = 2
 
+# Max consecutive no-tool-call turns before forced termination.
+# The loop terminates after N consecutive responses without tool calls.
+# Before termination, the first N-1 turns inject a nudge prompt to give the LLM
+# another chance. Example: N=2 means 1 nudge + 1 break.
+MAX_CONSECUTIVE_NO_TOOL_TURNS = 2
+
 # Max context reduction retries in SummaryHandler
 MAX_SUMMARY_CONTEXT_RETRIES = 5
 
@@ -74,6 +80,21 @@ DEFAULT_MAX_CONCURRENT_SUBAGENTS = 3
 
 # Default threshold for offloading large tool results to filesystem
 DEFAULT_RESULT_OFFLOAD_THRESHOLD = 5000
+
+# Session memory: minimum line length to qualify as a "finding"
+MIN_FINDING_LINE_LEN = 30
+
+# Session memory: max chars stored per finding
+MAX_FINDING_CHARS = 200
+
+# Keywords (multilingual) for heuristic finding detection in LLM responses
+SESSION_MEMORY_FINDING_KEYWORDS = (
+    "found", "result", "answer", "conclusion", "shows", "indicates",
+    "发现", "结果", "结论", "表明",
+)
+
+# Synthetic turn ID used for non-turn LLM calls (verify checkpoint, context summarize)
+SYNTHETIC_TURN_ID = 999
 
 # Built-in tool names
 BUILTIN_TOOL_UPDATE_TODO = "update_todo"
@@ -245,6 +266,7 @@ class MT:
 
     # === 系统提示（不受压缩保护，可被清理） ===
     LOOP_HINT = "loop_hint"
+    NO_TOOL_NUDGE = "no_tool_nudge"
     TRUNCATION_RECOVERY = "truncation_recovery"
     INLINE_SKILL = "inline_skill"
 
@@ -383,4 +405,8 @@ def ensure_dict(value) -> dict:
         return {}
     if isinstance(value, dict):
         return value
-    return dict(value) if hasattr(value, "__iter__") else {}
+    # Use "items" check to avoid false positives on list-like iterables
+    # (e.g., OmegaConf ListConfig is iterable but not dict-convertible)
+    if hasattr(value, "items"):
+        return dict(value)
+    return {}

@@ -354,6 +354,51 @@ def on_reflection_build(priority: int = 0):
     return hooks.register("on_reflection_build", priority)
 
 
+def on_system_prompt_build(priority: int = 0):
+    """System prompt 生成后钩子 — 可修改 system prompt"""
+    return hooks.register("on_system_prompt_build", priority)
+
+
+def on_summarize_prompt_build(priority: int = 0):
+    """Summarize prompt 生成后钩子 — 可修改 summarize prompt"""
+    return hooks.register("on_summarize_prompt_build", priority)
+
+
+def on_message_intercept(priority: int = 0):
+    """消息拦截钩子"""
+    return hooks.register("on_message_intercept", priority)
+
+
+def on_route_classify(priority: int = 0):
+    """任务复杂度分类钩子 — 可覆盖路由决策"""
+    return hooks.register("on_route_classify", priority)
+
+
+def on_route_apply(priority: int = 0):
+    """路由结果应用钩子 — 可修改 mode 和 reasoning_effort"""
+    return hooks.register("on_route_apply", priority)
+
+
+def on_result_offload(priority: int = 0):
+    """大结果卸载钩子 — 可覆盖存储后端"""
+    return hooks.register("on_result_offload", priority)
+
+
+def on_result_restore(priority: int = 0):
+    """卸载结果恢复钩子 — 可覆盖读取后端"""
+    return hooks.register("on_result_restore", priority)
+
+
+def on_offload_evidence_prep(priority: int = 0):
+    """Offload evidence sidecar prompt 构建钩子"""
+    return hooks.register("on_offload_evidence_prep", priority)
+
+
+def on_query_compile(priority: int = 0):
+    """用户 query 编译后钩子 — 可修改 query 或追加 attachments"""
+    return hooks.register("on_query_compile", priority)
+
+
 # ============================================================
 # 项目钩子加载
 # ============================================================

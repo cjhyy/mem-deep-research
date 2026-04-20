@@ -176,10 +176,11 @@ class TestMainLoopRunnerIntegration:
 
     @pytest.mark.asyncio
     async def test_simple_response_no_tools(self):
-        """LLM responds without tool calls — should return immediately."""
+        """LLM responds without tool calls and no tools were ever executed —
+        fast-path: treat as direct answer and return immediately (1 LLM call)."""
         runner, call_log = self._build_runner(
             [
-                ("The answer is 42.", False, None),  # No tool calls
+                ("The answer is 42.", False, None),  # No tool calls → direct answer
             ]
         )
 
@@ -198,7 +199,7 @@ class TestMainLoopRunnerIntegration:
 
         assert "42" in result
         assert is_simple  # truthy for simple responses (no tool calls)
-        assert len(call_log) == 1
+        assert len(call_log) == 1  # fast-path: single LLM call
 
     @pytest.mark.asyncio
     async def test_max_turns_reached(self):

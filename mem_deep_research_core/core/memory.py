@@ -22,12 +22,13 @@ logger = logging.getLogger("mem_deep_research")
 
 @dataclass
 class SourceRecord:
-    """引用来源记录"""
+    """引用来源记录（统一定义，供 memory + context_manager 共用）"""
 
     url: str = ""
     title: str = ""
     snippet: str = ""
     tool_name: str = ""
+    turn: int = 0
 
 
 @dataclass

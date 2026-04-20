@@ -25,6 +25,7 @@ Usage:
 
 import json
 import logging
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -110,6 +111,7 @@ class Transcript:
         self.agent_name = agent_name
         self._events: list[TranscriptEvent] = []
         self._start_time: float = time.time()
+        self._lock = threading.Lock()
 
     def record(
         self,
@@ -143,7 +145,8 @@ class Transcript:
             ref_event_id=ref_event_id,
             duration_ms=duration_ms,
         )
-        self._events.append(event)
+        with self._lock:
+            self._events.append(event)
         return event.event_id
 
     def filter(
@@ -153,7 +156,8 @@ class Transcript:
         agent_name: str | None = None,
     ) -> list[TranscriptEvent]:
         """按条件过滤事件"""
-        results = self._events
+        with self._lock:
+            results = list(self._events)
         if event_type is not None:
             results = [e for e in results if e.event_type == event_type.value]
         if turn is not None:
@@ -164,9 +168,10 @@ class Transcript:
 
     def get_by_id(self, event_id: str) -> TranscriptEvent | None:
         """按 ID 获取事件"""
-        for e in self._events:
-            if e.event_id == event_id:
-                return e
+        with self._lock:
+            for e in self._events:
+                if e.event_id == event_id:
+                    return e
         return None
 
     def get_tool_pairs(
@@ -174,10 +179,12 @@ class Transcript:
     ) -> list[tuple[TranscriptEvent, TranscriptEvent | None]]:
         """获取 tool_use → tool_result 配对"""
         uses = self.filter(EventType.TOOL_USE, turn=turn)
+        with self._lock:
+            events_snapshot = list(self._events)
         pairs = []
         for use in uses:
             result = None
-            for e in self._events:
+            for e in events_snapshot:
                 if e.event_type == EventType.TOOL_RESULT.value and e.ref_event_id == use.event_id:
                     result = e
                     break
@@ -186,18 +193,23 @@ class Transcript:
 
     @property
     def event_count(self) -> int:
-        return len(self._events)
+        with self._lock:
+            return len(self._events)
 
     @property
     def events(self) -> list[TranscriptEvent]:
-        return list(self._events)
+        with self._lock:
+            return list(self._events)
 
     def summary(self) -> dict:
         """生成 transcript 摘要统计"""
         type_counts: dict[str, int] = {}
         total_tool_ms = 0
         total_llm_ms = 0
-        for e in self._events:
+        with self._lock:
+            events_snapshot = list(self._events)
+            start_time = self._start_time
+        for e in events_snapshot:
             type_counts[e.event_type] = type_counts.get(e.event_type, 0) + 1
             if e.duration_ms:
                 if e.event_type == EventType.TOOL_RESULT.value:
@@ -206,21 +218,23 @@ class Transcript:
                     total_llm_ms += e.duration_ms
 
         return {
-            "total_events": len(self._events),
+            "total_events": len(events_snapshot),
             "event_types": type_counts,
             "total_tool_duration_ms": total_tool_ms,
             "total_llm_duration_ms": total_llm_ms,
-            "wall_time_seconds": round(time.time() - self._start_time, 2),
+            "wall_time_seconds": round(time.time() - start_time, 2),
         }
 
     def save(self, path: str | Path) -> None:
         """保存为 JSONL 文件"""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            events_snapshot = list(self._events)
         with open(path, "w", encoding="utf-8") as f:
-            for event in self._events:
+            for event in events_snapshot:
                 f.write(json.dumps(event.to_dict(), ensure_ascii=False, default=str) + "\n")
-        logger.info(f"[Transcript] Saved {len(self._events)} events to {path}")
+        logger.info(f"[Transcript] Saved {len(events_snapshot)} events to {path}")
 
     @classmethod
     def load(cls, path: str | Path) -> "Transcript":
@@ -243,5 +257,6 @@ class Transcript:
 
     def reset(self):
         """重置"""
-        self._events.clear()
-        self._start_time = time.time()
+        with self._lock:
+            self._events.clear()
+            self._start_time = time.time()

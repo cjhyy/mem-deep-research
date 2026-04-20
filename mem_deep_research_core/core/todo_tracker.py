@@ -20,6 +20,7 @@ Context 截断时 todo 状态不会丢失，每轮自动重新注入。
 """
 
 import logging
+import threading
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -64,6 +65,7 @@ class TodoTracker:
         self._items: list[TodoItem] = []
         self._next_id: int = 1
         self._last_injected_turn: int = -1
+        self._lock = threading.Lock()
 
     # ---- Tool interface (LLM calls these via update_todo tool) ----
 
@@ -96,9 +98,10 @@ class TodoTracker:
     def _add(self, task: str, priority: str = "medium") -> str:
         if not task:
             return "Error: task description is required"
-        item = TodoItem(id=self._next_id, task=task, priority=priority)
-        self._items.append(item)
-        self._next_id += 1
+        with self._lock:
+            item = TodoItem(id=self._next_id, task=task, priority=priority)
+            self._items.append(item)
+            self._next_id += 1
         logger.info(f"[Todo] Added #{item.id}: {task}")
         return f"Added task #{item.id}: {task}"
 
@@ -109,11 +112,12 @@ class TodoTracker:
             task_id = int(task_id)
         except (ValueError, TypeError):
             return f"Error: invalid task_id '{task_id}', must be a number"
-        for item in self._items:
-            if item.id == task_id:
-                item.status = status
-                logger.info(f"[Todo] #{task_id} → {status}")
-                return f"Task #{task_id} is now {status}"
+        with self._lock:
+            for item in self._items:
+                if item.id == task_id:
+                    item.status = status
+                    logger.info(f"[Todo] #{task_id} → {status}")
+                    return f"Task #{task_id} is now {status}"
         return f"Error: task #{task_id} not found"
 
     def _complete(self, task_id: int | None, result: str = "") -> str:
@@ -123,35 +127,40 @@ class TodoTracker:
             task_id = int(task_id)
         except (ValueError, TypeError):
             return f"Error: invalid task_id '{task_id}', must be a number"
-        for item in self._items:
-            if item.id == task_id:
-                item.status = TodoStatus.COMPLETED
-                item.result = result
-                logger.info(f"[Todo] #{task_id} completed: {result[:80]}")
-                return f"Task #{task_id} completed" + (f": {result[:100]}" if result else "")
+        with self._lock:
+            for item in self._items:
+                if item.id == task_id:
+                    item.status = TodoStatus.COMPLETED
+                    item.result = result
+                    logger.info(f"[Todo] #{task_id} completed: {result[:80]}")
+                    return f"Task #{task_id} completed" + (f": {result[:100]}" if result else "")
         return f"Error: task #{task_id} not found"
 
     def _list(self) -> str:
-        if not self._items:
-            return "No tasks."
-        return "\n".join(item.to_display() for item in self._items)
+        with self._lock:
+            if not self._items:
+                return "No tasks."
+            return "\n".join(item.to_display() for item in self._items)
 
     # ---- State queries ----
 
     @property
     def has_pending_work(self) -> bool:
-        return any(item.status != TodoStatus.COMPLETED for item in self._items)
+        with self._lock:
+            return any(item.status != TodoStatus.COMPLETED for item in self._items)
 
     @property
     def progress(self) -> float:
-        if not self._items:
-            return 1.0
-        completed = sum(1 for item in self._items if item.status == TodoStatus.COMPLETED)
-        return completed / len(self._items)
+        with self._lock:
+            if not self._items:
+                return 1.0
+            completed = sum(1 for item in self._items if item.status == TodoStatus.COMPLETED)
+            return completed / len(self._items)
 
     @property
     def is_empty(self) -> bool:
-        return len(self._items) == 0
+        with self._lock:
+            return len(self._items) == 0
 
     # ---- Injection into message_history ----
 
@@ -160,20 +169,26 @@ class TodoTracker:
 
         如果没有任务或状态未变化，返回 None。
         """
-        if not self.enabled or not self._items:
+        if not self.enabled:
             return None
 
+        # Snapshot under lock to avoid concurrent-mutation during iteration.
+        with self._lock:
+            if not self._items:
+                return None
+            snapshot = list(self._items)
+            self._last_injected_turn = turn
+
+        completed = sum(1 for i in snapshot if i.status == TodoStatus.COMPLETED)
         lines = ["[TASK PROGRESS]", ""]
-        lines.append(
-            f"Progress: {self.progress:.0%} ({sum(1 for i in self._items if i.status == TodoStatus.COMPLETED)}/{len(self._items)} completed)"
-        )
+        lines.append(f"Progress: {completed / len(snapshot):.0%} ({completed}/{len(snapshot)} completed)")
         lines.append("")
-        for item in self._items:
+        for item in snapshot:
             lines.append(item.to_display())
         lines.append("")
 
-        pending = [i for i in self._items if i.status == TodoStatus.PENDING]
-        in_progress = [i for i in self._items if i.status == TodoStatus.IN_PROGRESS]
+        pending = [i for i in snapshot if i.status == TodoStatus.PENDING]
+        in_progress = [i for i in snapshot if i.status == TodoStatus.IN_PROGRESS]
 
         if in_progress:
             lines.append(f"Currently working on: #{in_progress[0].id} {in_progress[0].task}")
@@ -184,8 +199,6 @@ class TodoTracker:
         lines.append(
             "Use the update_todo tool to update task status when you start or complete a task."
         )
-
-        self._last_injected_turn = turn
 
         from mem_deep_research_core.core.constants import MT
 
@@ -245,19 +258,20 @@ class TodoTracker:
     # ---- Serialization ----
 
     def to_dict(self) -> dict:
-        return {
-            "items": [
-                {
-                    "id": i.id,
-                    "task": i.task,
-                    "status": i.status,
-                    "priority": i.priority,
-                    "result": i.result,
-                }
-                for i in self._items
-            ],
-            "next_id": self._next_id,
-        }
+        with self._lock:
+            return {
+                "items": [
+                    {
+                        "id": i.id,
+                        "task": i.task,
+                        "status": i.status,
+                        "priority": i.priority,
+                        "result": i.result,
+                    }
+                    for i in self._items
+                ],
+                "next_id": self._next_id,
+            }
 
     @classmethod
     def from_dict(cls, data: dict, enabled: bool = True) -> "TodoTracker":
@@ -278,6 +292,7 @@ class TodoTracker:
         return tracker
 
     def reset(self):
-        self._items.clear()
-        self._next_id = 1
-        self._last_injected_turn = -1
+        with self._lock:
+            self._items.clear()
+            self._next_id = 1
+            self._last_injected_turn = -1

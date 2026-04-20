@@ -23,7 +23,7 @@ logger = logging.getLogger("mem_deep_research")
 
 
 @dataclass
-class AgentConfig:
+class AgentSetupConfig:
     """Agent 配置数据类"""
 
     config_path: pathlib.Path
@@ -47,7 +47,7 @@ class AgentConfig:
 
 
 @dataclass
-class TaskResult:
+class AgentTaskResult:
     """任务执行结果"""
 
     task_id: str
@@ -83,7 +83,7 @@ class AgentFactory:
 
     def __init__(
         self,
-        agent_config: AgentConfig,
+        agent_config: AgentSetupConfig,
         auto_load_env: bool = True,
         runtime: AgentRuntime | None = None,
     ):
@@ -138,7 +138,7 @@ class AgentFactory:
         # 加载配置
         cfg = load_yaml_config(config_path)
 
-        agent_config = AgentConfig(
+        agent_config = AgentSetupConfig(
             config_path=config_path,
             logs_dir=logs_dir,
             prompts_dir=pathlib.Path(prompts_dir) if prompts_dir else None,
@@ -200,7 +200,7 @@ class AgentFactory:
         """
         logs_dir = pathlib.Path(logs_dir)
 
-        agent_config = AgentConfig(
+        agent_config = AgentSetupConfig(
             config_path=pathlib.Path("dynamic_config"),  # 标记为动态配置
             logs_dir=logs_dir,
             prompts_dir=pathlib.Path(prompts_dir) if prompts_dir else None,
@@ -255,7 +255,7 @@ class AgentFactory:
         history: list[dict[str, Any]] | None = None,
         on_progress: Callable[[str, Any], None] | None = None,
         resume_from: dict | None = None,
-    ) -> TaskResult:
+    ) -> AgentTaskResult:
         """
         执行任务
 
@@ -269,7 +269,7 @@ class AgentFactory:
             on_progress: 进度回调函数（可选）
 
         Returns:
-            TaskResult: 任务执行结果
+            AgentTaskResult: 任务执行结果
         """
         from mem_deep_research_core.core.pipeline import execute_task_pipeline
 
@@ -308,7 +308,7 @@ class AgentFactory:
 
             duration = (datetime.now() - start_time).total_seconds()
 
-            result = TaskResult(
+            result = AgentTaskResult(
                 task_id=task_id,
                 final_answer=final_answer,
                 boxed_answer=boxed_answer,
@@ -338,7 +338,7 @@ class AgentFactory:
             else:
                 error_type = "llm_error"
 
-            result = TaskResult(
+            result = AgentTaskResult(
                 task_id=task_id,
                 final_answer=f"Error: {error_str}",
                 boxed_answer="",
@@ -355,22 +355,40 @@ class AgentFactory:
             return result
 
     async def close(self) -> None:
-        """Clean up all resources — call on shutdown."""
+        """Clean up all resources — call on shutdown.
+
+        Each tool manager close is isolated: a failure on one must not leave
+        other managers' subprocesses/pipes dangling.
+        """
+        errors: list[tuple[str, BaseException]] = []
         if self._main_agent_tool_manager:
-            await self._main_agent_tool_manager.close_sessions()
+            try:
+                await self._main_agent_tool_manager.close_sessions()
+            except Exception as e:
+                errors.append(("main", e))
+                logger.error(f"Failed to close main tool_manager: {e!r}")
         if self._sub_agent_tool_managers:
-            for tm in self._sub_agent_tool_managers.values():
-                await tm.close_sessions()
+            for name, tm in self._sub_agent_tool_managers.items():
+                try:
+                    await tm.close_sessions()
+                except Exception as e:
+                    errors.append((name, e))
+                    logger.error(f"Failed to close sub-agent tool_manager '{name}': {e!r}")
         self._initialized = False
-        logger.info("AgentFactory resources closed")
+        if errors:
+            logger.warning(
+                f"AgentFactory.close() completed with {len(errors)} failures"
+            )
+        else:
+            logger.info("AgentFactory resources closed")
 
     async def run_batch(
         self,
         tasks: list[str],
         parallel: bool = False,
         max_concurrent: int = 3,
-        on_task_complete: Callable[[int, TaskResult], None] | None = None,
-    ) -> list[TaskResult]:
+        on_task_complete: Callable[[int, AgentTaskResult], None] | None = None,
+    ) -> list[AgentTaskResult]:
         """
         批量执行任务
 
@@ -411,7 +429,7 @@ class AgentFactory:
 # 便捷函数
 async def run_agent(
     task: str, config_path: str | pathlib.Path, logs_dir: str | pathlib.Path = "logs", **kwargs
-) -> TaskResult:
+) -> AgentTaskResult:
     """
     便捷函数：一行代码运行 Agent
 
@@ -422,7 +440,7 @@ async def run_agent(
         **kwargs: 传递给 AgentFactory.run() 的其他参数
 
     Returns:
-        TaskResult: 任务执行结果
+        AgentTaskResult: 任务执行结果
 
     Example:
         result = await run_agent(
@@ -440,7 +458,7 @@ async def run_agent(
 
 async def run_agent_from_project(
     task: str, project_dir: str | pathlib.Path, config_name: str = "agent", **kwargs
-) -> TaskResult:
+) -> AgentTaskResult:
     """
     便捷函数：从项目目录运行 Agent
 
@@ -451,7 +469,7 @@ async def run_agent_from_project(
         **kwargs: 传递给 AgentFactory.run() 的其他参数
 
     Returns:
-        TaskResult: 任务执行结果
+        AgentTaskResult: 任务执行结果
     """
     factory = AgentFactory.from_project_dir(project_dir, config_name)
     try:

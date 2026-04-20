@@ -106,35 +106,66 @@ class SubAgentRunner:
         llm_client,
         *,
         parent_context_manager: ContextManager | None = None,
+        sub_agent_name: str | None = None,
     ) -> ContextManager:
-        """Create a ContextManager that inherits the main agent's configuration.
+        """Create a sub-agent ContextManager using inherit_with_override.
 
-        Reads ``main_agent.context_manager`` from the full config so that
-        sub-agents use the same compact/dedup/offload settings as the main agent.
+        Resolution order (later entries override earlier ones):
+          1. ``ContextManagerConfig()`` built-in defaults
+          2. ``main_agent.context_manager`` from config
+          3. Parent ContextManager runtime snapshot (spawn path only; captures
+             dynamic adjustments made at runtime that aren't in the YAML)
+          4. ``sub_agents.<name>.context_manager`` from config
+             (configured sub-agent path only; explicit overrides win)
 
-        When *parent_context_manager* is provided, the offload directory is
-        inherited directly from the parent's resolved ``_offload_dir`` instead
-        of being re-derived from config.  This prevents path mismatches when
-        the parent uses a custom offload dir that differs from the config default.
+        The parent's resolved ``_offload_dir`` is always used when available,
+        to keep offload files in a single shared directory.
         """
         import os
+        import dataclasses
 
-        cm_cfg_dict = {}
+        merged: dict[str, Any] = {}
+
+        # Layer 2: main agent config
         if self.cfg:
             main_agent = self.cfg.get("main_agent", {})
-            cm_cfg_dict = ensure_dict(main_agent.get("context_manager", {}) if main_agent else {})
-        cm_config = ContextManagerConfig(**cm_cfg_dict) if cm_cfg_dict else ContextManagerConfig()
+            main_cm = ensure_dict(
+                main_agent.get("context_manager", {}) if main_agent else {}
+            )
+            merged.update(main_cm)
+
+        # Layer 3: parent runtime snapshot (for spawn path only)
+        if parent_context_manager is not None:
+            parent_snapshot = dataclasses.asdict(parent_context_manager.config)
+            merged.update(parent_snapshot)
+
+        # Layer 4: explicit sub-agent override (for configured sub-agents)
+        if sub_agent_name and self.cfg and self.cfg.get("sub_agents"):
+            sub_cfg = self.cfg.sub_agents.get(sub_agent_name)
+            if sub_cfg:
+                sub_cm = ensure_dict(sub_cfg.get("context_manager", {}) or {})
+                if sub_cm:
+                    logger.info(
+                        f"[SubAgent:{sub_agent_name}] context_manager overrides: "
+                        f"{sorted(sub_cm.keys())}"
+                    )
+                    merged.update(sub_cm)
+
+        # Filter to fields accepted by ContextManagerConfig (defensive against
+        # stale keys in YAML that the dataclass no longer declares).
+        valid_fields = {f.name for f in dataclasses.fields(ContextManagerConfig)}
+        filtered = {k: v for k, v in merged.items() if k in valid_fields}
+        cm_config = ContextManagerConfig(**filtered) if filtered else ContextManagerConfig()
         cm = ContextManager(config=cm_config, hooks=self._hooks)
 
         if hasattr(llm_client, "_estimate_tokens"):
             cm.set_token_estimator(llm_client._estimate_tokens)
 
-        # Inherit offload dir from parent if available (already resolved),
-        # otherwise fall back to config → output_dir default.
+        # Offload dir: prefer parent's resolved dir, else config, else default.
         if parent_context_manager is not None and parent_context_manager._offload_dir:
             offload_dir = parent_context_manager._offload_dir
         else:
-            offload_dir = cm_cfg_dict.get("result_offload_dir", "")
+            offload_dir = merged.get("result_offload_dir", "")
             if not offload_dir and self.cfg:
                 output_dir = self.cfg.get("output_dir", "logs/")
                 offload_dir = os.path.join(output_dir, "offloaded_results")
@@ -238,6 +269,8 @@ class SubAgentRunner:
         sub_agent_name: str,
         task_description: str | dict,
         keep_tool_result: int = -1,
+        *,
+        parent_context_manager: ContextManager | None = None,
     ) -> str:
         """Run a sub-agent by delegating to MainLoopRunner.
 
@@ -245,6 +278,10 @@ class SubAgentRunner:
             sub_agent_name: Sub-agent name (e.g. ``"agent-search"``).
             task_description: Task description string or arguments dict from LLM.
             keep_tool_result: Number of recent tool results to keep (-1 = all).
+            parent_context_manager: Parent ContextManager — its offload_dir is
+                shared with the sub-agent's isolated ContextManager, and any
+                offload records the sub-agent produces are merged back on exit
+                so cleanup_offload_files() can reach them (prevents orphan files).
 
         Returns:
             Final answer text from the sub-agent.
@@ -258,6 +295,7 @@ class SubAgentRunner:
 
         final_answer_text = ""
         system_prompt = ""
+        context_manager: ContextManager | None = None
         message_history = [
             {"role": "user", "content": [{"type": "text", "text": task_description}]}
         ]
@@ -277,7 +315,11 @@ class SubAgentRunner:
 
             # --- Create isolated components for this sub-agent ---
 
-            context_manager = self._create_context_manager(self.sub_agent_llm_client)
+            context_manager = self._create_context_manager(
+                self.sub_agent_llm_client,
+                parent_context_manager=parent_context_manager,
+                sub_agent_name=sub_agent_name,
+            )
 
             monitor = ExecutionMonitor(
                 config=MonitoringConfig(),
@@ -383,6 +425,17 @@ class SubAgentRunner:
             )
             final_answer_text = f"[Sub-agent Error] {sub_agent_name} failed: {str(e)[:500]}"
         finally:
+            # Merge sub-agent's offload registry into parent so parent's
+            # cleanup_offload_files() reaches the shared offload dir.
+            # Without this, offload records die with the sub-agent's isolated
+            # ContextManager and the files become orphans on disk.
+            if parent_context_manager is not None and context_manager is not None:
+                try:
+                    parent_context_manager.merge_offload_registry(context_manager)
+                except Exception as merge_err:
+                    logger.warning(
+                        f"[SubAgent:{sub_agent_name}] offload registry merge failed: {merge_err}"
+                    )
             if message_history:
                 self.task_log.sub_agent_message_history_sessions[
                     self.task_log.current_sub_agent_session_id

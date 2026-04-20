@@ -295,42 +295,50 @@ class DeepResearch:
             return "openrouter"  # default fallback
 
     # Fields whose absence means the framework cannot function at all.
+    # Missing/invalid values here raise ConfigurationError and block initialization.
     _CRITICAL_CONFIG_FIELDS = {"provider_class", "model_name"}
 
     def _validate_config(self) -> None:
-        """验证配置是否符合 schema，核心字段缺失时阻断初始化"""
+        """Validate config against the Pydantic schema with fail-fast semantics.
+
+        - Critical fields (``provider_class``, ``model_name``): missing/invalid →
+          raise :class:`ConfigValidationError`, block initialization.
+        - Non-critical fields: log a warning, continue with Pydantic defaults.
+        - Import-time schema failures: re-raise (cannot run without the schema).
+        """
+        from pydantic import ValidationError as PydanticValidationError
+
+        from mem_deep_research_core.config_schema import validate_agent_config
+        from mem_deep_research_core.exceptions import ConfigValidationError
+
+        config_dict = OmegaConf.to_container(self._cfg, resolve=False)
         try:
-            from pydantic import ValidationError as PydanticValidationError
-
-            from mem_deep_research_core.config_schema import validate_agent_config
-
-            config_dict = OmegaConf.to_container(self._cfg, resolve=False)
             validate_agent_config(config_dict)
+            return
         except PydanticValidationError as e:
-            # Check if any critical field is among the errors
-            critical_errors = []
-            non_critical_errors = []
+            critical_errors: list[str] = []
+            non_critical_errors: list[str] = []
             for err in e.errors():
-                field_path = ".".join(str(p) for p in err.get("loc", []))
-                field_name = err["loc"][-1] if err.get("loc") else ""
+                loc = err.get("loc", ())
+                field_path = ".".join(str(p) for p in loc)
+                field_name = loc[-1] if loc else ""
+                line = f"  {field_path}: {err['msg']}"
                 if field_name in self._CRITICAL_CONFIG_FIELDS:
-                    critical_errors.append(f"  {field_path}: {err['msg']}")
+                    critical_errors.append(line)
                 else:
-                    non_critical_errors.append(f"  {field_path}: {err['msg']}")
+                    non_critical_errors.append(line)
+
             if non_critical_errors:
                 logger.warning(
-                    f"Config validation warnings ({len(non_critical_errors)}):\n"
+                    f"Config validation warnings ({len(non_critical_errors)}) — "
+                    f"non-critical fields fell back to defaults:\n"
                     + "\n".join(non_critical_errors)
                 )
             if critical_errors:
-                raise ValueError(
+                raise ConfigValidationError(
                     "Config validation failed on critical fields:\n"
                     + "\n".join(critical_errors)
                 ) from e
-        except ImportError as e:
-            logger.warning(f"Config validation skipped (schema not available): {e}")
-        except Exception as e:
-            logger.warning(f"Config validation warning: {e}")
 
     def _build_config(
         self,

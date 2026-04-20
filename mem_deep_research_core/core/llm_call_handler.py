@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import Any
 
 from mem_deep_research_core.core.constants import (
+    CONTEXT_REDUCTION_TARGET_RATIO,
     EMERGENCY_SUMMARY_MIN_CHARS,
     FALLBACK_EMERGENCY_SUMMARY,
     FALLBACK_SUMMARY_ERROR,
@@ -475,7 +476,9 @@ class SummaryHandler:
                         str(m.get("content", "")) for m in message_history
                     )
                     current_tokens = current_llm_client._estimate_tokens(total_text)
-                    target_tokens = int(current_llm_client.max_context_length * 0.6)
+                    target_tokens = int(
+                        current_llm_client.max_context_length * CONTEXT_REDUCTION_TARGET_RATIO
+                    )
                     if current_tokens > target_tokens:
                         # Calculate how many middle messages to remove to hit target
                         middle_msgs = message_history[1:-keep_tail]

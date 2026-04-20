@@ -15,12 +15,16 @@ Core 模块 - Pipeline 和 Orchestrator
 """
 
 from mem_deep_research_core.core.agent_factory import (
-    AgentConfig,
     AgentFactory,
-    TaskResult,
+    AgentSetupConfig,
+    AgentTaskResult,
     run_agent,
     run_agent_from_project,
 )
+
+# Backward compatibility aliases
+AgentConfig = AgentSetupConfig
+TaskResult = AgentTaskResult
 from mem_deep_research_core.core.constants import generate_message_id
 from mem_deep_research_core.core.llm_call_handler import (
     LLMCallHandler,

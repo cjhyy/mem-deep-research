@@ -8,6 +8,20 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+_KNOWN_RESPONSE_LANGUAGES: frozenset[str] = frozenset({
+    "auto",
+    "Chinese",
+    "English",
+    "Japanese",
+    "Korean",
+    "Spanish",
+    "French",
+    "German",
+    "Italian",
+    "Portuguese",
+    "Russian",
+})
+
 
 class LLMConfig(BaseModel):
     """LLM 配置验证"""
@@ -41,6 +55,9 @@ class LLMConfig(BaseModel):
     openrouter_base_url: str | None = Field(default=None, description="OpenRouter Base URL")
     openrouter_provider: str | None = Field(default="", description="OpenRouter Provider 偏好")
     anthropic_api_key: str | None = Field(default=None, description="Anthropic API Key")
+    anthropic_base_url: str | None = Field(default=None, description="Anthropic Base URL")
+    openai_api_key: str | None = Field(default=None, description="OpenAI API Key")
+    openai_base_url: str | None = Field(default=None, description="OpenAI Base URL")
     api_key: str | None = Field(default=None, description="通用 API Key")
     base_url: str | None = Field(default=None, description="通用 Base URL")
 
@@ -251,85 +268,9 @@ class TodoTrackerConfig(BaseModel):
     enabled: bool = Field(default=False, description="是否启用任务追踪")
 
 
-class ContextManagerConfig(BaseModel):
-    """Context Manager 配置
-
-    三级 Context 管理策略:
-      Level 1 (Compact): token-aware 摘要替换，零 LLM 成本
-      Level 2 (Summarize): LLM 压缩旧历史为一条摘要
-      Level 3 (Emergency): 二分删除中间消息
-    """
-
-    enable_dedup: bool = Field(default=True, description="是否启用跨轮次 tool call 去重")
-    enable_compact: bool = Field(default=True, description="是否启用 Level 1 摘要替换")
-
-    # Level 1: 摘要替换
-    compact_at_ratio: float = Field(
-        default=0.6, ge=0.0, le=1.0, description="token 占比超过此值时触发 compact"
-    )
-    compact_keep_recent: int = Field(default=3, ge=1, description="至少保留最近 N 轮完整结果")
-    compact_preview_length: int = Field(
-        default=300,
-        ge=0,
-        description="Masking 摘要中保留的结果预览字符数。越大最终 summary 质量越好，但压缩效果越弱。",
-    )
-
-    # Level 2: LLM 压缩
-    summarize_at_ratio: float = Field(
-        default=0.8, ge=0.0, le=1.0, description="token 占比超过此值时触发 LLM 压缩"
-    )
-
-    # Dedup cache
-    max_dedup_cache_size: int = Field(
-        default=200, ge=1, description="Maximum entries in dedup cache"
-    )
-
-    # Result offloading
-    result_offload_threshold: int = Field(
-        default=5000, ge=0, description="工具结果超过此字符数时备份到文件，0=禁用。替换由 compact_keep_recent 滑动窗口控制"
-    )
-    result_offload_dir: str = Field(default="", description="卸载文件目录，空=使用 output_dir")
-    cleanup_offload_on_finish: bool = Field(
-        default=True, description="任务结束后自动清理 offload 文件"
-    )
-
-    # Evidence extraction
-    enable_evidence_extraction: bool = Field(
-        default=True,
-        description="每轮工具结果执行后自动提炼高价值证据，常驻 context 不被压缩丢失",
-    )
-
-    # Token 估算
-    chars_per_token: float = Field(
-        default=3.5, gt=0.0, description="无 tiktoken 时的 fallback 估算比例"
-    )
-
-    # 兼容旧配置
-    mask_after_n_turns: int = Field(
-        default=5, ge=1, description="[已废弃] 旧配置，被 compact_keep_recent 取代"
-    )
-    enable_masking: bool = Field(
-        default=True, description="[已废弃] 旧配置，被 enable_compact 取代"
-    )
-
-    @model_validator(mode="after")
-    def validate_ratios_and_warn_deprecated(self) -> "ContextManagerConfig":
-        import logging
-
-        _logger = logging.getLogger("mem_deep_research")
-        # 交叉校验：compact 阈值必须小于 summarize 阈值
-        if self.compact_at_ratio >= self.summarize_at_ratio:
-            raise ValueError(
-                f"compact_at_ratio ({self.compact_at_ratio}) must be less than "
-                f"summarize_at_ratio ({self.summarize_at_ratio})"
-            )
-        if self.mask_after_n_turns != 5:  # non-default means user set it
-            _logger.warning(
-                "Config 'mask_after_n_turns' is deprecated, use 'compact_keep_recent' instead"
-            )
-        if not self.enable_masking:  # non-default means user set it
-            _logger.warning("Config 'enable_masking' is deprecated, use 'enable_compact' instead")
-        return self
+# ContextManagerConfig is defined in context_manager.py (single source of truth).
+# Re-export here for backward compatibility.
+from mem_deep_research_core.core.context_manager import ContextManagerConfig  # noqa: F401, E402
 
 
 class InterceptorConfig(BaseModel):
@@ -426,13 +367,28 @@ class MainAgentConfig(BaseModel):
     # Language
     response_language: str = Field(
         default="auto",
-        description="响应语言: 'auto' 从 query 自动检测, 或指定语言如 'Chinese', 'English', 'Japanese' 等",
+        description=(
+            "响应语言: 'auto' 从 query 自动检测，或指定语言名（'Chinese', 'English', "
+            "'Japanese', 'Korean' 等）。未在已知列表中的值会 WARNING 但不阻塞。"
+        ),
     )
     add_message_id: bool = Field(default=True, description="是否添加消息 ID")
     chinese_context: bool = Field(
         default=False,
         description="[已废弃] 使用 response_language 代替。设为 true 等同 response_language='Chinese'",
     )
+
+    @field_validator("response_language")
+    @classmethod
+    def validate_response_language(cls, v: str) -> str:
+        import logging
+        if v and v not in _KNOWN_RESPONSE_LANGUAGES:
+            logging.getLogger("mem_deep_research").warning(
+                f"response_language={v!r} is not in the known set "
+                f"{sorted(_KNOWN_RESPONSE_LANGUAGES)}; "
+                f"falling back to string literal — verify spelling"
+            )
+        return v
 
     class Config:
         extra = "allow"

@@ -12,6 +12,7 @@ Usage:
 """
 
 import logging
+import threading
 from collections import OrderedDict
 
 logger = logging.getLogger("mem_deep_research")
@@ -29,52 +30,60 @@ class FileStateCache:
         self._cache: OrderedDict[str, str] = OrderedDict()
         self._hits: int = 0
         self._misses: int = 0
+        self._lock = threading.Lock()
 
     def get(self, path: str) -> str | None:
         """获取缓存的文件内容（LRU 更新）"""
-        if path in self._cache:
-            self._cache.move_to_end(path)
-            self._hits += 1
-            return self._cache[path]
-        self._misses += 1
-        return None
+        with self._lock:
+            if path in self._cache:
+                self._cache.move_to_end(path)
+                self._hits += 1
+                return self._cache[path]
+            self._misses += 1
+            return None
 
     def put(self, path: str, content: str) -> None:
         """缓存文件内容"""
-        if path in self._cache:
-            self._cache.move_to_end(path)
-            self._cache[path] = content
-        else:
-            self._cache[path] = content
-            if len(self._cache) > self._max_size:
-                evicted = self._cache.popitem(last=False)
-                logger.debug(f"[FileStateCache] Evicted: {evicted[0]}")
+        with self._lock:
+            if path in self._cache:
+                self._cache.move_to_end(path)
+                self._cache[path] = content
+            else:
+                self._cache[path] = content
+                if len(self._cache) > self._max_size:
+                    evicted = self._cache.popitem(last=False)
+                    logger.debug(f"[FileStateCache] Evicted: {evicted[0]}")
 
     def invalidate(self, path: str) -> None:
         """使指定路径的缓存失效（文件被写入后调用）"""
-        self._cache.pop(path, None)
+        with self._lock:
+            self._cache.pop(path, None)
 
     def clone(self) -> "FileStateCache":
         """克隆缓存（用于 sub-agent 隔离，共享读取结果）"""
         new = FileStateCache(max_size=self._max_size)
-        new._cache = OrderedDict(self._cache)
+        with self._lock:
+            new._cache = OrderedDict(self._cache)
         return new
 
     @property
     def size(self) -> int:
-        return len(self._cache)
+        with self._lock:
+            return len(self._cache)
 
     @property
     def stats(self) -> dict:
-        total = self._hits + self._misses
-        return {
-            "size": len(self._cache),
-            "hits": self._hits,
-            "misses": self._misses,
-            "hit_rate": round(self._hits / total, 2) if total > 0 else 0.0,
-        }
+        with self._lock:
+            total = self._hits + self._misses
+            return {
+                "size": len(self._cache),
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": round(self._hits / total, 2) if total > 0 else 0.0,
+            }
 
     def reset(self):
-        self._cache.clear()
-        self._hits = 0
-        self._misses = 0
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0

@@ -27,6 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from mem_deep_research_core.core.constants import (
+    DEFAULT_RESULT_OFFLOAD_THRESHOLD,
     MT,
     MICROCOMPACT_MIN_CHARS,
     PROTECTED_MESSAGE_TYPES,
@@ -34,6 +35,7 @@ from mem_deep_research_core.core.constants import (
     SYSTEM_MESSAGE_KEYWORDS,
     TAG_OFFLOADED,
 )
+from mem_deep_research_core.core.memory import SourceRecord
 from mem_deep_research_core.core.window_strategy import (
     BinaryReductionStrategy,
     LLMSummarizeStrategy,
@@ -75,16 +77,6 @@ class OffloadRecord:
     tool_names: list[str] = field(default_factory=list)
     state: str = "backed_up"  # backed_up | pending_evidence | offloaded
     evidence: list[str] = field(default_factory=list)
-
-
-@dataclass
-class SourceRecord:
-    """来源记录"""
-
-    url: str
-    title: str = ""
-    tool_name: str = ""
-    turn: int = 0
 
 
 class SourceRegistry:
@@ -197,7 +189,11 @@ class SourceRegistry:
 
 @dataclass
 class ContextManagerConfig:
-    """ContextManager 配置"""
+    """ContextManager 配置（单一来源，含验证逻辑）
+
+    取代了 config_schema.py 中的同名 Pydantic 模型，确保
+    compact_at_ratio < summarize_at_ratio 等约束在运行时始终被校验。
+    """
 
     enable_dedup: bool = True  # 是否启用跨轮次去重
     enable_compact: bool = True  # 是否启用 Level 1 摘要替换
@@ -217,12 +213,19 @@ class ContextManagerConfig:
     chars_per_token: float = 3.5  # 无 tiktoken 时的 fallback 估算
 
     # Result offloading
-    result_offload_threshold: int = 5000  # 0 = disabled
+    result_offload_threshold: int = DEFAULT_RESULT_OFFLOAD_THRESHOLD  # 0 = disabled
     result_offload_dir: str = ""
     cleanup_offload_on_finish: bool = True
 
     # Evidence extraction
     enable_evidence_extraction: bool = True
+
+    def __post_init__(self):
+        if self.compact_at_ratio >= self.summarize_at_ratio:
+            raise ValueError(
+                f"compact_at_ratio ({self.compact_at_ratio}) must be less than "
+                f"summarize_at_ratio ({self.summarize_at_ratio})"
+            )
 
 
 # ============================================================
