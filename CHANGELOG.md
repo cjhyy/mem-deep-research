@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.2.5 (2026-04-20)
+
+**循环退出机制对齐 Claude Code** — 移除 grace turn，使用 `stop_reason` / `finish_reason` 作为唯一退出信号。
+
+### 背景
+
+v1.2.3 引入的 grace turn 机制（`771fcf7`）让框架在 LLM 不再调工具时主动注入 nudge 再问一轮，本意是救援 LLM 中途误判完成的场景。实际 trade-off 反了 —— 100% 任务多等 ~6s 换 <1% 的补救收益，且补救效果本身存疑。本次回归 v1.2.2 之前的设计思路，并对齐 Claude Code 的做法：**信任 LLM 通过 API 明确表达的意图**。
+
+### 破坏性变化（Breaking）
+
+- **删除 `MAX_CONSECUTIVE_NO_TOOL_TURNS` 常量** — 不再按"连续无 tool 轮次"终止
+- **删除 `MT.NO_TOOL_NUDGE` 消息类型** — nudge 机制整体移除
+- **删除 grace turn 所有逻辑**（`main_loop.py` 约 75 行）
+- 框架不再主动注入 nudge，LLM 不调工具就是完成信号
+
+**迁移**：依赖 grace turn 行为的用户几乎没有（机制只存在于 v1.2.3/v1.2.4）；如果项目有测试断言"3 次 LLM 调用（含 grace 确认）"，需改为"2 次"。
+
+### Provider 层改动
+
+四个 provider 的 `process_llm_response` 从"永远返回 `should_break=False`"改为按 API 字段返回真实值：
+
+- `claude_anthropic_client.py`: `should_break = stop_reason != "tool_use"`
+- `openai_compatible_client.py`: `should_break = finish_reason != "tool_calls"`
+- `gpt_openai_client.py`: 同上
+- `deepseek_openrouter_client.py`: 委托基类，无需改动
+
+### Main Loop 改动
+
+- 删除 grace turn 整块（counter + nudge + token 预算检查 + microcompact 回退）
+- 新增防御性检查：`should_break=True` 但响应里仍带 `tool_use` block（不规范 provider），先执行工具再退出
+- 反思豁免检查前移：反思轮 LLM 只输出反思文字（`stop_reason=end_turn`），不应被 should_break 提前截断，改为在 should_break 之前 continue 给 LLM 下一轮
+
+### 相关 Bug 影响
+
+BUG-01 / BUG-02 / BUG-03 / BUG-08 在 v1.2.4 的修复代码全部删除 —— 源头（grace turn）不存在，这些 bug 不再可能发生。docs/20-roadmap.md 标记为 "🗑️ 代码移除"。
+
+### Verification
+
+- 543 tests pass，零 regression
+- 简单任务延迟下降：一次 tool call 的查询从 ~20s 缩到 ~14s（省 1 次 LLM 调用）
+
 ## v1.2.4 (2026-04-20)
 
 **Phase 1 稳定性修复** — 基于代码 Review 定位的运行时安全与配置契约修复。
