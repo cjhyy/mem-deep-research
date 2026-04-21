@@ -303,10 +303,12 @@ DeepResearch.run(query)
 | [12-memory-and-todo](docs/12-memory-and-todo.md) | 记忆与任务追踪 |
 | [13-execution-modes](docs/13-execution-modes.md) | 执行模式与语言控制 |
 | [14-api-reference](docs/14-api-reference.md) | API 参考 |
-| [15-technical-roadmap](docs/15-technical-roadmap.md) | 技术 Roadmap |
+| [15-technical-roadmap](docs/15-technical-roadmap.md) | 历史技术 Roadmap（存档） |
 | [16-dual-mode-execution-plan](docs/16-dual-mode-execution-plan.md) | Dual-mode 当前状态 |
 | [17-repo-architecture-review](docs/17-repo-architecture-review.md) | 仓库架构评估与演进建议 |
 | [18-offload-evidence-optimization](docs/18-offload-evidence-optimization.md) | Offload 与 Evidence 联动优化方案 |
+| [20-roadmap](docs/20-roadmap.md) | 当前版本路线图（权威） |
+| [21-industry-framework-analysis](docs/21-industry-framework-analysis.md) | 业界框架分析与后续优化方向 |
 
 ## 开发
 

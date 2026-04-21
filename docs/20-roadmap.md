@@ -1,573 +1,294 @@
-# Mem Deep Research Framework — 迭代 Roadmap
+# Mem Deep Research Framework Roadmap
 
-> **权威版本**：本文档是唯一权威 Roadmap，取代 doc-15、doc-17、doc-19。
-> 旧文档已降级为历史参考，顶部标注 `[DEPRECATED — 见 doc-20]`。
->
-> 生成时间：2026-04-17
-> 最后更新：2026-04-20（Grace turn 机制整体移除）
-> 基于：Arena 三模型评审（Claude Opus / Gemini 3.1-pro-preview / DeepSeek-R1）
+> 状态基线：2026-04-21
+> 当前版本：v1.2.5
+> 文档定位：当前权威 Roadmap，用于回答“项目下一阶段做什么、为什么做、做到什么算完成”。
+> 配套阅读：`docs/21-industry-framework-analysis.md`（业界对比 + 长期方向）。
 
-## Phase 1 进度快照（2026-04-20 最终）
+## 一句话判断
 
-### ⭐ 根本性改动：Grace turn 机制已整体移除
+项目已经完成“研究型 Agent 执行内核”的第一阶段建设。下一步的战略重点**不是继续做一个更强的 research agent，而是把 deep research 从"框架本体"降级为"框架上的一个高级执行 profile"，把底座从研究型内核升级为通用 Agent Runtime。**
 
-在 Phase 1 收尾阶段，通过性能分析（"link 了哪些数据源" 查询 20s 中有 6s 浪费在 grace turn nudge）重新审视了 `771fcf7` 引入的 grace turn 机制，得出结论：**trade-off 反了** —— 用 100% 任务多等一次 LLM call (~6s) 换 <1% 场景的补救。
+## 定位转向
 
-**修复方向（对齐 Claude Code 设计）**：循环退出完全交给 LLM 通过 API `stop_reason` / `finish_reason` 明说，框架只读信号不做推断：
+过去一年的演进路径是"围绕研究任务做得更深"。随着 `MainLoopRunner` / `ContextManager` / `ToolManager` / sub-agent / hook / skill / memory / resume 都已就位，继续沿着"研究单点"方向优化的边际收益在下降：主循环已经承担了大量研究专属逻辑，任何新场景（automation / coding / ops / enterprise workflow）都会继续往主链里堆条件分支。
 
-- `stop_reason == "tool_use"` / `finish_reason == "tool_calls"` → LLM 要调工具，循环继续
-- `stop_reason == "end_turn"` → LLM 明说完成，循环退出
-- `"max_tokens"` / `"length"` / `"refusal"` 等 → 非正常完成，同样退出（交给上层处理）
+因此定位调整如下：
 
-**改动**：
-1. 四个 provider 的 `process_llm_response` 从"永远返回 `should_break=False`"改为"按 `stop_reason` / `finish_reason` 返回真实值"（`claude_anthropic_client.py`, `openai_compatible_client.py`, `gpt_openai_client.py`, `deepseek_openrouter_client.py` 基类委托）
-2. `main_loop.py` 删除 grace turn 整块（75 行 → 6 行），`should_break` 在 line 1155 主导退出，无 tool call 保底退出
-3. `constants.py` 删除 `MAX_CONSECUTIVE_NO_TOOL_TURNS` + `MT.NO_TOOL_NUDGE`
-4. 测试从"3 LLM calls（含 grace turn 确认）"改为"2 LLM calls"
+- **框架本体** = 通用 Agent Runtime（主循环、context、tool、sub-agent、resume、observability、guardrails、workflow）
+- **Deep Research** = 框架之上的一个高级执行 profile（聚合了反思、规划、offload、evidence extraction、summary 等研究专属策略）
 
-**语义**：LLM 通过 API 明确表达意图，框架尊重。不推断、不 nudge、不强行再问。
+这不是放弃 deep research，而是**让研究能力**作为 profile **在底座之上**清晰表达，同时给 workflow / automation / coding 等其他 profile 留出生长空间。
 
-**影响**：
-- `main_loop.py` 删除 grace turn 分支（75 行 → 6 行）
-- `constants.py` 删除 `MAX_CONSECUTIVE_NO_TOOL_TURNS` 常量 + `MT.NO_TOOL_NUDGE` 消息类型
-- 相关测试从 "3 LLM calls（含 grace turn 确认）" 改为 "2 LLM calls"
-- BUG-01 / BUG-03 / BUG-08 的修复代码一并删除（源头不存在，bug 自然消失）
+## 当前阶段
 
-**语义**：LLM 的判断优先。无 tool call 直接 break。反思检查点豁免（`_reflection_pending`）保留。Deep 模式通过反思检查点主动问 LLM "还要做什么"，比 grace turn nudge 更有信息量。
+截至 2026-04-20，框架已经具备这些核心能力：
 
-### Bug 最终状态
+- `MainLoopRunner` + `ContextManager` + `ToolManager` 构成可运行的执行内核
+- `quick / standard / deep / auto` 四种执行模式已经可用
+- 子 Agent、Hook、Skill、Memory、Todo、Transcript 均已接入主链
+- 上下文压缩、结果 offload、resume、监控与循环检测已经形成闭环
+- v1.2.5 已移除 grace turn，主循环退出对齐 Claude Code `stop_reason` 语义
 
-| Bug | 最终状态 | 说明 |
-|-----|---------|------|
-| BUG-01 Grace Turn 绕过 context 管理 | 🗑️ 代码移除 | Grace turn 整体删除后不存在 |
-| BUG-02 Nudge 去重破坏角色交替 | 🗑️ 代码移除 | 同上 |
-| BUG-03 常量注释误导 | 🗑️ 代码移除 | `MAX_CONSECUTIVE_NO_TOOL_TURNS` 已删 |
-| BUG-04 子 Agent 配置继承不完整 | ✅ 已修复 | `sub_agent_runner.py:104-175` — inherit_with_override 四层合并 |
-| BUG-05 Registry merge 静默丢弃 | ✅ 已修复 | `context_manager.py:655-674` — collision WARNING + 覆盖写入 |
-| BUG-06 MCP 会话跨任务串号 | ⚠️ 设计争议 | `tool/manager.py:286-378` — context fingerprint 已修串号；默认 `_default_env_inject` 行为见 BUG-09 |
-| BUG-07 配置契约 fail-fast | ✅ 已修复 | `deep_research.py:297-341` — critical 字段抛 `ConfigValidationError` |
-| BUG-08 Fast-path 与 Grace Turn 冲突 | 🗑️ 代码移除 | Fast-path 本身也随 grace turn 一起删 |
-| BUG-10 gather 缺 return_exceptions | ✅ 已修复 | `main_loop.py` agent_calls gather 加 `return_exceptions=True` + 异常归一化 |
-| BUG-11 AgentFactory.close() 异常未隔离 | ✅ 已修复 | `agent_factory.py:357-384` — 每个 tool_manager 独立 try/except |
-| BUG-12 三模块缺锁 | ✅ 已修复 | `todo_tracker.py` / `file_state_cache.py` / `transcript.py` 加 `threading.Lock` |
-| BUG-14 response_language 未约束 | ✅ 已修复 | Pydantic `field_validator` 软验证 |
-| BUG-16 硬编码 0.6 | ✅ 已修复 | `llm_call_handler.py` → `CONTEXT_REDUCTION_TARGET_RATIO` |
-| BUG-17 命名 sub-agent offload 孤儿 | ✅ 已修复 | `SubAgentRunner.run()` 接受 `parent_context_manager`，finally merge |
+这意味着项目已经越过“功能证明可行”阶段，进入“框架可信度 + 通用化演进”阶段。
 
-**复核结论**：
-- BUG-13 scrape_max_length：**非 bug**，配置优先级已正确
-- BUG-15 `@file` 白名单：**复核已实现**，多层防护已在 `input_compiler.py` + `config_schema.py` 中
-- BUG-18~21（Review agent 汇报）：**均非 bug**，属已有设计或误判
+## 北极星目标
 
-**测试**：543 passed，零 regression。
+面向未来 2 到 3 个版本，Roadmap 聚焦五个方向（前两项是定位转向的直接动作，后三项是支撑底座可信的基础工作）：
 
----
+1. **把 deep research 从主链逻辑降级为 profile**。保留 `quick / standard / deep`，但把 deep 明确为一种 profile；新增更通用的 workflow / automation / coding profile 概念；把研究专属逻辑逐步从主循环抽离到 policy / profile 层。
+2. **补 workflow layer**。业界已经清晰分成 workflow（开发者定义结构化控制流）+ agent（局部节点开放式推理）两层。当前 agent loop 很强但缺 workflow，新增 `Flow` / `Process` / `TaskGraph` 抽象，允许 Agent 作为 workflow 节点。
+3. 让主循环行为更可预测，降低不同 provider / mode / tool transport 的行为漂移。
+4. 让长任务生命周期更统一，尤其是 `compact -> offload -> read_result -> resume` 这条链，把 durable execution 做成正式 contract。
+5. 让框架具备更强的对外可用性，包括测试、文档、版本发布、observability 和 eval 体系。
 
-## 当前状态评估
+## 版本路线图总览
 
-框架已完成从功能扩张期向**运行时收敛期**的过渡节点。核心执行内核（主循环、上下文管理、子 Agent、Offload 流水线）功能已就位，但存在四类系统性风险需要在继续演进前修复：
+| 版本 | 目标窗口 | 主题 | 核心结果 |
+|------|---------|------|---------|
+| v1.3.0 | 2026-05 | Runtime Contract 收敛 | 统一结果生命周期、配置契约、子 Agent 行为边界；为 profile 拆分准备契约基础 |
+| v1.4.0 | 2026-06 | Profile 拆分 + Workflow Layer 雏形 | deep research 从主循环降为 profile；引入 `Flow` / `TaskGraph` 抽象；主循环瘦身 |
+| v1.5.0 | 2026-07 至 2026-08 | 质量、Observability、对外可用性 | 建立评测体系、trace schema 收口、稳定入口 API、规范发布流程 |
 
-| 风险维度 | 代表问题 | 影响 | 2026-04-20 状态 |
-|---------|---------|------|-----------|
-| 运行时状态一致性 | Grace Turn 绕过上下文管理 | 长任务 Token 溢出 | 🗑️ Grace turn 机制整体移除，问题源头消失 |
-| 主循环性能 | Grace turn 让所有任务多等 ~6s | 简单任务延迟翻倍 | 🗑️ 移除 grace turn 后简单任务直接 break |
-| 多任务隔离失效 | MCP 会话串号、子 Agent 配置继承不完整 | 静默行为偏离 | ✅ 串号已修（fingerprint）；子 Agent 已修（inherit_with_override） |
-| 配置契约分裂 | 多条读取路径、校验非 fail-fast | 调试成本极高 | ⚠️ critical 字段 fail-fast 完成；多路径读取未收口 |
-| 并发安全 | 三个模块缺锁、gather 缺 return_exceptions、close 不隔离 | 资源泄漏、死锁 | ✅ Review 发现项全部修复 |
-| 质量保障缺失 | 端到端集成测试严重不足 | 修复引入回归无法感知 | ⚠️ Phase 2 承接 |
+> **说明**：v1.4.0 是定位转向的关键版本。此前版本的 "执行架构整理" 目标现在明确了方向 —— 不只是拆 mode 策略文件，而是把主循环里的研究专属逻辑（reflection / verify / task planner / evidence extraction / summary policy）全部收到 DeepResearchProfile 里，主循环本体只保留通用 agent runtime 能力。
 
----
+## v1.3.0：Runtime Contract 收敛
 
-## 版本规划总览
+### 目标
 
-```
-Phase 0  v1.2.3-prep   规划收敛与对齐          ~1 周
-Phase 1  v1.2.3        高优稳定性修复           ~3-4 周
-Phase 2  v1.3.0        契约收敛与架构整理        ~4-6 周
-Phase 3  v1.4.0        质量体系与长期演进        ~4-6 周
+把“已经能跑”的运行时能力收口成清晰、稳定、可验证的 contract。
+
+### 重点任务
+
+#### 1. 统一结果生命周期
+
+收口下面这条主链语义：
+
+```text
+tool result
+  -> format
+  -> offload / marker
+  -> compact / summarize
+  -> read_result / restore
+  -> resume rebuild
 ```
 
----
+需要明确：
 
-## Phase 0：规划收敛与对齐（v1.2.3-prep）
+- 什么消息会被视为标准 `tool_result`
+- 什么状态下结果允许再次压缩
+- `read_result(ref=...)` 能恢复到什么粒度
+- `resume()` 需要重建哪些运行时状态
 
-**目标**：消除规划碎片化，建立单一权威执行框架。
+#### 2. 收口配置契约
 
-### 任务清单
+继续把配置从“多入口可用”收口到“单一来源可信”：
 
-| 优先级 | 任务 | 完成标准 |
-|--------|------|---------|
-| P0 | 合并 doc-15/17/19 为本文档（doc-20） | 旧文档顶部标注 DEPRECATED |
-| P0 | 统一版本号体系（v1.2.3 / v1.3.0 / v1.4.0） | CHANGELOG 和 pyproject.toml 一致 |
-| P0 | 决策配置契约修复策略（方案 A vs 方案 B） | 技术方案文档落地 |
-| P1 | 审查 `@file` 指令安全边界 | 安全评估报告，确认是否需提升至 Phase 1 |
+- 核心字段必须 fail-fast
+- provider / skill selector / prompt hint 的字段读取路径保持一致
+- `example_project`、`README`、schema、运行时默认值保持同步
 
-### 配置契约修复策略决策
+#### 3. 对齐主 Agent / 子 Agent 行为
 
-**推荐方案 B（一次性收口）**，区分两类字段：
-- **核心必需字段**（如 `llm.provider_class`、`llm.model_name`）：缺失时 `_validate_config()` 直接 `raise ConfigurationError`，阻断初始化
-- **可选字段**：缺失时 `WARNING` 日志 + 自动填充默认值，不阻断
+重点解决“看起来共享能力，实际行为不完全一致”的问题：
 
-理由：框架处于 v1.2.x 早期，用户基数有限，一次性收口的迁移成本可接受。
+- 子 Agent 默认继承主链 context 管理策略
+- offload registry、dedup、resume 相关语义在主链和子链保持一致
+- named sub-agent 与动态 spawn agent 的结果回收和清理逻辑一致
 
----
+#### 4. 补运行时回归测试
 
-## Phase 1：v1.2.3 高优稳定性修复
+优先补齐这些高价值回归场景：
 
-**目标**：修复所有已确认的高优运行时风险，每个修复必须附带回归测试。
+- `resume()` 后继续执行
+- `offload + read_result + compact` 联动
+- 多任务 / 多 context 下 MCP session 隔离
+- 子 Agent 返回结果重新进入主链后的生命周期
 
-**入口条件**：Phase 0 完成，配置策略已决策。
+### 完成标准
 
-### Bug 修复清单
+- 结果生命周期可以用一张图讲清楚，且实现与文档一致
+- `resume`、`read_result`、offload 的关键场景具备端到端回归测试
+- 子 Agent 和主 Agent 的上下文管理行为不再静默漂移
+- 配置写错核心字段时初始化明确失败，不再“带病运行”
 
-#### BUG-01 Grace Turn 绕过上下文管理 🗑️ 代码移除（2026-04-20）
+## v1.4.0：Profile 拆分 + Workflow Layer 雏形
 
-**说明**：此 bug 修复代码已随 grace turn 机制整体删除，不再适用。以下为历史记录。
+### 目标
 
+让框架从 "一个研究型主循环" 升级为 "通用 Agent Runtime + 可插拔 profile + 雏形 workflow 层"。**这是项目定位转向的关键版本。**
 
+### 重点任务
 
-**位置**：`main_loop.py:1279-1283`
+#### 1. Deep research 从主链逻辑降级为 profile
 
-**问题**：Grace Turn 路径仅执行 microcompact，跳过完整 `manage_context` 流水线（含 `prepare_offload_candidates` / `finalize_offload_candidates`）。长任务中 Grace Turn 发生在 token 接近上限时，下一轮 LLM 调用直接触发 context limit 错误。
+把目前散落在 `MainLoopRunner` / `Orchestrator` 里的研究专属逻辑，收到独立的 `DeepResearchProfile` 里：
 
-**修复方案**：
-```python
-# Grace Turn 注入 nudge 前，先做 token 预算检查
-if self._token_ratio() > self.cfg.context_manager.compact_at_ratio:
-    await self.context_manager.manage_context(self.message_history)
-self.message_history.append(nudge_msg)
-continue
+- reflection 检查点（目前由 `task_engine_cfg` 驱动）
+- verify checkpoint（deep 模式前的证据覆盖/冲突检测）
+- task planner（LLM 任务分解）
+- evidence extraction（`<evidence>` tag 解析）
+- summary policy（deep + 用过工具强制生成 summary）
+- context 压缩策略的研究向偏好
+
+主循环本体只保留：turn loop、tool dispatch、stop_reason 判退、基础 context 管理、sub-agent orchestration。
+
+形态参考：
+
+```text
+ModeResolver
+  -> QuickProfile      (直答场景)
+  -> StandardProfile   (通用工具调用 agent)
+  -> DeepResearchProfile  (研究场景，含反思/规划/evidence/summary)
+  -> (future) AutomationProfile / CodingProfile / WorkflowNodeProfile
 ```
 
-**验收标准**：
-- [ ] 上下文接近阈值时触发 Grace Turn，`manage_context` 被正确调用（mock 验证）
-- [ ] Grace Turn 后 token 占比回落到阈值以下
+#### 2. 引入 Workflow Layer 雏形
 
----
+新增 `Flow` / `Process` / `TaskGraph` 抽象（任选一个命名），支持：
 
-#### BUG-02 Nudge 去重逻辑破坏消息角色交替 🗑️ 代码移除（2026-04-20）
+- 顺序、并行、路由、等待、人工确认、子流程节点
+- Agent 作为 workflow 节点运行（而非把所有复杂性塞进单 agent loop）
+- 与现有 `resume` / offload / checkpoint 机制集成
 
-**说明**：Nudge 机制已随 grace turn 整体删除，此 bug 不再存在。以下为历史记录。
+这一版不需要做到 LangGraph 级完整度，目标是让"复杂任务可以用 workflow 组合多个 agent 节点"这条路在框架层走得通。
 
+#### 3. 缩小主链对象职责
 
+优先抽出的模块：
 
-**位置**：`main_loop.py`（nudge 去重的反向扫描 + `list.pop(i)`）
+- `RouteController`（mode 决策 + profile 选择）
+- `BuiltinToolDispatcher`（spawn_agent / read_result / update_todo 等内置工具分发）
+- `ResultLifecycleManager`（tool result format → offload → compact → restore 生命周期）
+- `SummaryPolicy`（当前由 `generate_summary` + mode 隐式决定，抽成显式策略）
 
-**问题**：当 LLM 停滞后恢复、再次停滞时，去重逻辑反向遍历整个历史并删除早期轮次的 nudge（role=user）。这可能导致历史中出现连续两条 `assistant` 消息，违反 Anthropic API 的严格角色交替规则，引发 400 Bad Request。
+目的是降低 `MainLoopRunner` 和 `Orchestrator` 的认知负担，让后续功能不再默认往主链堆。
 
-**修复方案**：移除反向扫描去重逻辑，改为仅检查 `message_history[-1]` 是否已为 nudge，避免重复注入：
-```python
-# 替换复杂的反向扫描
-last = self.message_history[-1] if self.message_history else None
-if last and last.get("_type") == MT.NO_TOOL_NUDGE:
-    pass  # 已有 nudge，不重复注入
-else:
-    self.message_history.append(nudge_msg)
-```
+#### 4. 统一工具定义形态
 
-**验收标准**：
-- [ ] 停滞→恢复→再次停滞场景下，消息历史角色序列合法（user/assistant 严格交替）
-- [ ] 连续停滞场景下不会注入重复 nudge
+减少 builtin tool、MCP tool、deferred tool 在数据 shape 上的分叉，建立统一 `ToolDefinition` 中间表示，让 prompt 构建、工具选择、工具执行和 profile 层使用一致契约。
 
----
+#### 5. 收口公共入口语义
 
-#### BUG-03 常量命名语义误导（off-by-one）🗑️ 代码移除（2026-04-20）
+把以下入口的行为边界补清楚并文档化：
 
-**说明**：`MAX_CONSECUTIVE_NO_TOOL_TURNS` 常量已删除，此 bug 不再存在。以下为历史记录。
+- `DeepResearch.run()` / `from_project()` / `resume()` / `run_batch()`
+- 新增 `DeepResearch(profile=...)` 或等价显式 profile 指定 API
+- Workflow 入口的调用 / 注册方式
 
+### 完成标准
 
+- `MainLoopRunner` 主循环不再包含 reflection / verify / evidence / summary policy 等研究专属分支
+- `DeepResearchProfile` 可以独立单测，能拼装到其他入口
+- quick / standard / deep 的行为差异通过 profile 定义表达，可解释、可测试、可替换
+- Workflow layer 至少支持 "顺序 + 并行 + 单 agent 节点" 三个最小场景，且能在长任务中 resume
+- 新功能（如新 profile）接入时，不需要修改 `MainLoopRunner`
 
-**位置**：`constants.py`
+## v1.5.0：质量与对外可用性
 
-**问题**：`MAX_CONSECUTIVE_NO_TOOL_TURNS=2` 注释声称"gets up to this many grace turns"，实际只有 1 次 grace turn（第 2 次直接 break）。
+### 目标
 
-**修复方案**：
-```python
-# 修改注释，明确语义
-MAX_CONSECUTIVE_NO_TOOL_TURNS = 2  # 连续 N 次无工具调用后终止；前 N-1 次注入 nudge，第 N 次 break
-```
-或重命名为 `MAX_NO_TOOL_TURNS_BEFORE_TERMINATION`。
+让项目从“内部架构成熟”进入“可长期维护、可对外稳定使用”的阶段。
 
-**验收标准**：
-- [ ] 常量名或注释准确反映"1 次 grace turn"的实际行为
+### 重点任务
 
----
+#### 1. 建立分层评测体系
 
-#### BUG-04 子 Agent 配置继承不完整 🔴 ✅ 已修复（2026-04-20）
+建议拆成三层：
 
-**位置**：`sub_agent_runner.py`
+- 离线回归集：验证 runtime contract，不依赖实时世界状态
+- 在线稳定集：验证完成率、引用覆盖率、时延与成本
+- 新鲜度 smoke 集：只做实时搜索类能力冒烟，不纳入核心长期分数
 
-**问题**：`SubAgentRunner` 创建独立 `ContextManager` 时，`offload_dir` 已继承（已修复），但 `compact_keep_recent`、`enable_dedup`、`window strategy` 等配置未继承，退回默认值，导致子 Agent 的 compact/offload 行为与主链不一致。
+#### 2. 补公共边界测试
 
-**修复方案**：实现 `inherit_with_override` 模式：
-- 默认从父级 `ContextManager` 继承完整配置
-- 子 Agent 配置中显式声明的字段允许覆盖
-- 设计原则：子 Agent 通常执行更短任务，可允许更激进的 compact 策略，但必须是显式配置而非静默退回默认值
+补齐更贴近用户使用方式的测试：
 
-**验收标准**：
-- [ ] 子 Agent 的 `compact_keep_recent`、`enable_dedup` 与主链一致（未显式覆盖时）
-- [ ] 显式覆盖的子 Agent 配置生效
+- `from_project()` + hooks 自动加载
+- `run_batch()` 在不同 context 下的隔离
+- 不同 transport 的 `ToolManager` 行为差异
+- provider 差异对工具调用与退出语义的影响
 
----
+#### 3. 规范版本与发布流程
 
-#### BUG-05 Registry Merge 静默丢弃条目 🔴 ✅ 已修复
+目标是让版本不再漂移、发布不再依赖人工记忆：
 
-**位置**：`context_manager.py`（`merge_offload_registry`）
+- 版本号单一来源
+- CHANGELOG 与发布标签自动校验
+- 发布前 smoke test
+- example project 作为最小可用验证链路
 
-**问题**：`if ref not in self._offload_registry` 跳过冲突，被丢弃的 ref 对应文件永远不会被清理，产生孤儿文件，且无任何日志警告。
+#### 4. 收口文档体系
 
-**修复方案**：
-```python
-def merge_offload_registry(self, child_registry: dict) -> None:
-    for ref, path in child_registry.items():
-        if ref in self._offload_registry:
-            logger.warning(f"Offload registry collision on ref={ref!r}, child entry dropped. "
-                           f"Existing: {self._offload_registry[ref]}, Child: {path}")
-        else:
-            self._offload_registry[ref] = path
-```
+重点不是“再写更多文档”，而是让文档、实现和示例保持一致：
 
-**验收标准**：
-- [ ] 冲突时输出 WARNING 日志
-- [ ] 无冲突时子 Agent 所有条目正确 merge
+- roadmap 与 changelog 对齐
+- 配置文档与 schema 对齐
+- mode / resume / offload 契约文档明确
+- hooks 和扩展点给出推荐用法
 
----
+### 完成标准
 
-#### BUG-06 MCP 会话缓存导致多任务串号 🔴 ⚠️ 串号已修复，设计可议
+- 不同版本之间的运行时表现可通过 benchmark 进行横向比较
+- 公共入口的主要使用路径有稳定测试覆盖
+- 发布流程具备自动化检查，版本号不再多处漂移
+- 文档能支撑新用户从接入到扩展的完整路径
 
-**位置**：`tool/manager.py`
+## 成功指标
 
-**原问题**：`ToolManager` 缓存 server 级持久会话，stdio transport 的上下文注入仅在首次创建 session 时发生。单进程串行执行多个研究任务时，后续任务的环境变量可能沿用旧值。
+为了避免 roadmap 变成纯叙事，建议按下面几类指标跟踪：
 
-**当前状态**（2026-04-20 核对）：
-- **串号已修复**：`_compute_context_fingerprint`（`tool/manager.py:237-256`）为每个 stdio session 记录 env 注入的指纹；`_get_or_create_session`（`tool/manager.py:286-320`）检测到 context 变化时自动 invalidate + 重建 session。
-- **双重防线**：工具调用时通过 `_mcp_context` arguments（`tool/manager.py:783-795`）每次传递当前 context，MCP server 即使不读 env 也能拿到正确身份。
-- **设计争议（延伸为 BUG-09）**：默认 `_default_env_inject`（`tool/manager.py:62-83`）把顶层 context 全部塞成 env。这个行为本身导致 fingerprint/invalidate 机制的必要性。如果采用"env 仅注入静态 secret、用户身份只走 `_mcp_context` arguments"的纯设计，fingerprint 机制可以整体移除。
+### 运行时指标
 
-**验收标准**：
-- [x] 多任务串行执行时，每个任务的 MCP 环境变量独立（fingerprint 保证）
-- [ ] 设计决策：是否移除默认 context→env 注入（见 BUG-09）
+- 长任务中断后 `resume()` 成功恢复比例
+- context compact / summarize / offload 触发后的成功续跑比例
+- 多任务场景下 tool session 串号问题数量
 
----
+### 质量指标
 
-#### BUG-07 配置契约 fail-fast 🟡 ✅ 已修复（2026-04-20，方案 B）
+- 关键主链端到端测试覆盖率
+- benchmark 任务通过率
+- 每个版本回归 bug 数量
 
-**位置**：`config_schema.py`、`_validate_config()`
+### 可维护性指标
 
-**问题**：核心字段缺失时仅记录日志，不阻断初始化，导致框架以错误配置静默运行。
+- 主循环核心文件复杂度变化趋势
+- 新增功能需要修改主链核心文件的比例（目标：v1.4.0 后新 profile 接入 = 0 主链改动）
+- 文档与实现不一致问题数
+- 研究专属逻辑在主循环中的占比（目标：v1.4.0 后收敛到 0，全部进入 `DeepResearchProfile`）
 
-**修复方案**：按 Phase 0 决策的方案 B 实施，核心必需字段缺失时 `raise ConfigurationError`。
+### 对外可用性指标
 
-**验收标准**：
-- [ ] `llm.provider_class` / `llm.model_name` 缺失时初始化阶段直接报错
-- [ ] 可选字段缺失时 WARNING + 自动填充默认值
+- example project 首次跑通成功率
+- 用户接入常见问题是否能在文档中直接找到答案
+- 发布后版本号、CHANGELOG、文档之间的一致性
 
----
+## 当前优先级排序
 
-#### BUG-08 快速路径与 Grace Turn 首轮冲突 🗑️ 代码移除（2026-04-20）
+2026-04-21 之后 4 到 8 周内最值得投入的事情，顺序如下：
 
-**说明**：Fast-path 分支与 grace turn 一起删除。循环退出由 `stop_reason` / `finish_reason` 信号决定（见 grace turn 移除说明），LLM 通过 API 明确表达意图，框架尊重。以下为历史记录。
+1. 收口 `resume + offload + read_result + compact` 的统一 contract，为 profile 拆分准备契约基础
+2. 对齐主 Agent / 子 Agent 的 context 与结果生命周期
+3. **设计 `DeepResearchProfile` 抽象**，为 v1.4.0 的主循环瘦身做准备（可以先作为内部概念，不对外暴露）
+4. 补公共入口、profile 切换、运行时隔离相关测试
+5. 规范版本、发布与文档同步流程
 
+## 明确不优先做的事情
 
+在定位转向完成前，以下方向不建议作为主线投入：
 
-**位置**：`main_loop.py`
+- 继续优化 deep research 的 prompt 细节和 reflection 策略（这些将在 v1.4.0 被重构到 profile 里）
+- 为研究场景往主循环里塞新 heuristics
+- 大量新增内置工具
+- 在 workflow 抽象缺位时过早强化多 Agent 花样
+- 继续扩大 prompt 模板分支
 
-**问题**：`total_tool_calls_executed == 0` 时快速路径直接 break，跳过 Grace Turn 恢复机会。对于强制要求工具调用的 Agent（如搜索 Agent），首轮偶发遗忘调用工具会直接终止任务。
+原因：**当前项目的稀缺性不在"能力更多"，而在"底座更稳、更通用、更容易演进到其他场景"**。任何在主循环里新增的研究专属分支，都是 v1.4.0 拆分时需要偿还的债。
 
-**修复方案**：根据 `execution_mode` 条件性启用快速路径：
-- `quick` 模式：保留快速路径（直接回答场景合理）
-- `standard` / `deep` 模式：禁用快速路径，允许 Grace Turn 恢复
+## 结论
 
-**验收标准**：
-- [ ] `deep` 模式下首轮无工具调用时触发 Grace Turn 而非直接退出
-- [ ] `quick` 模式下快速路径行为不变
+这个项目已经具备成为**通用 Agent Runtime 底座 + 以 research 为强项**的潜力。接下来的关键，不是继续证明它"能做一个更强的 research agent"，而是证明它"有能力不被 research 绑定，能扩展到 workflow / automation / coding 等更多场景"。
 
----
+因此，这份 Roadmap 的主旨是：
 
-### Phase 1 测试补全清单
-
-| 场景 | 测试文件 | 优先级 |
-|------|---------|--------|
-| Grace Turn 后 LLM 恢复调用工具（计数器重置） | `test_mainloop_tools.py` | P0 |
-| 停滞→恢复→再次停滞，消息角色序列合法性 | `test_mainloop_tools.py` | P0 |
-| Grace Turn 发生时上下文接近阈值，`manage_context` 被调用 | `test_mainloop_tools.py` | P0 |
-| 子 Agent 配置继承（`compact_keep_recent` 与主链一致） | `test_sub_agent.py` | P1 |
-| Registry merge 冲突时 WARNING 日志输出 | `test_context_manager.py` | P1 |
-| 多任务串行执行时 MCP 环境变量独立 | `test_tool_manager.py` | P1 |
-| `deep` 模式首轮无工具调用触发 Grace Turn | `test_mainloop_tools.py` | P1 |
-| 中文 nudge 文本路径（`chinese_context=True`） | `test_mainloop_tools.py` | P2 |
-
----
-
-### 2026-04-20 Review 新发现
-
-#### BUG-09 默认 context→env 注入设计争议 🟡
-
-**位置**：`tool/manager.py:62-83`（`_default_env_inject`）
-
-**问题**：默认注入逻辑把 context 顶层所有 string 字段塞成 MCP stdio subprocess 的环境变量。这带来：
-1. 用户身份（user_id, org_id 等）被 bake 进长期存活的 stdio 子进程 env
-2. 需要依赖 fingerprint 机制（`tool/manager.py:237-378`）做切换时 invalidate + rebuild
-3. 进程列表可能泄露敏感字段
-4. 用户理想的设计是：用户身份只通过 tool arguments 的 `_mcp_context` 传递（`tool/manager.py:783-795` 已实现），env 仅用于静态 secret（API key 等启动时固定的值）
-
-**修复方案（选项 A — 推荐）**：移除 `_default_env_inject` 中对 context 的自动遍历注入，仅保留 `TASK_ID` 等系统字段：
-```python
-def _default_env_inject(ctx):
-    server_params = ctx.server_params
-    if TASK_CONTEXT_VAR.get() is not None:
-        server_params.env["TASK_ID"] = TASK_CONTEXT_VAR.get()
-    return server_params
-```
-同时可以移除 `_compute_context_fingerprint` / `_session_context_fingerprints` / context-change invalidate 逻辑（约 50-80 行简化）。
-
-**替代（选项 C）**：加配置开关 `main_agent.tool_manager.auto_env_inject: false`，默认关闭；保持向后兼容。
-
-**验收标准**：
-- [ ] 方案决策（A vs C）
-- [ ] `_mcp_context` arguments 路径文档化为唯一推荐的身份传递方式
-- [ ] 若选 A：stdio session 可长期复用，无需 invalidate
-
----
-
-#### BUG-10 asyncio.gather 缺 return_exceptions 🔴 ✅ 已修复（2026-04-20）
-
-**位置**：`main_loop.py:2017-2040`
-
-**问题**：`agent_calls` 路径的 `asyncio.gather` 无 `return_exceptions=True`，CancelledError 传播导致其他并发子 Agent 被取消，MCP 会话泄漏，`_sub_agent_semaphore` permit 不释放 → 后续 spawn 死锁。
-
-**修复**：加 `return_exceptions=True` + 异常归一化为错误元组，保证 offload/transcript 和信号量释放照常完成。
-
----
-
-#### BUG-11 AgentFactory.close() 异常未隔离 🔴 ✅ 已修复（2026-04-20）
-
-**位置**：`agent_factory.py:357-384`
-
-**问题**：任一 tool_manager `close_sessions()` 抛错就中断后续清理，遗留 subprocess/pipe。
-
-**修复**：逐个 try/except，记录失败集合，保证所有 tool_manager 都被尝试清理。
-
----
-
-#### BUG-12 TodoTracker / FileStateCache / Transcript 未加锁 🟡 ✅ 已修复（2026-04-20）
-
-**位置**：`todo_tracker.py`、`file_state_cache.py`、`transcript.py`
-
-**问题**：`SessionMemory` 已加 `threading.Lock`，但这三个模块未加。主 Agent 与子 Agent 并发访问时 list/dict 可能 race。
-
-**修复**：三个模块统一加 `threading.Lock`，iteration 路径改为 snapshot。
-
----
-
-#### BUG-13 scrape_max_length schema/env 不一致 🟡
-
-**位置**：`config_schema.py:248` vs `orchestrator.py:297-300`
-
-**问题**：`scrape_max_length` 在 `MonitoringConfigSchema` 中定义，但运行时通过 `os.getenv("SCRAPE_MAX_LENGTH", ...)` 读取，YAML 配置被忽略。
-
-**修复方向**：在 `MainAgentConfig` 中暴露此字段，读取链统一走 config。
-
----
-
-#### BUG-14 response_language 未用 Literal 约束 🟢
-
-**位置**：`config_schema.py:354`
-
-**问题**：`response_language: str` 接受任意字符串，容易拼写错误后静默走 fallback。
-
-**修复方向**：改为 `Literal["auto", "Chinese", "English", ...]`，明确可选值集合。
-
----
-
-#### BUG-15 @file 路径无白名单 🟡 ✅ 复核已实现
-
-**位置**：`input_compiler.py`
-
-**复核结论（2026-04-20）**：多层防护已存在，原 review 误判。
-
-已实现的防护：
-1. **敏感文件黑名单**（`input_compiler.py:68-79, 183-192`）：`.env`、SSH keys 等无条件拒绝
-2. **可选 allowlist**（`input_compiler.py:87, 194-206`）：配置 `input_process.file_ref_allowed_dirs` 后只读白名单目录
-3. **配置字段已暴露**（`config_schema.py:139-142`）：`InputProcessConfig.file_ref_allowed_dirs`
-4. **realpath 规范化**（`input_compiler.py:179`）：防符号链接绕过
-5. **50KB 大小上限**（`input_compiler.py:213-215`）：防大文件 OOM
-
-默认不限制是刻意设计（向后兼容 CLI 场景）。多租户生产环境在 agent.yaml 显式配置：
-```yaml
-main_agent:
-  input_process:
-    file_ref_allowed_dirs: [/app/data, /app/uploads]
-```
-
----
-
-#### BUG-16 硬编码 0.6 未用 CONTEXT_REDUCTION_TARGET_RATIO 🟢 ✅ 已修复（2026-04-20）
-
-**位置**：`llm_call_handler.py:478`
-
-**修复**：替换为 `CONTEXT_REDUCTION_TARGET_RATIO` 常量。
-
----
-
-#### BUG-17 命名 Sub-Agent offload 孤儿 🔴 ✅ 已修复（2026-04-20）
-
-**位置**：`sub_agent_runner.py` `_run_configured_sub_agent`（`run` 方法）
-
-**问题**：命名 sub-agent（`sub_agents.<name>` 配置的）创建独立 `ContextManager` 并可能产生 offload 文件，但 `finally` 块**不调用** `merge_offload_registry`（只有 spawn 路径做了）。主 Agent 的 `cleanup_offload_files()` 只看自己的 registry，**命名 sub-agent 的 offload 文件全部变孤儿**。
-
-**修复**：
-1. `SubAgentRunner.run()` 新增 `parent_context_manager` keyword 参数
-2. 创建 sub-agent `ContextManager` 时传入 parent（已触发 inherit_with_override + 共享 offload_dir）
-3. `finally` 块调用 `parent_context_manager.merge_offload_registry(context_manager)`，merge 失败仅 WARNING
-4. 主 loop 调用点（`main_loop.py:2028`）传入 `self.context_manager`
-
-**验收标准**：
-- [x] 命名 sub-agent 产生的 offload 文件能被主 agent `cleanup_offload_files` 清理
-- [x] merge 失败不阻塞 sub-agent 返回
-
----
-
-### BUG-13 scrape_max_length 复核（2026-04-20）
-
-核对代码后发现原 Review 报告误报：`orchestrator.py:292-300` 已经是"YAML config → env → default"的正确读取顺序。`ensure_dict(cfg.main_agent.get("monitoring", {}))` 不会被 Pydantic default 污染。**标记为非 bug，已关闭**。
-
----
-
-### BUG-14 response_language Literal 复核（2026-04-20）
-
-由于检测和用户自定义都可能返回任意语言名（`detect_language_by_chars` 仅覆盖四种，LLM 可能输出更多），改为**软验证**：`field_validator` 对未知值打 WARNING 但不阻塞，已知语言列表集中在 `_KNOWN_RESPONSE_LANGUAGES`。
-
----
-
-### Phase 1 出口标准
-
-- [x] BUG-04 / BUG-05 / BUG-07 修复完成
-- [x] BUG-01 / BUG-02 / BUG-03 / BUG-08：grace turn 机制整体移除，源头消失
-- [x] Review 新发现 BUG-10 / BUG-11 / BUG-12 / BUG-14 / BUG-16 / BUG-17 修复完成
-- [x] 全部回归测试通过（543 passed，零 regression）
-- [ ] BUG-06 / BUG-09 设计决策（MCP 默认 context→env 注入）
-- [ ] BUG-13 复核已证非 bug；BUG-15 复核已证已实现
-- [ ] `ruff check` 零错误
-- [ ] 版本号 bump + release（v1.2.5 或更高，含 grace turn 移除的 breaking notice）
-- [ ] CHANGELOG 更新，包含 BUG-07 方案 B 的配置迁移指南 + grace turn 移除说明
-
----
-
-## Phase 2：v1.3.0 契约收敛与架构整理
-
-**目标**：统一框架内部数据契约，建立端到端集成测试框架，为架构演进提供安全网。
-
-**入口条件**：Phase 1 完成，所有高优 Bug 已修复且有回归测试。
-
-### 任务清单
-
-#### 契约统一
-
-| 任务 | 说明 | 优先级 |
-|------|------|--------|
-| 统一 `tool_definitions` 数据结构 | 消除 MCP server 风格和 builtin tool 单体 dict 的混用，提供统一 `ToolDefinition` 类型 | P0 |
-| 定义 `RuntimeSnapshot` 最小字段集 | 支持主/子 Agent 间状态传递和跨会话 resume 的最小接口（不含 SessionMemory 深度重构） | P0 |
-| 收口结果生命周期契约 | 明确 tool result 从产生→offload→restore 的完整状态机，文档化并加断言保护 | P1 |
-| 理清 Fast-path 与 Grace Turn 状态机 | 消除两者的逻辑冲突，用状态机图文档化互斥关系 | P1 |
-
-#### 语言同步修复
-
-| 任务 | 说明 |
-|------|------|
-| 统一 `orchestrator.py` 和 `main_loop.py` 的语言同步逻辑 | `auto` 模式下检测后同步更新 `PromptBuilder`、`inline_skill_selector` 等组件 |
-| 验证 `on_hook_offload_evidence_prep` 返回非 string 时的 WARNING 日志 | 低成本改善 hook 实现者的调试体验 |
-
-#### 端到端测试框架
-
-| 任务 | 说明 | 优先级 |
-|------|------|--------|
-| 搭建 E2E 测试基础设施（mock LLM + mock MCP server） | 为 `DeepResearch.run()` 提供可测试的环境 | P0 |
-| 覆盖核心链路：run → offload → cleanup | 验证完整生命周期 | P0 |
-| 覆盖异常场景：LLM 调用失败、token 溢出、子 Agent 异常退出 | 至少 3 个异常场景 | P1 |
-| 覆盖 Grace Turn 与反思轮的交互 | 防止无限循环风险 | P1 |
-
-#### 架构整理（轻量）
-
-| 任务 | 说明 |
-|------|------|
-| `MainLoopRunner` 接口抽取 | 仅抽取策略接口（`ModeResolver`、`ResultLifecycleManager`），实现不变；为 Phase 3 拆分做准备 |
-| `parent_context_manager` 参数类型注解 | 加 `ContextManager \| None` 注解，启用静态分析 |
-| 条件性：`@file` 安全边界加固 | 如 Phase 0 安全审查确认风险，引入 Project-root Allowlist 机制 |
-
-### Phase 2 出口标准
-
-- [ ] `ToolDefinition` 统一数据结构，无特殊分支处理
-- [ ] `RuntimeSnapshot` 接口已定义并支持基本 resume 场景
-- [ ] E2E 测试覆盖核心链路 + 至少 3 个异常场景
-- [ ] Fast-path 与 Grace Turn 无状态冲突（E2E 测试验证）
-- [ ] `MainLoopRunner` 策略接口已声明（`ModeResolver` 等接口定义）
-
----
-
-## Phase 3：v1.4.0 质量体系与长期演进
-
-**目标**：建立可持续的质量保障体系，完成架构拆分，为记忆系统和高级 Agent 能力奠定基础。
-
-**入口条件**：Phase 2 完成，E2E 测试就位，接口已抽取。
-
-### 任务清单
-
-#### 质量体系
-
-| 任务 | 说明 |
-|------|------|
-| 建立分层 benchmark 体系 | 单元 → 集成 → E2E → 性能，CI 门禁全部通过才能合入 |
-| 完善公共入口测试覆盖 | `DeepResearch.run()`、`AgentFactory.run_batch()` 等 |
-| 规范 release 工程流程 | 版本号 bump 自动化、CHANGELOG 生成、tag 创建、CI/CD 门禁 |
-
-#### 架构演进
-
-| 任务 | 说明 | 风险 |
-|------|------|------|
-| `MainLoopRunner` 完整策略拆分 | 基于 Phase 2 抽取的接口，拆分为 `ModeResolver`、`ResultLifecycleManager` 等独立模块 | 高风险重构，需 E2E 测试作为安全网 |
-| `RuntimeSnapshot` 完整实现 | 支持跨会话 resume，含 `SessionMemory` 基础序列化 | 序列化兼容性问题 |
-| 温度覆盖 `ContextVar` 隔离审查 | 确认多客户端/父子 Agent 间是否存在串扰，必要时改为实例字段 | 需确认子 Agent 调用方式（`create_task` vs `await`） |
-
-#### 长期演进（RFC 阶段）
-
-| 方向 | 说明 |
-|------|------|
-| 记忆系统深度重构 | `SessionMemory` + `LongTermMemory` 的统一接口、持久化策略、跨 session 检索 |
-| 高级 Agent 能力 | 多 Agent 协作协议、Agent 间通信、动态工具发现 |
-
-### Phase 3 出口标准
-
-- [ ] CI 门禁包含分层测试（单元 + 集成 + E2E），全部通过才能合入
-- [ ] `RuntimeSnapshot` 支持完整跨会话 resume（E2E 测试验证）
-- [ ] `MainLoopRunner` 已拆分为至少 3 个独立模块，各模块有独立单元测试
-- [ ] Release 流程自动化（版本号 bump、CHANGELOG 生成、tag 创建）
-- [ ] 记忆系统重构 RFC 完成评审
-
----
-
-## 待决策事项（Open Questions）
-
-| 问题 | 决策期限 | 影响范围 |
-|------|---------|---------|
-| 配置契约修复策略：方案 A（渐进迁移）vs 方案 B（一次性收口） | Phase 0 | Phase 1 实施方式 |
-| `@file` 指令是否存在安全越权风险 | Phase 0 | 是否提升至 Phase 1 |
-| 子 Agent 配置继承：完全继承 vs `inherit_with_override` | Phase 1 启动前 | BUG-04 设计方向 |
-| `RuntimeSnapshot` 最小字段集范围 | Phase 1 完成后 | Phase 2 工作量 |
-| `MainLoopRunner` 拆分深度与时机 | Phase 2 完成后 | Phase 3 风险评估 |
-| 温度覆盖 `ContextVar` 串扰风险 | Phase 3 启动前 | 是否需要架构变更 |
-
----
-
-## 历史规划文档归档说明
-
-| 文档 | 状态 | 说明 |
-|------|------|------|
-| `docs/15-technical-roadmap.md` | DEPRECATED | 使用 v1.2.3/v1.3/v1.4 版本号体系，已被本文档取代 |
-| `docs/17-repo-architecture-review.md` | DEPRECATED | 使用 P0/P1/P2 优先级体系，已被本文档取代 |
-| `docs/19-framework-issues-and-iteration-plan.md` | DEPRECATED | 使用阶段体系，已被本文档取代 |
-| `docs/arena-review-offload-pipeline.md` | 历史参考 | Offload 流水线专项 Arena Review，保留作为背景材料 |
-
----
-
-*本文档由 Arena 三模型评审（Claude Opus / Gemini 3.1-pro-preview / DeepSeek-R1）综合分析生成，2026-04-17。*
+**先把运行时 contract 收紧，然后把 deep research 从主循环降级为 profile，补上 workflow layer 雏形，最后把质量、observability 和发布体系补齐。**
