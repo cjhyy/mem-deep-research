@@ -72,8 +72,12 @@ SUB_AGENT_PREFIX = "agent-"
 # Default max concurrent sub-agents
 DEFAULT_MAX_CONCURRENT_SUBAGENTS = 3
 
-# Default threshold for offloading large tool results to filesystem
-DEFAULT_RESULT_OFFLOAD_THRESHOLD = 5000
+# Default threshold for offloading large tool results to filesystem.
+# 0 = disabled by default: offload writes files to disk and has environment
+# prerequisites (writable output_dir, filesystem available). Users who want
+# offload should set this explicitly in main_agent.context_manager config
+# (a common value is 5000, matching the example projects).
+DEFAULT_RESULT_OFFLOAD_THRESHOLD = 0
 
 # Session memory: minimum line length to qualify as a "finding"
 MIN_FINDING_LINE_LEN = 30

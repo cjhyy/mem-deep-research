@@ -274,6 +274,9 @@ class ContextManager:
         # Session memory 引用（由 MainLoopRunner 注入，供 SessionMemoryCompactStrategy 使用）
         self._session_memory = None
 
+        # Profile 引用（Phase 2a：用于 on_compact 触发 extraction strategy 链）
+        self._profile = None
+
         # Offload directory for large results
         self._offload_dir: str = ""
 
@@ -322,6 +325,13 @@ class ContextManager:
     def set_session_memory(self, session_memory) -> None:
         """注入 SessionMemory 引用（供 SessionMemoryCompactStrategy 使用）"""
         self._session_memory = session_memory
+
+    def set_profile(self, profile) -> None:
+        """注入 Profile 引用（Phase 2a：供 on_compact 触发 extraction strategy 链）。
+
+        Profile 必须实现 run_strategies_on_compact(summary, up_to_turn, ctx) async 方法。
+        """
+        self._profile = profile
 
     def set_offload_dir(self, path: str) -> None:
         """Set the directory for offloading large results."""
@@ -1230,6 +1240,7 @@ class ContextManager:
             compacted_turns=self._compacted_turns,
             estimate_tokens_fn=self._token_estimator,
             session_memory=self._session_memory,
+            profile=self._profile,
         )
 
     def manage_context(

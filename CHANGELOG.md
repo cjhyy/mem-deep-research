@@ -1,5 +1,107 @@
 # Changelog
 
+## v1.2.6 (2026-04-22)
+
+**Profile 架构落地 — 通用 Agent Runtime + 可插拔 Profile / Strategy 层**
+
+这是一个向后兼容的架构新增版本。把之前散落在主循环里 29 处 `is_deep_mode` / `is_quick_mode` 研究专属分支，重构成可插拔的 `Profile` 抽象，并把"大工具结果细节保鲜"的三种机制统一到 `MemoryExtractionStrategy` 层。
+
+定位转向：从"研究型 Agent 框架"向"通用 Agent Runtime + research 作为高级执行 profile"演进。research 行为由 `DeepResearchProfile` 聚合并保持等价，其他 profile 可零侵入接入。
+
+### Profile 抽象（`core/profiles/`）
+
+- **`Profile` ABC**：10 个生命周期钩子覆盖 agent_start / turn_start / reflection / LLM 响应 / pre-post tool / verify / final answer；默认 pass-through
+- **`StandardProfile`**：通用 agent profile，所有 lifecycle 钩子空实现
+- **`DeepResearchProfile`**：聚合研究专属决策
+  - `should_inject_reflection` / `should_run_verify` / `should_create_task_plan` / `should_process_inline_skills`：mode 感知的 policy 决策
+  - `needs_final_summary`：deep + 有工具调用时强制 summary，其他情况遵循用户配置
+  - 配置字段：`reflection_enabled` / `enable_verify` / `generate_summary` / `auto_task_plan`
+- **Registry**：`resolve_profile` 接受 str / class / instance / None；`register_profile` 支持自定义 profile
+- **Orchestrator** 按 `execution_mode` 自动路由：`deep` / `auto` / `task_engine.enabled` → `DeepResearchProfile`，其他 → `StandardProfile`
+
+### Memory Extraction Strategy 层（`memory_extraction/`）
+
+统一"长任务细节保鲜"的可插拔扩展点，所有 strategy 通过 `profile.extraction_strategies` 组合：
+
+- **4 个触发点**：`on_llm_response` / `on_tool_result` / `on_compact` / `on_offload`
+- **3 个默认 strategy**（StandardProfile 含前两个，DeepResearchProfile 全含）
+  - `OffloadEvidenceStrategy`：`<offload_evidence ref="...">` 绑定到 offload registry（所有 profile）
+  - `SummaryEvidenceStrategy`：LLM 压缩 summary 的 `## Evidence` 段抽取（所有 profile）
+  - `EvidenceTagStrategy`：自由 `<evidence>` tag 抽取到 session_memory（仅 DeepResearch）
+- **2 个 opt-in strategy**（用户按需配置）
+  - `FactExtractionStrategy`：工具结果回来后用轻量 LLM 抽 facts，内置 `(tool, content_hash)` 去重集合，resume-safe
+  - `SummarizeOnCompactStrategy`：LLMSummarize 的整段 summary 作为 compact_anchor 存 session_memory（LangGraph / Mastra "memory is summary" 风格）
+- **Vector store / RAG 接入**不作为内置 strategy 提供（每个 vector store client / embedding model / chunk 策略差异太大，框架给不出真正通用的抽象）。用户继承 `MemoryExtractionStrategy` 在项目内实现，通过 `register_strategy` 注册即可，参考 `docs/26-memory-extraction-strategy.md` 的"用户自定义 Strategy 示例"章节
+- **Snapshot / Restore**：每个 strategy 独立 state，Profile 递归聚合，为后续 HITL resume 准备
+- **Registry**：`resolve_strategy` / `register_strategy` / `list_strategies` 支持自定义
+
+### Runtime 改造
+
+- `MainLoopRunner` 加 `profile` 字段 + `_build_profile_ctx` / `_build_extraction_ctx` helper
+- **29 处 `is_deep_mode` / `is_quick_mode` 功能性分支 → 1 处**（仅保留 adaptive 路由的 runtime 状态同步）
+- 具体迁移：
+  - `main_loop.py:807` task planner injection → `profile.should_create_task_plan`
+  - `main_loop.py:1209` inline skill selection → `profile.should_process_inline_skills`
+  - `main_loop.py:1668` reflection checkpoint → `profile.should_inject_reflection`
+  - `main_loop.py:1780` verify checkpoint → `profile.should_run_verify`
+  - `main_loop.py:1801` summary policy → `profile.needs_final_summary`
+- `_maybe_offload_result` 转 async，triggers `profile.run_strategies_on_offload`
+- `context_manager` / `window_strategy` 加 profile 注入路径，LLMSummarize 触发 `on_compact` strategy 链
+- Runtime 统一对最终输出做 tag 清理（`<evidence>` / `<offload_evidence>`），strategy 只读写 session_memory
+
+### 配置 API
+
+```python
+# 内置 profile
+dr = DeepResearch(profile="deep_research", profile_config={...})
+
+# 自定义 profile
+dr = DeepResearch(profile=MyProfile(), profile_config={...})
+
+# strategy 追加（保留默认）
+profile_config={"extraction_strategies_extra": [FactExtractionStrategy(...)]}
+
+# strategy 完全覆盖
+profile_config={"extraction_strategies": [MyCustomStrategy(...)]}
+```
+
+### 默认行为调整（潜在影响）
+
+**Offload 默认关闭** — `DEFAULT_RESULT_OFFLOAD_THRESHOLD` 从 `5000` 改为 `0`（关闭）：
+
+- **原因**：offload 对环境有预期（output_dir 可写、文件系统可用），不应默认打开
+- **示例项目**：`example_project/config/*.yaml` 里一直显式设 `result_offload_threshold: 5000`，不受影响
+- **你需要做什么**：如果你之前依赖默认值，显式在配置里加 `main_agent.context_manager.result_offload_threshold: 5000`（或其他合适的字节数）
+
+**`[OFFLOAD PREP]` sidecar 注入改为跟随 `OffloadEvidenceStrategy` 的存在**：
+
+- 原来：只要有 offload 候选就注入 sidecar prompt 要求 LLM 产 `<offload_evidence>`，无论 profile 是否会抽取
+- 现在：只有 profile 的 `extraction_strategies` 里含 `OffloadEvidenceStrategy` 时才注入
+- **原因**：如果没有 strategy 消费 tag，sidecar 白占 prompt tokens
+- **StandardProfile 和 DeepResearchProfile 的默认 strategies 都含 `OffloadEvidenceStrategy`**，所以 98% 用户无感
+- 仅当你显式用 `extraction_strategies=[...]` 覆盖且不含 `OffloadEvidenceStrategy` 时，sidecar 才不再注入（这是期望行为）
+
+### 向后兼容
+
+- 既有 `execution_mode` / `task_engine` / `generate_summary` / `task_engine.enabled` 配置不变，通过 `Orchestrator` 路由自动映射到合适的 profile
+- Research 场景行为 100% 等价（`DeepResearchProfile` 默认带 `[OffloadEvidence, SummaryEvidence, EvidenceTag]` strategies，对应原硬编码抽取集合）
+- 543 + 95 个新测试 = 638 tests pass, zero regression
+
+### 设计文档
+
+- `docs/21-industry-framework-analysis.md`：业界框架对比 + 定位转向依据
+- `docs/22-profile-boundary.md`：Runtime / Profile 边界盘点（9 个核心模块全量分类）
+- `docs/25-profile-contract.md`：Profile 契约设计（10 个决策汇总）
+- `docs/26-memory-extraction-strategy.md`：Strategy 层最终设计（10 个决策 + 3 阶段实施）
+
+### Roadmap 调整
+
+原 `docs/20-roadmap.md` 把 Profile 拆分放在 v1.4.0，但工程顺序上"先拆 profile 再收口 contract"更合理（profile 明确了 runtime contract 的消费方边界）。因此本次提前实施了原 v1.4.0 的 Profile 主题。原 v1.3.0 的 "Runtime Contract 收敛"（统一结果生命周期 / 配置契约全量收口 / 端到端回归测试）重排到下一个 minor 版本。
+
+### 测试
+
+**638 passed**（v1.2.5 时 543；Phase 2a +33，Phase 2b +18，Phase 2c +17，Phase 1 测试修正 +1）
+
 ## v1.2.5 (2026-04-20)
 
 **循环退出机制对齐 Claude Code** — 移除 grace turn，使用 `stop_reason` / `finish_reason` 作为唯一退出信号。

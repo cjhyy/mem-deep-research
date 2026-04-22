@@ -79,6 +79,9 @@ class WindowContext:
     # Session memory（供 SessionMemoryCompactStrategy 使用）
     session_memory: Any = None  # Optional[SessionMemory]
 
+    # Profile 引用（Phase 2a：供 LLMSummarize 后触发 extraction strategy 链）
+    profile: Any = None
+
 
 @dataclass
 class CompressResult:
@@ -678,8 +681,25 @@ class LLMSummarizeStrategy(WindowStrategy):
             self._summary_text = summary
             self._summarized_up_to_turn = cutoff_turn
 
-            # 从 LLM 摘要中提取 Evidence 部分，存入 session_memory
-            if ctx.session_memory is not None:
+            # 触发 extraction strategy 链的 on_compact（Phase 2a）
+            # SummaryEvidenceStrategy 会从 summary 的 ## Evidence 段抽取细节存 session_memory
+            # 兼容：ctx.profile 未注入时走老逻辑（直接调 _extract_evidence_from_summary）
+            if ctx.profile is not None and ctx.session_memory is not None:
+                from mem_deep_research_core.memory_extraction import ExtractionContext
+
+                ext_ctx = ExtractionContext(
+                    turn_number=cutoff_turn,
+                    task_description="",
+                    mode="",
+                    session_memory=ctx.session_memory,
+                    context_manager=None,  # on_compact 下 strategies 不应碰 context_manager
+                    llm_client=None,
+                )
+                await ctx.profile.run_strategies_on_compact(
+                    summary, cutoff_turn, ext_ctx,
+                )
+            elif ctx.session_memory is not None:
+                # Fallback：没 profile 就保留老行为（测试/轻量使用场景）
                 self._extract_evidence_from_summary(summary, cutoff_turn, ctx.session_memory)
 
             logger.info(

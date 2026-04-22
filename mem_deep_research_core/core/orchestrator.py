@@ -819,6 +819,24 @@ class Orchestrator:
     def _create_main_loop_runner(self) -> MainLoopRunner:
         """创建主循环运行器"""
         from mem_deep_research_core.core.main_loop import MainLoopContext
+        from mem_deep_research_core.core.profiles import DeepResearchProfile, StandardProfile
+
+        # Profile 路由（Phase 2a）：根据 execution_mode / task_engine 选 profile
+        # - deep / auto / task_engine 启用 → DeepResearchProfile（含研究专属 strategies）
+        # - 其他 → StandardProfile
+        # auto 在运行时可能升级为 deep，所以 auto 默认走 DeepResearchProfile
+        # （DeepResearchProfile 的 strategies 是 Standard 的超集，无副作用）
+        _task_engine_enabled = False
+        try:
+            _te = self.cfg.main_agent.get("task_engine", {}) or {}
+            _task_engine_enabled = bool(_te.get("enabled", False))
+        except Exception:
+            pass
+        _profile_instance = (
+            DeepResearchProfile()
+            if self.execution_mode in ("deep", "auto") or _task_engine_enabled
+            else StandardProfile()
+        )
 
         ctx = MainLoopContext(
             cfg=self.cfg,
@@ -854,6 +872,7 @@ class Orchestrator:
             skill_commands=self.skill_commands,
             router_llm_client=self.router_llm_client,
             config_loader=self.runtime.config_loader,
+            profile=_profile_instance,
         )
         return MainLoopRunner(ctx)
 

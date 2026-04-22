@@ -83,7 +83,7 @@ main_agent:
     compact_at_ratio: 0.6
     summarize_at_ratio: 0.8
     compact_keep_recent: 3
-    result_offload_threshold: 5000  # 大结果卸载到文件
+    result_offload_threshold: 5000  # 大结果卸载到文件（默认 0 = 关闭；需要 output_dir 可写）
 
   # Monitoring — prevents infinite loops
   monitoring:

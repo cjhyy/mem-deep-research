@@ -134,6 +134,32 @@ class MainLoopContext:
     # ConfigLoader instance (optional, needed for spawning sub-agents)
     config_loader: Any = None
 
+    # Profile instance (v1.4.0 Phase 1)
+    # 默认 StandardProfile（全空实现），主循环钩子调用点已接入但 runtime 行为不变。
+    # Phase 2 将把当前研究专属分支迁移到 DeepResearchProfile。
+    profile: Any = None
+
+
+@dataclass
+class _ProfileContextView:
+    """ProfileContext 协议的轻量实现 — 封装 runtime 的运行时状态快照。
+
+    每个 profile 钩子调用点构造一个新的 view（廉价），避免 profile 拿到 runner 的所有方法。
+    字段由 MainLoopRunner 在钩子调用点填充。
+    """
+    turn_number: int
+    task_description: str
+    mode: str
+    tool_calls_executed: int
+    assistant_response_text: str
+    last_assistant_text: str
+    message_history: list
+    session_memory: Any
+    todo_tracker: Any
+    context_manager: Any
+    llm_client: Any
+    hooks: Any
+
 
 def _get_spawn_agent_tool_definition() -> dict:
     """Built-in spawn_agent tool — MCP server format for system prompt rendering."""
@@ -540,6 +566,11 @@ class MainLoopRunner:
         self.router_llm_client = ctx.router_llm_client
         self.config_loader = ctx.config_loader
 
+        # Profile 解析（v1.4.0 Phase 1）
+        # 默认 StandardProfile，钩子全 no-op，行为与未接入前一致。
+        from mem_deep_research_core.core.profiles import resolve_profile
+        self.profile = resolve_profile(ctx.profile)
+
         # Session memory (within-run structured memory, survives context compression)
         self.session_memory = SessionMemory()
 
@@ -556,6 +587,55 @@ class MainLoopRunner:
 
         # 运行时上下文引用（在 run() 中设置）
         self._current_system_prompt: str = ""
+
+    def _build_profile_ctx(
+        self,
+        *,
+        turn_number: int = 0,
+        task_description: str = "",
+        mode: str = "",
+        tool_calls_executed: int = 0,
+        assistant_response_text: str = "",
+        last_assistant_text: str = "",
+        message_history: list | None = None,
+    ) -> "_ProfileContextView":
+        """构造一个 ProfileContext view，传递给 profile 钩子。
+
+        Runtime 状态只读暴露；profile 不应写回这些对象，只能通过钩子返回值影响主循环。
+        """
+        return _ProfileContextView(
+            turn_number=turn_number,
+            task_description=task_description,
+            mode=mode,
+            tool_calls_executed=tool_calls_executed,
+            assistant_response_text=assistant_response_text,
+            last_assistant_text=last_assistant_text,
+            message_history=message_history if message_history is not None else [],
+            session_memory=self.session_memory,
+            todo_tracker=self.todo_tracker,
+            context_manager=self.context_manager,
+            llm_client=self.llm_client,
+            hooks=self.hooks,
+        )
+
+    def _build_extraction_ctx(
+        self,
+        *,
+        turn_number: int,
+        mode: str,
+        task_description: str = "",
+    ):
+        """构造 ExtractionContext，传递给 profile 的 strategy 链。"""
+        from mem_deep_research_core.memory_extraction import ExtractionContext
+
+        return ExtractionContext(
+            turn_number=turn_number,
+            task_description=task_description,
+            mode=mode,
+            session_memory=self.session_memory,
+            context_manager=self.context_manager,
+            llm_client=self.llm_client,
+        )
 
     def _record_event(self, event_type, data=None, turn=0, ref_event_id=None, duration_ms=None):
         """Record a transcript event (no-op if transcript not configured)."""
@@ -606,6 +686,8 @@ class MainLoopRunner:
         self.context_manager.reset()
         self.session_memory = SessionMemory()  # Reset session memory between runs
         self.context_manager.set_session_memory(self.session_memory)
+        # Phase 2a：注入 profile，让 window_strategy 在 on_compact 时触发 strategy 链
+        self.context_manager.set_profile(self.profile)
 
         # Token budget tracker
         task_token_budget = self.cfg.main_agent.get("task_token_budget", DEFAULT_TASK_TOKEN_BUDGET)
@@ -711,8 +793,26 @@ class MainLoopRunner:
                 f"stripped {stripped} heavy tools, no reflection/skills"
             )
 
-        # 自动任务分解（仅深度研究模式 + auto_planning 启用时，quick 模式跳过）
-        if self.task_planner.enabled and not is_quick_mode:
+        # Profile hook: on_agent_start（Phase 1 no-op for StandardProfile）
+        await self.profile.on_agent_start(
+            self._build_profile_ctx(
+                turn_number=0,
+                task_description=task_description,
+                mode=effective_mode,
+                message_history=message_history,
+            )
+        )
+
+        # 自动任务分解（Phase 2c：profile 决定是否允许，task_planner.enabled 决定是否可用）
+        _profile_ctx_for_plan = self._build_profile_ctx(
+            turn_number=0,
+            task_description=task_description,
+            mode=effective_mode,
+            message_history=message_history,
+        )
+        if self.task_planner.enabled and await self.profile.should_create_task_plan(
+            _profile_ctx_for_plan
+        ):
             plan = await self.task_planner.create_plan(
                 task_description=task_description,
                 llm_client=self.llm_client,
@@ -745,6 +845,18 @@ class MainLoopRunner:
             self.context_manager.set_turn(turn_count)
             self._record_event("turn_start", {"turn": turn_count}, turn=turn_count)
             logger.debug(f"\n--- Main Agent Turn {turn_count} ---")
+
+            # Profile hook: on_turn_start（Phase 1 no-op for StandardProfile）
+            await self.profile.on_turn_start(
+                self._build_profile_ctx(
+                    turn_number=turn_count,
+                    task_description=task_description,
+                    mode=effective_mode,
+                    tool_calls_executed=total_tool_calls_executed,
+                    last_assistant_text=last_assistant_text,
+                    message_history=message_history,
+                )
+            )
 
             # Hook: on_turn_start
             self.hooks.call(
@@ -823,11 +935,19 @@ class MainLoopRunner:
             self.context_manager.microcompact(message_history, turn_count, keep_recent=keep_recent)
 
             # Phase 2: 标记即将滑出窗口的旧大结果，注入 sidecar prompt 要求产 evidence
+            # sidecar 注入和 OffloadEvidenceStrategy 配对：只有当 profile 启用了该
+            # strategy 时，让 LLM 产 <offload_evidence> 才有消费者；否则 sidecar 纯粹
+            # 浪费 prompt tokens。用户可通过 profile_config.extraction_strategies
+            # 显式移除 OffloadEvidenceStrategy 来禁用 evidence-based 细节保鲜。
             offload_candidates = self.context_manager.prepare_offload_candidates(
                 message_history, turn_count, keep_recent=keep_recent
             )
             _offload_prep_injected = False
-            if offload_candidates:
+            _has_offload_evidence_strategy = any(
+                getattr(s, "name", "") == "offload_evidence"
+                for s in getattr(self.profile, "extraction_strategies", [])
+            )
+            if offload_candidates and _has_offload_evidence_strategy:
                 candidate_lines = []
                 for c in offload_candidates:
                     tools = ", ".join(c.get("tool_names", [])) or "unknown"
@@ -897,6 +1017,26 @@ class MainLoopRunner:
             _perf_llm_elapsed = time.perf_counter() - _perf_llm_start
             _perf_total_llm_time += _perf_llm_elapsed
             self.task_log.append_perf("llm_call_durations", _perf_llm_elapsed)
+
+            # Profile hook: on_llm_response
+            # Phase 1 StandardProfile pass-through；Phase 2 DeepResearchProfile 将接管
+            # evidence 抽取等研究专属后处理。钩子在 should_break 判断前触发，保证
+            # 即使 LLM 一轮 end_turn 直接收尾，profile 也能看到响应。
+            if assistant_response_text:
+                profile_processed = await self.profile.on_llm_response(
+                    assistant_response_text,
+                    self._build_profile_ctx(
+                        turn_number=turn_count,
+                        task_description=task_description,
+                        mode=effective_mode,
+                        tool_calls_executed=total_tool_calls_executed,
+                        assistant_response_text=assistant_response_text,
+                        last_assistant_text=last_assistant_text,
+                        message_history=message_history,
+                    ),
+                )
+                if profile_processed is not None and profile_processed != assistant_response_text:
+                    assistant_response_text = profile_processed
 
             # Token budget: 记录本轮消耗并检查
             if token_budget.enabled:
@@ -1073,8 +1213,18 @@ class MainLoopRunner:
                 )
                 self.llm_client.set_temperature_boost(boost=temp_boost, cap=temp_cap)
 
-            # Inline Skill: 从 LLM 回复中解析 <next_skills>，下一轮动态注入（quick 模式跳过）
-            if not is_quick_mode and self.inline_skill_selector and assistant_response_text:
+            # Inline Skill: 从 LLM 回复中解析 <next_skills>，下一轮动态注入
+            # Phase 2c: profile 决定是否启用（StandardProfile: 否；DeepResearchProfile: quick 外启用）
+            _skill_profile_ctx = self._build_profile_ctx(
+                turn_number=turn_count,
+                task_description=task_description,
+                mode=effective_mode,
+                tool_calls_executed=total_tool_calls_executed,
+                last_assistant_text=last_assistant_text,
+                message_history=message_history,
+            )
+            _process_skills = await self.profile.should_process_inline_skills(_skill_profile_ctx)
+            if _process_skills and self.inline_skill_selector and assistant_response_text:
                 next_skills = self.inline_skill_selector.update_pending_skills(
                     assistant_response_text
                 )
@@ -1135,11 +1285,23 @@ class MainLoopRunner:
                         )
                     logger.info(f"[InlineSkill] Processed skills for next turn: {next_skills}")
 
-            # 处理 offload evidence（在 should_break 之前，确保最终回合也能解析）
-            if assistant_response_text and _offload_prep_injected:
-                cleaned = _extract_offload_evidence(
-                    assistant_response_text, self.context_manager
+            # Memory extraction strategy 链（Phase 2a）
+            # Profile 决定跑哪些 strategy：
+            # - OffloadEvidenceStrategy: 抽 <offload_evidence>（所有 profile 默认）
+            # - EvidenceTagStrategy: 抽 <evidence>（DeepResearchProfile 默认）
+            # - SummaryEvidenceStrategy: 在 on_compact 触发，不在这
+            # Runtime 在 strategy 链后统一清理 tag（保证输出干净）
+            if assistant_response_text:
+                ext_ctx = self._build_extraction_ctx(
+                    turn_number=turn_count,
+                    mode=effective_mode,
+                    task_description=task_description,
                 )
+                assistant_response_text = await self.profile.run_strategies_on_llm_response(
+                    assistant_response_text, ext_ctx,
+                )
+                # Runtime 统一清理 tag（strategy 不负责）
+                cleaned = _clean_evidence(assistant_response_text)
                 if cleaned != assistant_response_text:
                     assistant_response_text = cleaned
                     _strip_evidence_from_last_assistant(message_history)
@@ -1366,17 +1528,21 @@ class MainLoopRunner:
                 executed_results = all_tool_results_with_id[: len(to_execute)]
                 self.context_manager.register_tool_results(to_execute, executed_results, turn_count)
 
-            # 提炼证据：从 LLM 回复中提取 <evidence> 标签内容（零额外 LLM 调用）
-            # LLM 在 prompt 指令下会在回复中输出 <evidence>...</evidence> 标签
-            # 返回清理后的文本（标签已移除，不会泄露到用户输出）
-            if assistant_response_text and self.context_manager.config.enable_evidence_extraction:
-                cleaned = _extract_evidence_tags(
-                    assistant_response_text, turn_count, self.session_memory
+                # Phase 2b: Strategy 链 on_tool_result 触发（每个工具一次）
+                # 并发工具完成后按结果顺序触发，对齐并发语义
+                _tool_result_ext_ctx = self._build_extraction_ctx(
+                    turn_number=turn_count,
+                    mode=effective_mode,
+                    task_description=task_description,
                 )
-                if cleaned != assistant_response_text:
-                    assistant_response_text = cleaned
-                    # 同步清理 message_history 中已有的 assistant 消息
-                    _strip_evidence_from_last_assistant(message_history)
+                for call, (_call_id, _result) in zip(to_execute, executed_results):
+                    await self.profile.run_strategies_on_tool_result(
+                        call.get("tool_name", ""),
+                        _result,
+                        _tool_result_ext_ctx,
+                    )
+
+            # Evidence 抽取已在上方 strategy 链处理（Phase 2a 迁移）
 
             # Update session memory with findings from this turn (keyword-based fallback)
             if assistant_response_text:
@@ -1520,8 +1686,17 @@ class MainLoopRunner:
                 else "",
             )
 
-            # 反思检查点（quick 模式跳过）
-            if not is_quick_mode and turn_counter.should_inject_reflection():
+            # 反思检查点（Phase 2c：profile 决定是否启用）
+            _refl_profile_ctx = self._build_profile_ctx(
+                turn_number=turn_count,
+                task_description=task_description,
+                mode=effective_mode,
+                tool_calls_executed=total_tool_calls_executed,
+                last_assistant_text=last_assistant_text,
+                message_history=message_history,
+            )
+            _reflect_enabled = await self.profile.should_inject_reflection(_refl_profile_ctx)
+            if _reflect_enabled and turn_counter.should_inject_reflection():
                 reflection_prompt = generate_reflection_prompt(
                     turn_count, task_description, self.chinese_context
                 )
@@ -1623,27 +1798,43 @@ class MainLoopRunner:
                 f"Injected {len(self.context_manager.source_registry.get_all_sources())} sources into message history",
             )
 
-        # Deep verify 检查点：summary 前验证证据质量
+        # Deep verify 检查点（Phase 2c：profile 决策 mode/verify/evidence 条件，runtime 补 task_failed / cfg 存在判断）
+        _verify_profile_ctx = self._build_profile_ctx(
+            turn_number=turn_counter.current_turn,
+            task_description=task_description,
+            mode=effective_mode,
+            tool_calls_executed=total_tool_calls_executed,
+            last_assistant_text=last_assistant_text,
+            message_history=message_history,
+        )
         if (
-            is_deep_mode
-            and not task_failed
-            and total_tool_calls_executed > 0
-            and task_engine_cfg
-            and task_engine_cfg.get("enable_verify", True)
-            and not self.session_memory.is_empty()
+            not task_failed
+            and task_engine_cfg  # verify 配置存在才考虑跑
+            and await self.profile.should_run_verify(_verify_profile_ctx)
         ):
             await self._run_verify_checkpoint(
                 system_prompt, message_history, task_description
             )
 
-        # 是否跳过 summary：
-        # 1. deep 模式且调用过工具 → 强制生成 summary（中间轮文本不能当最终答案）
-        # 2. generate_summary=true → 仅无工具调用时跳过
-        # 3. generate_summary=false（默认）→ 有文本就跳过
-        generate_summary = self.cfg.main_agent.get("generate_summary", False)
-        # deep 模式下如果使用了工具，强制生成 summary
-        if effective_mode == EXECUTION_MODE_DEEP and total_tool_calls_executed > 0:
+        # 是否跳过 summary（Phase 2c：profile.needs_final_summary 决策 + runtime 配置兼容）
+        # 兼容：用户显式 generate_summary=True 强制生成；否则问 profile
+        _user_generate_summary = self.cfg.main_agent.get("generate_summary", None)
+        _summary_profile_ctx = self._build_profile_ctx(
+            turn_number=turn_counter.current_turn,
+            task_description=task_description,
+            mode=effective_mode,
+            tool_calls_executed=total_tool_calls_executed,
+            last_assistant_text=last_assistant_text,
+            message_history=message_history,
+        )
+        if _user_generate_summary is True:
             generate_summary = True
+        elif _user_generate_summary is False:
+            generate_summary = False
+        else:
+            generate_summary = await self.profile.needs_final_summary(
+                total_tool_calls_executed, last_assistant_text, _summary_profile_ctx,
+            )
         is_simple_response = (
             not task_failed
             and last_assistant_text
@@ -2025,7 +2216,7 @@ class MainLoopRunner:
                     tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
                         tool_result
                     )
-                    self._maybe_offload_result(tool_result_for_llm, tool_name)
+                    await self._maybe_offload_result(tool_result_for_llm, tool_name)
                     all_tool_results_with_id.append((call_id, tool_result_for_llm))
 
                 # Resume main agent stream
@@ -2194,23 +2385,34 @@ class MainLoopRunner:
         segments = set(re.split(r"[_\-]+", tool_name.lower()))
         return bool(segments & CONCURRENT_SAFE_TOOL_SEGMENTS)
 
-    def _maybe_offload_result(self, tool_result_for_llm: dict, tool_name: str) -> None:
+    async def _maybe_offload_result(self, tool_result_for_llm: dict, tool_name: str) -> None:
         """Backup large tool results to file and attach offload metadata.
 
         Shared by regular tool execution, sub-agent result handling, and spawn_agent.
+        Phase 2b：offload 发生后触发 profile.run_strategies_on_offload，
+        让用户自定义 strategy 能同步入外部存储（vector store / 索引 / blob 等）。
         """
         result_text = (
             tool_result_for_llm.get("text", "") if isinstance(tool_result_for_llm, dict) else ""
         )
-        if isinstance(result_text, str):
-            ref = self.context_manager.backup_large_result(
-                result_text,
-                tool_name=tool_name,
-                turn=self.context_manager._current_turn,
+        if not isinstance(result_text, str):
+            return
+        ref = self.context_manager.backup_large_result(
+            result_text,
+            tool_name=tool_name,
+            turn=self.context_manager._current_turn,
+        )
+        if ref:
+            tool_result_for_llm["_offload_ref"] = ref
+            tool_result_for_llm["_offload_chars"] = len(result_text)
+            # Phase 2b: 触发 on_offload strategy 链
+            ext_ctx = self._build_extraction_ctx(
+                turn_number=self.context_manager._current_turn,
+                mode=self.execution_mode,
             )
-            if ref:
-                tool_result_for_llm["_offload_ref"] = ref
-                tool_result_for_llm["_offload_chars"] = len(result_text)
+            await self.profile.run_strategies_on_offload(
+                ref, tool_name, result_text, ext_ctx,
+            )
 
     async def _execute_one_regular_tool(self, call: dict) -> tuple[str, dict]:
         """执行单个普通工具并返回 (call_id, formatted_result)"""
@@ -2222,7 +2424,7 @@ class MainLoopRunner:
             agent_name=self.agent_name,
         )
         tool_result_for_llm = self.output_formatter.format_tool_result_for_user(tool_result)
-        self._maybe_offload_result(tool_result_for_llm, call["tool_name"])
+        await self._maybe_offload_result(tool_result_for_llm, call["tool_name"])
         return call["id"], tool_result_for_llm
 
     async def _execute_regular_tools_concurrent(
@@ -2311,7 +2513,7 @@ class MainLoopRunner:
                     "result": spawn_result,
                 }
             )
-            self._maybe_offload_result(tool_result_for_llm, BUILTIN_TOOL_SPAWN_AGENT)
+            await self._maybe_offload_result(tool_result_for_llm, BUILTIN_TOOL_SPAWN_AGENT)
             return (call["id"], tool_result_for_llm)
 
         parallel = getattr(self.cfg.main_agent, "parallel_spawn", True)
