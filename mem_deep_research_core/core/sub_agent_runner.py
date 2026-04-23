@@ -72,6 +72,7 @@ class SubAgentRunner:
         # 运行时依赖（必传）
         hooks: HookRegistry,
         config_loader: ConfigLoader,
+        observers: Any | None = None,
     ):
         self.sub_agent_tool_managers = sub_agent_tool_managers
         self.sub_agent_llm_client = sub_agent_llm_client
@@ -90,6 +91,10 @@ class SubAgentRunner:
         self.streaming_final_message = streaming_final_message
         self._hooks = hooks
         self._config_loader = config_loader
+        if observers is None:
+            from mem_deep_research_core.observability import ObserverRegistry
+            observers = ObserverRegistry()
+        self._observers = observers
 
         self._cached_tool_definitions: dict[str, list[dict]] | None = None
 
@@ -286,8 +291,42 @@ class SubAgentRunner:
         Returns:
             Final answer text from the sub-agent.
         """
+        import uuid as _uuid
+        from mem_deep_research_core.observability import AgentRunContext
+
         task_description = self._parse_task_description(task_description)
         task_description += "\n\nPlease provide the answer and detailed supporting information of the subtask given to you."
+
+        # Observer context for sub-agent run
+        _obs_ctx = AgentRunContext(
+            agent_name=sub_agent_name,
+            agent_id=_uuid.uuid4().hex,
+            parent_agent_id=getattr(self, "_parent_agent_id", None),
+            task_description=task_description,
+            profile_name="",  # sub-agent 当前无独立 profile，留空
+            mode="",
+        )
+        async with self._observers.around_agent_run(_obs_ctx):
+            final_answer_text = await self._run_inner(
+                sub_agent_name,
+                task_description,
+                keep_tool_result,
+                parent_context_manager=parent_context_manager,
+                _obs_ctx=_obs_ctx,
+            )
+            _obs_ctx.final_answer = final_answer_text
+            return final_answer_text
+
+    async def _run_inner(
+        self,
+        sub_agent_name: str,
+        task_description: str,
+        keep_tool_result: int,
+        *,
+        parent_context_manager: ContextManager | None = None,
+        _obs_ctx: "AgentRunContext | None" = None,
+    ) -> str:
+        """原 run() 主体。被 observer context manager 包裹。"""
 
         logger.debug(f"\n=== Starting Sub Agent {sub_agent_name} ===")
 

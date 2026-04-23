@@ -51,6 +51,7 @@ class ToolExecutor:
         retry_backoff_base: float = 1.0,
         *,
         hook_registry: HookRegistry,
+        observer_registry: Any | None = None,
     ):
         """
         初始化工具执行器
@@ -66,6 +67,7 @@ class ToolExecutor:
             retry_max: 瞬态错误最大重试次数
             retry_backoff_base: 重试退避基数(秒)
             hook_registry: HookRegistry 实例（必传）
+            observer_registry: ObserverRegistry 实例（可选；None 使用空 registry）
         """
         self.tool_manager = tool_manager
         self.output_formatter = output_formatter
@@ -77,6 +79,10 @@ class ToolExecutor:
         self.retry_max = retry_max
         self.retry_backoff_base = retry_backoff_base
         self._hooks = hook_registry
+        if observer_registry is None:
+            from mem_deep_research_core.observability import ObserverRegistry
+            observer_registry = ObserverRegistry()
+        self._observers = observer_registry
 
         # 当前轮次 LLM 回复文本（由 main_loop 每轮设置，传入 on_thinking_generate hook）
         self._current_assistant_text: str | None = None
@@ -146,6 +152,7 @@ class ToolExecutor:
         arguments: dict,
         call_id: str,
         agent_name: str = "main",
+        turn_number: int = 0,
     ) -> tuple[dict[str, Any], int]:
         """
         执行单个工具调用
@@ -154,11 +161,41 @@ class ToolExecutor:
             server_name: 服务器名称
             tool_name: 工具名称
             arguments: 工具参数
-            call_id: 调用 ID
+            call_id: 调用 ID（唯一关联键，等于 LLM 的 tool_use_id）
             agent_name: Agent 名称（用于日志）
+            turn_number: 当前轮次（observer 上下文用）
 
         Returns:
             Tuple[Dict, int]: (工具结果, 执行耗时毫秒)
+        """
+        from mem_deep_research_core.observability import ToolCallContext
+
+        # Observer context：observer 包裹整个调用，yield 后由本方法填充 result / error / duration_ms
+        _obs_ctx = ToolCallContext(
+            call_id=call_id,
+            tool_name=tool_name,
+            server_name=server_name,
+            arguments=arguments,
+            agent_name=agent_name,
+            turn_number=turn_number,
+        )
+        async with self._observers.around_tool_call(_obs_ctx):
+            return await self._execute_single_tool_inner(
+                _obs_ctx, server_name, tool_name, arguments, agent_name,
+            )
+
+    async def _execute_single_tool_inner(
+        self,
+        _obs_ctx: "ToolCallContext",
+        server_name: str,
+        tool_name: str,
+        arguments: dict,
+        agent_name: str,
+    ) -> tuple[dict[str, Any], int]:
+        """原 execute_single_tool 逻辑；被 observer context manager 包裹。
+
+        本方法负责在 return / raise 前填充 _obs_ctx.result / error / duration_ms，
+        供 observer 的 __aexit__ 读取。
         """
         call_start_time = time.time()
 
@@ -251,6 +288,9 @@ class ToolExecutor:
                 except Exception as e:
                     logger.debug(f"Failed to stream result reasoning: {e}")
 
+            # 填充 observer context 供 around_tool_call 的 __aexit__ 读取
+            _obs_ctx.result = tool_result
+            _obs_ctx.duration_ms = call_duration_ms
             return tool_result, call_duration_ms
 
         except Exception as e:
@@ -278,6 +318,10 @@ class ToolExecutor:
                 "tool_name": tool_name,
                 "error": error_msg,
             }
+            # 填充 observer context（error path）
+            _obs_ctx.result = tool_result
+            _obs_ctx.error = error_msg
+            _obs_ctx.duration_ms = call_duration_ms
             return tool_result, call_duration_ms
 
     async def execute_tool_calls(

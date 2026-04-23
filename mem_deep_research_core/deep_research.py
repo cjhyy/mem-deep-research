@@ -133,6 +133,8 @@ class DeepResearch:
         config: DictConfig | None = None,
         # 运行时隔离
         runtime: AgentRuntime | None = None,
+        # Observability 插槽（可选）
+        observers: Any | None = None,
     ):
         """
         初始化 DeepResearch
@@ -192,8 +194,17 @@ class DeepResearch:
         # 验证配置
         self._validate_config()
 
-        # 运行时隔离：每个实例持有独立的 hooks + config_loader
-        self._runtime = runtime or AgentRuntime()
+        # 运行时隔离：每个实例持有独立的 hooks + config_loader + observers
+        if runtime is None:
+            self._runtime = AgentRuntime(observers=observers)
+        else:
+            self._runtime = runtime
+            # 若用户既传了 runtime 又传了 observers，且 runtime.observers 是空 registry，
+            # 用户 observers 替换之；否则尊重 runtime 里已有的 observers
+            if observers is not None:
+                _current = getattr(runtime, "observers", None)
+                if _current is not None and getattr(_current, "empty", True):
+                    runtime._observers = observers
 
         # 延迟初始化的组件
         self._factory = None

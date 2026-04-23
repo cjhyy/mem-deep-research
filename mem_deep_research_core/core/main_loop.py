@@ -139,6 +139,10 @@ class MainLoopContext:
     # Phase 2 将把当前研究专属分支迁移到 DeepResearchProfile。
     profile: Any = None
 
+    # ObserverRegistry（v1.3.0 observability 插槽）
+    # None 时默认空 registry（no-op），不影响主循环行为
+    observers: Any = None
+
 
 @dataclass
 class _ProfileContextView:
@@ -559,6 +563,12 @@ class MainLoopRunner:
         if ctx.hooks is None:
             raise ValueError("MainLoopContext.hooks is required — pass a HookRegistry instance")
         self.hooks = ctx.hooks
+        # ObserverRegistry（observability 插槽）
+        if ctx.observers is None:
+            from mem_deep_research_core.observability import ObserverRegistry
+            self._observers = ObserverRegistry()
+        else:
+            self._observers = ctx.observers
         self.deferred_tool_manager = ctx.deferred_tool_manager
         self.transcript = ctx.transcript
         self.file_state_cache = ctx.file_state_cache
@@ -676,6 +686,54 @@ class MainLoopRunner:
         Returns:
             (最终答案文本, is_simple_response)
         """
+        import uuid as _uuid
+        from mem_deep_research_core.observability import AgentRunContext
+
+        # Observer context for main agent
+        _obs_ctx = AgentRunContext(
+            agent_name=self.agent_name,
+            agent_id=_uuid.uuid4().hex,
+            parent_agent_id=None,
+            task_description=task_description,
+            profile_name=getattr(self.profile, "name", ""),
+            mode=self.execution_mode,
+        )
+
+        # Inject LLM observer into provider client (若尚未注入）
+        try:
+            if hasattr(self.llm_client, "set_observer_registry"):
+                self.llm_client.set_observer_registry(self._observers)
+        except Exception:
+            pass
+
+        async with self._observers.around_agent_run(_obs_ctx):
+            final_answer, is_simple = await self._run_inner(
+                system_prompt,
+                message_history,
+                tool_definitions,
+                main_agent_prompt_instance,
+                task_engine_cfg,
+                task_description,
+                task_guidance,
+                keep_tool_result,
+                resume_from,
+            )
+            _obs_ctx.final_answer = final_answer
+            return final_answer, is_simple
+
+    async def _run_inner(
+        self,
+        system_prompt: str,
+        message_history: list,
+        tool_definitions: list,
+        main_agent_prompt_instance,
+        task_engine_cfg: dict | None,
+        task_description: str,
+        task_guidance: str,
+        keep_tool_result: int,
+        resume_from: dict | None = None,
+    ) -> tuple[str, bool]:
+        """原 run() 主体；被 observer context manager 包裹。"""
         max_turns = self.cfg.main_agent.max_turns
         if max_turns < 0:
             max_turns = sys.maxsize

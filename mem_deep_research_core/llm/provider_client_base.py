@@ -88,6 +88,9 @@ class LLMProviderClientBase(ABC):
         # Usage tracking: accumulated across all API calls
         self._usage_records: list[dict] = []
 
+        # ObserverRegistry（可选，由 Orchestrator 注入）；None 时默认空 registry no-op
+        self._observers: Any = None
+
         self.client = self._create_client(self.cfg)
 
         logger.info(
@@ -263,18 +266,61 @@ class LLMProviderClientBase(ABC):
         """
         Call LLM to generate response, supports tool calls - unified implementation
         """
-        response = None
+        # Observer context：包裹整个 LLM 调用
+        import time as _time
+        from mem_deep_research_core.observability import LLMCallContext, ObserverRegistry
 
-        # Unified LLM call handling
-        # Note: _remove_tool_result_from_messages() is called inside each provider's _create_message()
-        response = await self._create_message(
-            system_prompt,
-            message_history,
-            tool_definitions,
-            keep_tool_result=keep_tool_result,
-            stream_message_callback=stream_message_callback,
+        _observers = self._observers or ObserverRegistry()
+        _obs_ctx = LLMCallContext(
+            agent_name=agent_type,
+            turn_number=step_id,
+            provider=self.provider_class,
+            model=self.model_name,
+            messages_count=len(message_history),
         )
-        return response
+        _start = _time.time()
+
+        async with _observers.around_llm_call(_obs_ctx):
+            try:
+                # Unified LLM call handling
+                # Note: _remove_tool_result_from_messages() is called inside each provider's _create_message()
+                response = await self._create_message(
+                    system_prompt,
+                    message_history,
+                    tool_definitions,
+                    keep_tool_result=keep_tool_result,
+                    stream_message_callback=stream_message_callback,
+                )
+            except Exception as e:
+                _obs_ctx.error = str(e)
+                _obs_ctx.duration_ms = int((_time.time() - _start) * 1000)
+                raise
+
+            _obs_ctx.duration_ms = int((_time.time() - _start) * 1000)
+            # 尝试填充 observer 可用的响应元数据（best-effort，不抛错）
+            try:
+                _obs_ctx.stop_reason = getattr(response, "stop_reason", None) or (
+                    response.choices[0].finish_reason
+                    if getattr(response, "choices", None)
+                    else None
+                )
+            except Exception:
+                pass
+            try:
+                usage = self.get_usage() if hasattr(self, "get_usage") else {}
+                if usage:
+                    _obs_ctx.token_usage = {
+                        "input_tokens": usage.get("input_tokens", 0),
+                        "output_tokens": usage.get("output_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    }
+            except Exception:
+                pass
+            return response
+
+    def set_observer_registry(self, observers: Any) -> None:
+        """注入 ObserverRegistry（由 Orchestrator 在初始化时调用）。"""
+        self._observers = observers
 
     @staticmethod
     async def convert_tool_definition_to_tool_call(tools_definitions):

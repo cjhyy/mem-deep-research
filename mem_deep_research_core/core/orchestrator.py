@@ -288,6 +288,7 @@ class Orchestrator:
             retry_max=retry_cfg.get("max_retries", 2) if retry_cfg.get("enabled", True) else 0,
             retry_backoff_base=retry_cfg.get("backoff_base", 1.0),
             hook_registry=self._hooks,  # 注入实例级 hooks，避免全局单例
+            observer_registry=getattr(self.runtime, "observers", None),
         )
         # scrape_max_length: 优先从配置读，fallback 环境变量，最后默认 20000
         scrape_max_length = monitoring_cfg_dict.get("scrape_max_length", None)
@@ -318,6 +319,7 @@ class Orchestrator:
             hooks=self._hooks,
             config_loader=self.runtime.config_loader,
             streaming_final_message=self._streaming_final_message,
+            observers=getattr(self.runtime, "observers", None),
         )
         if self.sub_agent_tool_definitions:
             self.sub_agent_runner.set_cached_tool_definitions(self.sub_agent_tool_definitions)
@@ -873,6 +875,7 @@ class Orchestrator:
             router_llm_client=self.router_llm_client,
             config_loader=self.runtime.config_loader,
             profile=_profile_instance,
+            observers=getattr(self.runtime, "observers", None),
         )
         return MainLoopRunner(ctx)
 

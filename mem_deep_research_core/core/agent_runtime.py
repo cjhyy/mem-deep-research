@@ -37,11 +37,13 @@ class AgentRuntime:
         self,
         hooks: Any | None = None,
         config_loader: Any | None = None,
+        observers: Any | None = None,
     ):
         """
         Args:
             hooks: HookRegistry 实例。None 时创建新的独立实例。
             config_loader: ConfigLoader 实例。None 时创建新的独立实例。
+            observers: ObserverRegistry 实例。None 时创建空的 registry（no-op）。
         """
         # 延迟导入避免循环依赖
         if hooks is None:
@@ -52,9 +54,14 @@ class AgentRuntime:
             from mem_deep_research_core.utils.external_loader import ConfigLoader
 
             config_loader = ConfigLoader()
+        if observers is None:
+            from mem_deep_research_core.observability import ObserverRegistry
+
+            observers = ObserverRegistry()
 
         self._hooks = hooks
         self._config_loader = config_loader
+        self._observers = observers
 
     @property
     def hooks(self):
@@ -65,6 +72,11 @@ class AgentRuntime:
     def config_loader(self):
         """ConfigLoader 实例"""
         return self._config_loader
+
+    @property
+    def observers(self):
+        """ObserverRegistry 实例（observability 插槽）"""
+        return self._observers
 
     def load_project_hooks(self, project_dir: str) -> None:
         """
