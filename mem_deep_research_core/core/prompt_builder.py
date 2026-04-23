@@ -32,6 +32,18 @@ class PromptBuilder:
     # Section 缓存边界标记（不出现在 prompt 中，仅内部使用）
     _DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
+    # 所有已知 provider 都原生支持 tool use，xml 格式意味着工具定义会被重复
+    # 注入到 system prompt 文本和 API tools 字段两处，浪费 token。
+    _NATIVE_TOOL_CAPABLE_PROVIDERS = frozenset({
+        "ClaudeAnthropicClient",
+        "ClaudeOpenRouterClient",
+        "DeepSeekOpenRouterClient",
+        "GPTOpenAIClient",
+        "GPT5OpenAIClient",
+        "GPT5OpenRouterClient",
+        "OpenAICompatibleClient",
+    })
+
     def __init__(
         self,
         cfg,
@@ -176,8 +188,15 @@ class PromptBuilder:
             task_engine_cfg = dict(task_engine_cfg)
 
         # evidence_extraction: 自动注入 preset
+        # 仅在没有 custom_system_template 时自动注入，避免悄悄污染用户的自定义 prompt。
+        # 使用 custom template 的用户若需 evidence protocol，应显式写到 prompt.presets 里。
         cm_cfg = getattr(self.cfg.main_agent, "context_manager", None)
-        if cm_cfg and getattr(cm_cfg, "enable_evidence_extraction", True):
+        has_custom_template = bool(prompt_cfg.get("custom_system_template"))
+        if (
+            cm_cfg
+            and getattr(cm_cfg, "enable_evidence_extraction", True)
+            and not has_custom_template
+        ):
             existing_presets = prompt_cfg.get("presets", [])
             if "evidence_extraction" not in existing_presets:
                 prompt_cfg["presets"] = list(existing_presets) + ["evidence_extraction"]
@@ -187,6 +206,7 @@ class PromptBuilder:
 
         # === 静态段：agent 角色 + 工具描述（缓存） ===
         if self._cached_static_prompt is None:
+            self._warn_if_xml_with_native_capable_provider(prompt_cfg, tool_definitions)
             extra_context = ""
             static_prompt = main_agent_prompt_instance.generate_system_prompt_with_mcp_tools(
                 mcp_servers=tool_definitions,
@@ -279,6 +299,27 @@ class PromptBuilder:
         if injector:
             return injector.build_meta_message(skill_names, skill_commands)
         return None
+
+    def _warn_if_xml_with_native_capable_provider(
+        self, prompt_cfg: dict, tool_definitions: list
+    ) -> None:
+        """xml 格式 + 原生支持 tool use 的 provider → 工具定义在 system prompt 和
+        API tools 字段被重复注入，浪费 token。首次构建时 warn 一次。
+        """
+        if prompt_cfg.get("tool_format", "xml") != "xml":
+            return
+        if not tool_definitions:
+            return
+        llm_cfg = self.cfg.main_agent.get("llm", {})
+        provider_class = llm_cfg.get("provider_class") if llm_cfg else None
+        if provider_class in self._NATIVE_TOOL_CAPABLE_PROVIDERS:
+            logger.warning(
+                "[PromptBuilder] tool_format=xml with native-capable provider %s: "
+                "tool definitions are injected both into system prompt text and API "
+                "tools field, doubling token cost. Consider setting "
+                "main_agent.prompt.tool_format=native.",
+                provider_class,
+            )
 
     def invalidate_cache(self):
         """手动使缓存失效（工具定义变更等场景使用）"""

@@ -116,6 +116,13 @@ class PromptConfig(BaseModel):
     templates_dir: str | None = Field(default=None, description="自定义模板目录")
     custom_system_template: str | None = Field(default=None, description="自定义系统提示词模板")
     custom_summarize_template: str | None = Field(default=None, description="自定义总结模板")
+    custom_takes_over: bool = Field(
+        default=False,
+        description=(
+            "仅在 custom_system_template 生效时有意义。True 时 custom 模板完全接管，"
+            "框架不再追加 presets/chinese_context/language_tag 段落；默认 False 保持向后兼容。"
+        ),
+    )
 
 
 class TaskEngineConfig(BaseModel):

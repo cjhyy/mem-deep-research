@@ -70,12 +70,23 @@ class GPTOpenAIClient(LLMProviderClientBase):
         if system_prompt:
             target_role = "developer" if is_oai_new_model else "system"
 
+            from mem_deep_research_core.core.prompt_builder import PromptBuilder
+
+            boundary = PromptBuilder._DYNAMIC_BOUNDARY
+            if boundary in system_prompt:
+                static_part, dynamic_part = system_prompt.split(boundary, 1)
+                system_text = static_part.rstrip()
+                if dynamic_part.strip():
+                    system_text = f"{system_text}\n\n{dynamic_part.lstrip()}"
+            else:
+                system_text = system_prompt
+
             # Check if there's already a system or developer message
             if messages and messages[0]["role"] in ["system", "developer"]:
                 # Replace existing message with correct role
                 messages[0] = {
                     "role": target_role,
-                    "content": [{"type": "text", "text": system_prompt}],
+                    "content": [{"type": "text", "text": system_text}],
                 }
             else:
                 # Insert new message
@@ -83,7 +94,7 @@ class GPTOpenAIClient(LLMProviderClientBase):
                     0,
                     {
                         "role": target_role,
-                        "content": [{"type": "text", "text": system_prompt}],
+                        "content": [{"type": "text", "text": system_text}],
                     },
                 )
 

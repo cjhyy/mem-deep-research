@@ -51,6 +51,7 @@ class AgentPrompt:
         custom_system_template: str | None = None,
         custom_summarize_template: str | None = None,
         minimal: bool = False,
+        custom_takes_over: bool = False,
     ):
         """
         初始化 Agent Prompt
@@ -63,12 +64,20 @@ class AgentPrompt:
             custom_system_template: 自定义系统 prompt 模板名
             custom_summarize_template: 自定义总结 prompt 模板名
             minimal: 最小化 system prompt — 跳过 intro/objective，只保留日期+工具定义(如有)
+            custom_takes_over: 仅在 custom_system_template 生效时有意义。
+                - False（默认，向后兼容）：custom 模板替换主体后，框架仍会追加
+                  presets / chinese_context / language detection 段落。
+                - True：custom 模板完全接管，框架不再追加任何段落。所有默认段
+                  通过占位符暴露给模板（{{system_intro}}/{{tool_format}}/
+                  {{mcp_tools}}/{{objective}}/{{presets}}/{{chinese_context}}/
+                  {{language_tag}}），由模板按需引用。
         """
         self.agent_type = agent_type
         self.tool_format = tool_format
         self.presets = presets or []
         self.is_main_agent = agent_type == "main"
         self.minimal = minimal
+        self.custom_takes_over = custom_takes_over
 
         # 自定义模板名
         self.custom_system_template = custom_system_template
@@ -152,6 +161,28 @@ class AgentPrompt:
         except FileNotFoundError:
             default_objective = "# General Objective\n\nYou accomplish a given task iteratively, breaking it down into clear steps and working through them methodically."
 
+        # mcp_tools_section：xml 格式下工具 JSON schema 的完整成品（含包装语），
+        # 暴露给 custom 模板避免用户手抄样板；native 格式下为空（工具走 API tools 字段）。
+        if mcp_tools and self.tool_format != "native":
+            default_mcp_tools_section = (
+                f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
+            )
+        else:
+            default_mcp_tools_section = ""
+
+        # 归一化 chinese_context 与 response_language：
+        # - chinese_context=True 等同 response_language="Chinese"（CLAUDE.md 约定）
+        # - response_language="Chinese" 反向触发 chinese_context 模板
+        # 两种写法在 prompt 输出上完全一致，避免用户选错字段。
+        is_chinese = chinese_context or response_language == "Chinese"
+        effective_response_language = "Chinese" if chinese_context else response_language
+
+        # 预渲染 presets / chinese_context / language_tag 三段，既用于默认拼装也作为
+        # custom_takes_over=True 时的占位符暴露给 custom 模板。
+        presets_section = self._render_presets_section(task_engine_cfg)
+        chinese_section = self._render_chinese_context_section() if is_chinese else ""
+        language_section = self._render_language_tag_section(effective_response_language)
+
         # 构建系统 prompt
         parts = []
 
@@ -162,10 +193,8 @@ class AgentPrompt:
             if mcp_tools:
                 if default_tool_format:
                     parts.append(default_tool_format)
-                if self.tool_format != "native":
-                    parts.append(
-                        f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
-                    )
+                if default_mcp_tools_section:
+                    parts.append(default_mcp_tools_section)
             return "\n\n".join(parts)
 
         # 1. 自定义模板覆盖整个主体，通过占位符按需引用默认模块
@@ -178,7 +207,11 @@ class AgentPrompt:
                     system_intro=default_intro,
                     tool_format=default_tool_format,
                     mcp_tools=mcp_tools,
+                    mcp_tools_section=default_mcp_tools_section,
                     objective=default_objective,
+                    presets=presets_section,
+                    chinese_context=chinese_section,
+                    language_tag=language_section,
                 )
                 if extra_context:
                     custom_content = extra_context.strip() + "\n\n" + custom_content
@@ -191,6 +224,11 @@ class AgentPrompt:
                     f"If templates_dir is a relative path, ensure project_dir is set correctly."
                 )
 
+        # custom_takes_over=True：custom 模板完全接管，框架不再追加任何段落。
+        # 注意：custom 模板加载失败时 parts 为空，此时会继续走默认构建（fallback）。
+        if self.custom_system_template and self.custom_takes_over and parts:
+            return "\n\n".join(parts)
+
         # 2. 默认构建（无 custom 模板或加载失败时）
         if not parts:
             if mcp_tools:
@@ -200,18 +238,11 @@ class AgentPrompt:
                     intro = extra_context.strip() + "\n\n" + intro
                 parts.append(intro)
 
-                if self.tool_format == "native":
-                    # native 模式：工具定义通过 API tools 参数传递，
-                    # system prompt 只保留简要使用说明，不注入工具 JSON schema
-                    if default_tool_format:
-                        parts.append(default_tool_format)
-                else:
-                    # xml 模式：在 system prompt 中注入完整工具格式说明 + JSON schema
-                    if default_tool_format:
-                        parts.append(default_tool_format)
-                    parts.append(
-                        f"Here are the functions available in JSONSchema format:\n\n{mcp_tools}"
-                    )
+                if default_tool_format:
+                    parts.append(default_tool_format)
+                # xml 模式下额外注入 JSON schema；native 模式由 API tools 字段承载
+                if default_mcp_tools_section:
+                    parts.append(default_mcp_tools_section)
             else:
                 # 无工具：只保留日期时间，不注入工具相关描述
                 date_line = f"Today is: {formatted_date}. Current time: {formatted_time}."
@@ -221,10 +252,23 @@ class AgentPrompt:
 
             parts.append(default_objective)
 
-        # 6. 预设模块
+        # 3. 追加 presets / chinese_context / language_tag
+        # custom_takes_over=True 的早返回已在上方处理；此处覆盖两种路径：
+        #   - 无 custom 模板（走默认构建）
+        #   - 有 custom 模板但 custom_takes_over=False（向后兼容）
+        if presets_section:
+            parts.append(presets_section)
+        if chinese_section:
+            parts.append(chinese_section)
+        if language_section:
+            parts.append(language_section)
+
+        return "\n\n".join(parts)
+
+    def _render_presets_section(self, task_engine_cfg: dict | None) -> str:
+        """渲染 presets 段（含 task_engine_cfg 自动追加的预设）。"""
         effective_presets = list(self.presets)
 
-        # task_engine_cfg 转换为 presets
         if task_engine_cfg and task_engine_cfg.get("enabled", False):
             if "task_completion" not in effective_presets:
                 effective_presets.append("task_completion")
@@ -232,36 +276,36 @@ class AgentPrompt:
                 if "task_planning" not in effective_presets:
                     effective_presets.append("task_planning")
 
+        rendered = []
         for preset in effective_presets:
             try:
-                preset_content = self._load_preset_template(preset)
-                parts.append(preset_content)
+                rendered.append(self._load_preset_template(preset))
             except FileNotFoundError:
                 pass
+        return "\n\n".join(rendered)
 
-        # 7. 中文语境
-        if chinese_context:
-            chinese_template = (
-                "chinese_worker" if self.agent_type == "worker" else "chinese_context"
-            )
-            try:
-                chinese_content = self._load_base_template(chinese_template)
-                parts.append(chinese_content)
-            except FileNotFoundError:
-                pass
+    def _render_chinese_context_section(self) -> str:
+        """渲染中文语境段（按 agent_type 选择模板）。"""
+        chinese_template = (
+            "chinese_worker" if self.agent_type == "worker" else "chinese_context"
+        )
+        try:
+            return self._load_base_template(chinese_template)
+        except FileNotFoundError:
+            return ""
 
-        # 8. Language detection (always appended, cannot be overridden by custom templates)
-        if response_language == "auto":
-            parts.append(
-                "## Language\n\n"
-                "On your **first reply only**, emit a `<response_language>` tag declaring "
-                "the language you will use for this session, based on the user's query language:\n\n"
-                "```\n<response_language>Chinese</response_language>\n```\n\n"
-                "Supported values: `Chinese`, `English`, `Japanese`, `Korean`, or any other "
-                "language matching the user's input. After the first reply, do not emit this tag again."
-            )
-
-        return "\n\n".join(parts)
+    def _render_language_tag_section(self, response_language: str) -> str:
+        """渲染 language detection 段（仅当 response_language=auto 时生效）。"""
+        if response_language != "auto":
+            return ""
+        return (
+            "## Language\n\n"
+            "On your **first reply only**, emit a `<response_language>` tag declaring "
+            "the language you will use for this session, based on the user's query language:\n\n"
+            "```\n<response_language>Chinese</response_language>\n```\n\n"
+            "Supported values: `Chinese`, `English`, `Japanese`, `Korean`, or any other "
+            "language matching the user's input. After the first reply, do not emit this tag again."
+        )
 
     def generate_summarize_prompt(
         self,

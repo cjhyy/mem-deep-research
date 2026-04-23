@@ -137,19 +137,38 @@ class ClaudeAnthropicClient(LLMProviderClientBase):
                 # budget_tokens 模式要求 temperature=1
                 temperature = 1
 
+        # Split system prompt at dynamic boundary for cache optimization:
+        # static prefix gets cache_control, dynamic suffix does not.
+        from mem_deep_research_core.core.prompt_builder import PromptBuilder
+
+        boundary = PromptBuilder._DYNAMIC_BOUNDARY
+        if system_prompt and boundary in system_prompt:
+            static_part, dynamic_part = system_prompt.split(boundary, 1)
+            system_blocks = [
+                {
+                    "type": "text",
+                    "text": static_part.rstrip(),
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+            if dynamic_part.strip():
+                system_blocks.append({"type": "text", "text": dynamic_part.lstrip()})
+        else:
+            system_blocks = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+
         kwargs = {
             "model": self.model_name,
             "temperature": temperature,
             "top_p": self.top_p if self.top_p != 1.0 else NOT_GIVEN,
             "top_k": self.top_k if self.top_k != -1 else NOT_GIVEN,
             "max_tokens": self.max_tokens,
-            "system": [
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            "system": system_blocks,
             "messages": processed_messages,
             "stream": self.enable_streaming,
         }

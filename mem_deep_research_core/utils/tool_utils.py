@@ -211,6 +211,7 @@ def _load_agent_prompt(
         custom_system_template=prompt_cfg.get("custom_system_template"),
         custom_summarize_template=prompt_cfg.get("custom_summarize_template"),
         minimal=prompt_cfg.get("minimal", False),
+        custom_takes_over=prompt_cfg.get("custom_takes_over", False),
     )
 
 
