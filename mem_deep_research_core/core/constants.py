@@ -210,6 +210,13 @@ TAG_COLLECTED_SOURCES = "[COLLECTED SOURCES]"
 TAG_CONTEXT_SUMMARY = "[CONTEXT SUMMARY"
 TAG_CONTENT_REMOVED = "[Content removed to reduce context]"
 TAG_OFFLOADED = "[OFFLOADED:"  # prefix for offloaded content markers
+
+# Sidecar message field listing offload refs that the message carries.
+# Used by ContextManager.restore_offloaded_content to know which files to
+# read on resume, and by HITL concurrent-batch suspend to capture
+# completed tool refs in the snapshot. Centralised here so callers don't
+# rely on the literal string in multiple places.
+MSG_FIELD_OFFLOAD_REFS = "_offload_refs"
 TAG_TASK_PROGRESS = "[TASK PROGRESS]"
 TAG_EVIDENCE = "[EVIDENCE]"
 

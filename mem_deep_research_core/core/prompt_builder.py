@@ -270,7 +270,7 @@ class PromptBuilder:
                     logger.debug("Rule-matched skills injected into system prompt")
 
         # Hook: on_system_prompt_build — post-process system prompt (dynamic)
-        hook_result = self._hooks.call(
+        hook_result = self._hooks.call_sync(
             "on_system_prompt_build",
             HookContext(
                 hook_name="on_system_prompt_build",

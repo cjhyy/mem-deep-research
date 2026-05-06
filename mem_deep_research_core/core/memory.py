@@ -208,6 +208,57 @@ class SessionMemory:
             if url:
                 self.add_source(url=url, title=title, snippet=snippet, tool_name=tool_name)
 
+    # ------------------------------------------------------------------
+    # Snapshot contract (HITL / durable execution)
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Serialize session memory for RuntimeSnapshot (thread-safe)."""
+        with self._lock:
+            return {
+                "key_findings": list(self.key_findings),
+                "attempted_strategies": list(self.attempted_strategies),
+                "sources": [
+                    {
+                        "url": s.url,
+                        "title": s.title,
+                        "snippet": s.snippet,
+                        "tool_name": s.tool_name,
+                        "turn": s.turn,
+                    }
+                    for s in self.sources
+                ],
+                "sub_agent_results": [list(pair) for pair in self.sub_agent_results],
+                "evidence_items": [
+                    {
+                        "tool_name": e.tool_name,
+                        "turn": e.turn,
+                        "summary": e.summary,
+                        "key_arg": e.key_arg,
+                        "offload_ref": e.offload_ref,
+                        "source_url": e.source_url,
+                        "confidence": e.confidence,
+                    }
+                    for e in self.evidence_items
+                ],
+            }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SessionMemory":
+        """Inverse of :meth:`to_dict`."""
+        inst = cls()
+        with inst._lock:
+            inst.key_findings = list(data.get("key_findings", []))
+            inst.attempted_strategies = list(data.get("attempted_strategies", []))
+            inst.sources = [SourceRecord(**s) for s in data.get("sources", [])]
+            inst.sub_agent_results = [
+                tuple(pair) for pair in data.get("sub_agent_results", [])
+            ]
+            inst.evidence_items = [
+                EvidenceItem(**e) for e in data.get("evidence_items", [])
+            ]
+        return inst
+
 
 # ============================================================
 # Long-term Memory (Cross-session, persistent)

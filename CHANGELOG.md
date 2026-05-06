@@ -1,5 +1,141 @@
 # Changelog
 
+## v1.3.0 (2026-04-28)
+
+**HITL (Human-in-the-Loop) — durable suspend / resume on tool boundaries**
+
+Adds first-class human-approval support to the runtime. Approval hooks call
+`ctx.runtime.wait_for_human(...)` from inside `on_tool_start`; the framework
+either delivers the decision in-process or persists a `RuntimeSnapshot`
+checkpoint and returns `awaiting_human`. The same checkpoint is later
+delivered to `DeepResearch.resume_with_human_decision(...)` to continue
+execution from the exact tool boundary.
+
+Phase 0 / 1 / 2 from `docs/23-hitl-design.md` are all in this release.
+
+### Phase 0: Snapshot infrastructure (foundation)
+
+- **Hook system async-aware**: `HookRegistry.call()` is now `async`;
+  synchronous hooks still execute natively (no `to_thread`). `call_sync()`
+  preserves the sync entry point for hook sites that can't go async.
+  All 27 framework call sites migrated.
+- **`on_suspend` / `on_resume` lifecycle hooks** for resource
+  cleanup/rebuild around durable execution.
+- **Module snapshot/restore contract**: `ContextManager`, `ExecutionMonitor`,
+  `InlineSkillSelector` each expose `snapshot()` / `restore()` for runtime
+  state capture.
+- **ContextVar save/restore**: `LLMProviderClientBase` /
+  `DeepSeekOpenRouterClient` / `sub_agent_runner` expose
+  `save_contextvar_state` / `restore_contextvar_state` so framework-owned
+  ContextVars survive a process restart.
+- **`RuntimeSnapshot` dataclass + `build_snapshot` / `restore_snapshot`**
+  primitives in `core/hitl/runtime_snapshot.py` with `schema_version=1`.
+
+### Phase 1: Synchronous HITL surface
+
+- **`HumanDecision` / `PendingHumanRequest` / `RunResult`** data types
+  (`core/hitl/types.py`).
+- **`PendingHumanException`** runtime control-flow exception
+  (`core/hitl/exceptions.py`); transparently propagated through hook
+  chain, tool executor, sub-agent runner, and concurrent `asyncio.gather`
+  fan-in paths.
+- **`PendingStore` Protocol + `InMemoryPendingStore`** —
+  `Future`-based rendezvous between `wait_for_human` and the approver.
+- **`RuntimeFacade.wait_for_human(...)`** — main HITL entry point;
+  short-circuits to auto-approved when `cfg.hitl.enabled=False`.
+- **`HookContext.runtime`** resolves the current facade via ContextVar so
+  `HookContext` stays invariant.
+- **`on_await_human` hook** for business-side notification (Slack / email
+  / webhook).
+- **Sub-agent restriction**: `_is_sub_agent_var=True` forces
+  synchronous-only path; durable suspend is disallowed inside sub-agents
+  (design-doc Phase 2 contract). Deferred to v1.4.0 workflow layer.
+
+### Phase 2: Asynchronous HITL + checkpoint/resume
+
+- **`FilesystemCheckpointStore`** with atomic writes (`tempfile` +
+  `os.replace`), path-traversal guards, and `sweep_expired()` for stale
+  request cleanup.
+- **`wait_for_human` timeout → `PendingHumanException`** (main agent
+  path); the request stays open in the pending store so resume can
+  deliver the decision after a process restart.
+- **`MainLoopRunner._build_runtime_snapshot` / `_restore_runtime_snapshot`**
+  + `_HitlLiveState` dataclass updated each turn.
+- **Outer `try/except PendingHumanException`** in `MainLoopRunner.run`
+  builds the snapshot, fires `on_suspend`, and re-raises to the pipeline
+  layer for persistence.
+- **`Pipeline.execute_task_pipeline`** catches and persists; returns 6-tuple
+  with `(answer, boxed, log_path, status, checkpoint_id, pending_request)`.
+- **Concurrent batch drain-then-suspend**:
+  `_execute_regular_tools_concurrent` waits for the rest of the batch and
+  records completed tools' offload refs before raising the first pending.
+- **`MainLoopRunner.run_from_tool_cursor(snapshot, decision)`** resumes
+  from the tool cursor: skips the LLM call for the paused turn, skips
+  `on_tool_start` re-entry, runs the pending tool with
+  `effective_arguments` merged from the approver's `decision.payload`,
+  then re-enters the normal turn loop with `skip_init=True` so restored
+  module state survives.
+- **`DeepResearch.resume_with_human_decision(...)`** /
+  **`AgentFactory.resume_with_human_decision(...)`** /
+  **`execute_hitl_resume_pipeline`** — three-layer resume entry. Auto-resolves
+  `task_description` from the snapshot.
+- **`HitlConfig`** in `config_schema.py`:
+  - `enabled` (default True)
+  - `checkpoint_dir` — explicit override; falls back to `output_dir` →
+    log directory.
+  - `sweep_on_start` — runs `sweep_expired_checkpoints` on
+    `AgentFactory.initialize()`.
+- **`AgentFactory.sweep_expired_checkpoints()`** public API for
+  out-of-band cleanup schedulers.
+
+### TaskResult extensions
+
+`TaskResult` (and the internal `AgentTaskResult`) gain two HITL fields:
+
+- `checkpoint_id`: populated when `status == "awaiting_human"`.
+- `pending_human_request`: the `PendingHumanRequest` describing what the
+  approver must decide on.
+
+`status` adds the `"awaiting_human"` state alongside `completed` /
+`failed`. Existing call sites that only check `status == "completed"`
+continue to work; treat `awaiting_human` separately when wiring HITL.
+
+### Tests
+
+- 33 HITL tests across `test_runtime_snapshot.py` (Phase 0 golden, 13),
+  `test_hitl_phase1.py` (sync surface, 11), `test_hitl_phase2.py`
+  (checkpoint store + config wiring, 14).
+- 4 end-to-end resume integration tests in `test_hitl_resume_e2e.py`
+  drive `run_from_tool_cursor` with mocked LLM + tool executor and
+  verify module state survives, the LLM is not called for the paused
+  turn, rejection injects a tool error, and `on_resume` fires before
+  the tool executes.
+- 708 / 708 passing.
+
+### Migration notes
+
+- No breaking change to existing call sites. `DeepResearch.run()` still
+  returns `TaskResult`; the new `awaiting_human` status is an additive
+  third state. Apps that only consume `completed` / `failed` continue
+  to work.
+- v1.4.0 will rename `TaskResult` to `RunResult` as a breaking change
+  (per `docs/23-hitl-design.md`); using the new HITL fields today is
+  forward-compatible.
+
+### Known limitations (deferred to Phase 3 / v1.4.0)
+
+- Concurrent batch's `_offload_refs` extraction relies on the field-name
+  convention from `_maybe_offload_result`; not yet decoupled into a
+  ContextManager API.
+- `CheckpointStore` / `PendingStore` are Protocols but only one
+  implementation each ships (filesystem / in-memory). Pluggable
+  Redis / Postgres backends are Phase 3.
+- Batch HITL approval (multiple pendings on one turn) is single-pending
+  in v1.3.0; first decides, others wait for resume. Phase 3 evolves
+  `effective_arguments` to `dict[tool_call_id, dict]`.
+- `on_human_request_created` audit event + transcript wiring deferred
+  to Phase 3.
+
 ## v1.2.6 (2026-04-22)
 
 **Profile 架构落地 — 通用 Agent Runtime + 可插拔 Profile / Strategy 层**

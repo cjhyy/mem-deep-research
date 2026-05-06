@@ -74,12 +74,21 @@ PROVIDER_REGISTRY: dict[str, tuple[str, str, str]] = {
 
 @dataclass
 class TaskResult:
-    """研究结果"""
+    """研究结果
+
+    Phase 2 HITL adds ``status="awaiting_human"`` alongside the existing
+    ``completed`` / ``failed``. When status is ``awaiting_human``:
+    - ``checkpoint_id`` identifies the persisted ``RuntimeSnapshot``
+    - ``pending_human_request`` describes what the approver must decide
+    - ``answer`` is ``""`` — the task has not produced a final answer yet
+
+    v1.4.0 replaces this class with :class:`RunResult` as a breaking change.
+    """
 
     task_id: str
     answer: str
     boxed_answer: str = ""
-    status: str = "completed"  # completed, failed
+    status: str = "completed"  # completed | failed | awaiting_human
     duration_seconds: float = 0.0
     log_path: pathlib.Path | None = None
     error: str | None = None
@@ -90,6 +99,10 @@ class TaskResult:
     error_type: str | None = None  # "llm_error", "tool_error", "config_error", "timeout"
     perf_metrics: dict | None = None
     checkpoints: list | None = None  # Turn-level progress checkpoints
+
+    # v1.3.0 HITL: populated when status == "awaiting_human"
+    checkpoint_id: str | None = None
+    pending_human_request: Any | None = None  # PendingHumanRequest
 
     @property
     def success(self) -> bool:
@@ -309,12 +322,25 @@ class DeepResearch:
     # Missing/invalid values here raise ConfigurationError and block initialization.
     _CRITICAL_CONFIG_FIELDS = {"provider_class", "model_name"}
 
+    # Pydantic error types that ALWAYS block initialization, regardless of
+    # which field they hit. Cross-field invariant violations (e.g.
+    # ``compact_at_ratio >= summarize_at_ratio``) surface as ``value_error``
+    # at the section level (``loc=('main_agent', 'context_manager')``) and
+    # cannot be safely "fall back to defaults" — the user's intent is
+    # contradictory and silently overriding it would surprise them later.
+    _CRITICAL_ERROR_TYPES = {"value_error"}
+
     def _validate_config(self) -> None:
         """Validate config against the Pydantic schema with fail-fast semantics.
 
+        Three classes of errors:
         - Critical fields (``provider_class``, ``model_name``): missing/invalid →
           raise :class:`ConfigValidationError`, block initialization.
-        - Non-critical fields: log a warning, continue with Pydantic defaults.
+        - Cross-field invariants (Pydantic ``value_error``, e.g. compact ratio
+          ordering): raise :class:`ConfigValidationError`. Falling back to
+          defaults would silently discard the user's intent.
+        - Per-field type/range violations on non-critical fields: log a
+          warning and continue with Pydantic defaults.
         - Import-time schema failures: re-raise (cannot run without the schema).
         """
         from pydantic import ValidationError as PydanticValidationError
@@ -333,8 +359,13 @@ class DeepResearch:
                 loc = err.get("loc", ())
                 field_path = ".".join(str(p) for p in loc)
                 field_name = loc[-1] if loc else ""
+                err_type = err.get("type", "")
                 line = f"  {field_path}: {err['msg']}"
-                if field_name in self._CRITICAL_CONFIG_FIELDS:
+                is_critical = (
+                    field_name in self._CRITICAL_CONFIG_FIELDS
+                    or err_type in self._CRITICAL_ERROR_TYPES
+                )
+                if is_critical:
                     critical_errors.append(line)
                 else:
                     non_critical_errors.append(line)
@@ -547,6 +578,8 @@ class DeepResearch:
             error_type=_classify_error(result.error) if result.error else None,
             perf_metrics=_perf if _perf else None,
             checkpoints=_checkpoints if _checkpoints else None,
+            checkpoint_id=result.checkpoint_id,
+            pending_human_request=result.pending_human_request,
         )
 
     async def resume(
@@ -613,6 +646,8 @@ class DeepResearch:
             error_type=_classify_error(result.error) if result.error else None,
             perf_metrics=_perf if _perf else None,
             checkpoints=_checkpoints if _checkpoints else None,
+            checkpoint_id=result.checkpoint_id,
+            pending_human_request=result.pending_human_request,
         )
 
     def resume_sync(
@@ -630,6 +665,75 @@ class DeepResearch:
 
         self._initialized = False
         return asyncio.run(_resume_and_close())
+
+    async def resume_with_human_decision(
+        self,
+        checkpoint_id: str,
+        decision: Any,
+        *,
+        task_description: str | None = None,
+        context: dict[str, Any] | None = None,
+        stream_queue: Any | None = None,
+    ) -> TaskResult:
+        """Deliver ``decision`` to a HITL-suspended task and resume execution.
+
+        Args:
+            checkpoint_id: ID returned in the suspended ``TaskResult.checkpoint_id``.
+            decision: :class:`HumanDecision` with ``approved`` + optional
+                ``payload={"args": {...}}`` to override tool arguments.
+            task_description: Optional override for the original task prompt.
+                Auto-resolved from the checkpoint snapshot when omitted —
+                pass explicitly only for migrating pre-v1.3.0 checkpoints
+                whose snapshot predates the field.
+            context: Optional user context (passed through to MCP tools).
+            stream_queue: Optional stream queue for resumed execution.
+
+        Returns:
+            :class:`TaskResult` — ``status == "completed"`` on success, or
+            ``"awaiting_human"`` if the resume triggered another HITL suspend.
+        """
+        await self._ensure_initialized()
+
+        result = await self._factory.resume_with_human_decision(
+            checkpoint_id=checkpoint_id,
+            decision=decision,
+            task_description=task_description,
+            stream_queue=stream_queue,
+            context=context,
+        )
+
+        _perf = {}
+        _turns = 0
+        _tool_calls = 0
+        _checkpoints = []
+        if result.log_path and result.log_path.exists():
+            try:
+                import json
+
+                _log_data = json.loads(result.log_path.read_text())
+                _perf = _log_data.get("perf_metrics", {})
+                _turns = _perf.get("main_loop_turns", {}).get("value", 0)
+                _tool_calls = _perf.get("main_loop_tool_calls", {}).get("value", 0)
+                _checkpoints = _log_data.get("checkpoints", [])
+            except Exception as e:
+                logger.debug(f"[DeepResearch] Failed to parse log metrics: {e}")
+
+        return TaskResult(
+            task_id=result.task_id,
+            answer=result.final_answer,
+            boxed_answer=result.boxed_answer,
+            status=result.status,
+            duration_seconds=result.duration_seconds,
+            log_path=result.log_path,
+            error=result.error,
+            turns=_turns,
+            tool_calls=_tool_calls,
+            error_type=_classify_error(result.error) if result.error else None,
+            perf_metrics=_perf if _perf else None,
+            checkpoints=_checkpoints if _checkpoints else None,
+            checkpoint_id=result.checkpoint_id,
+            pending_human_request=result.pending_human_request,
+        )
 
     def run_sync(
         self,
@@ -712,6 +816,8 @@ class DeepResearch:
                     error_type=_classify_error(r.error) if r.error else None,
                     perf_metrics=_perf if _perf else None,
                     checkpoints=_checkpoints if _checkpoints else None,
+                    checkpoint_id=r.checkpoint_id,
+                    pending_human_request=r.pending_human_request,
                 )
             )
         return research_results

@@ -55,6 +55,7 @@ from mem_deep_research_core.core.constants import (
     TOKEN_BUDGET_WARNING_RATIO,
     generate_message_id,
 )
+from mem_deep_research_core.core.hitl.exceptions import PendingHumanException
 from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.llm_call_handler import generate_reflection_prompt
 from mem_deep_research_core.core.memory import EvidenceItem, SessionMemory
@@ -521,6 +522,51 @@ class _RunState:
     perf_total_tool_time: float = 0.0
 
 
+@dataclass
+class _HitlLiveState:
+    """Live state bag refreshed each turn so HITL snapshot has fresh input.
+
+    Kept as a dataclass (not a dict) so field names are IDE-discoverable and
+    adding fields surfaces at call sites, not at runtime.
+    """
+
+    task_description: str = ""
+    message_history: list = field(default_factory=list)
+    turn_count: int = 0
+    last_assistant_text: str = ""
+    task_failed: bool = False
+    total_tool_calls_executed: int = 0
+    effective_mode: str = ""
+    reasoning_effort: str | None = None
+    reflection_pending: bool = False
+    adaptive_pending: bool = False
+    assistant_response_text: str = ""
+    current_tool_calls: list = field(default_factory=list)
+    current_tool_index: int = 0
+    completed_tool_results: list = field(default_factory=list)
+    effective_arguments: dict | None = None
+
+    def as_kwargs(self) -> dict:
+        """Expose the state as a kwarg dict for _build_runtime_snapshot."""
+        return {
+            "task_description": self.task_description,
+            "message_history": self.message_history,
+            "turn_count": self.turn_count,
+            "last_assistant_text": self.last_assistant_text,
+            "task_failed": self.task_failed,
+            "total_tool_calls_executed": self.total_tool_calls_executed,
+            "effective_mode": self.effective_mode,
+            "reasoning_effort": self.reasoning_effort,
+            "reflection_pending": self.reflection_pending,
+            "adaptive_pending": self.adaptive_pending,
+            "assistant_response_text": self.assistant_response_text,
+            "current_tool_calls": self.current_tool_calls,
+            "current_tool_index": self.current_tool_index,
+            "completed_tool_results": self.completed_tool_results,
+            "effective_arguments": self.effective_arguments,
+        }
+
+
 class MainLoopRunner:
     """主执行循环运行器
 
@@ -598,6 +644,11 @@ class MainLoopRunner:
         # 运行时上下文引用（在 run() 中设置）
         self._current_system_prompt: str = ""
 
+        # HITL live state — MainLoopRunner updates these every turn so that
+        # _build_runtime_snapshot can assemble a consistent snapshot when
+        # PendingHumanException is caught. Only touched by _run_inner.
+        self._hitl_state: _HitlLiveState = _HitlLiveState()
+
     def _build_profile_ctx(
         self,
         *,
@@ -646,6 +697,365 @@ class MainLoopRunner:
             context_manager=self.context_manager,
             llm_client=self.llm_client,
         )
+
+    # ------------------------------------------------------------------
+    # RuntimeSnapshot build / restore (HITL Phase 2)
+    # ------------------------------------------------------------------
+
+    def _update_hitl_state(
+        self,
+        *,
+        task_description: str | None = None,
+        message_history: list | None = None,
+        turn_count: int | None = None,
+        last_assistant_text: str | None = None,
+        task_failed: bool | None = None,
+        total_tool_calls_executed: int | None = None,
+        effective_mode: str | None = None,
+        reasoning_effort: str | None = None,
+        reflection_pending: bool | None = None,
+        adaptive_pending: bool | None = None,
+        assistant_response_text: str | None = None,
+        current_tool_calls: list | None = None,
+        current_tool_index: int | None = None,
+        completed_tool_results: list | None = None,
+        effective_arguments: dict | None = None,
+    ) -> None:
+        """Overwrite the live HITL state bag with the values provided.
+
+        Only non-None keyword arguments are written, so callers at different
+        turn-loop phases can update just the fields that changed.
+        """
+        state = self._hitl_state
+        if task_description is not None:
+            state.task_description = task_description
+        if message_history is not None:
+            state.message_history = message_history
+        if turn_count is not None:
+            state.turn_count = turn_count
+        if last_assistant_text is not None:
+            state.last_assistant_text = last_assistant_text
+        if task_failed is not None:
+            state.task_failed = task_failed
+        if total_tool_calls_executed is not None:
+            state.total_tool_calls_executed = total_tool_calls_executed
+        if effective_mode is not None:
+            state.effective_mode = effective_mode
+        if reasoning_effort is not None:
+            state.reasoning_effort = reasoning_effort
+        if reflection_pending is not None:
+            state.reflection_pending = reflection_pending
+        if adaptive_pending is not None:
+            state.adaptive_pending = adaptive_pending
+        if assistant_response_text is not None:
+            state.assistant_response_text = assistant_response_text
+        if current_tool_calls is not None:
+            state.current_tool_calls = current_tool_calls
+        if current_tool_index is not None:
+            state.current_tool_index = current_tool_index
+        if completed_tool_results is not None:
+            state.completed_tool_results = completed_tool_results
+        if effective_arguments is not None:
+            state.effective_arguments = effective_arguments
+
+    def _build_runtime_snapshot(
+        self,
+        *,
+        pending_request: "PendingHumanRequest",
+        task_description: str = "",
+        message_history: list,
+        turn_count: int,
+        last_assistant_text: str,
+        task_failed: bool,
+        total_tool_calls_executed: int,
+        effective_mode: str,
+        reasoning_effort: str | None = None,
+        reflection_pending: bool = False,
+        adaptive_pending: bool = False,
+        assistant_response_text: str = "",
+        current_tool_calls: list[dict] | None = None,
+        current_tool_index: int = 0,
+        completed_tool_results: list[tuple[str, str]] | None = None,
+        effective_arguments: dict | None = None,
+    ) -> "RuntimeSnapshot":
+        """Capture complete runtime state for a pending HITL suspend.
+
+        Only called from the outer catch-path; relies on ``build_snapshot``
+        to project module state into the snapshot dataclass.
+        """
+        from mem_deep_research_core.core.hitl.runtime_snapshot import build_snapshot
+
+        todo_state = (
+            self.todo_tracker.to_dict()
+            if self.todo_tracker is not None and getattr(self.todo_tracker, "enabled", False)
+            else None
+        )
+
+        return build_snapshot(
+            task_description=task_description,
+            message_history=message_history,
+            turn_count=turn_count,
+            session_memory=self.session_memory.to_dict(),
+            todo_state=todo_state,
+            last_assistant_text=last_assistant_text,
+            task_failed=task_failed,
+            tool_calls_executed=total_tool_calls_executed,
+            reflection_pending=reflection_pending,
+            adaptive_pending=adaptive_pending,
+            effective_mode=effective_mode,
+            reasoning_effort=reasoning_effort,
+            context_manager=self.context_manager,
+            monitor=self.monitor,
+            inline_skill_selector=self.inline_skill_selector,
+            llm_client=self.llm_client,
+            assistant_response_text=assistant_response_text,
+            current_tool_calls=current_tool_calls,
+            current_tool_index=current_tool_index,
+            completed_tool_results=completed_tool_results,
+            effective_arguments=effective_arguments,
+            pending_human_request=pending_request,
+        )
+
+    async def run_from_tool_cursor(
+        self,
+        snapshot: "RuntimeSnapshot",
+        decision: "HumanDecision",
+        *,
+        system_prompt: str,
+        main_agent_prompt_instance,
+        task_engine_cfg: dict | None,
+        task_description: str,
+        task_guidance: str,
+        tool_definitions: list,
+        keep_tool_result: int,
+    ) -> tuple[str, bool]:
+        """Resume a suspended run from the tool-execution cursor.
+
+        Contract:
+        - Skip the LLM call for the suspended turn (the assistant message with
+          ``tool_use`` is already in ``snapshot.message_history``).
+        - Skip the ``on_tool_start`` hook chain (it fired before the suspend;
+          re-running would double-fire side effects).
+        - Run the pending tool using ``effective_arguments`` merged with any
+          approver-supplied overrides in ``decision.payload["args"]``.
+        - Append the tool result and re-enter the normal loop from the next turn.
+
+        ``decision.approved=False`` injects a GuardrailError-style tool error
+        result, letting the LLM react to the rejection on the next turn.
+        """
+        from mem_deep_research_core.core.hitl.exceptions import PendingHumanException
+        from mem_deep_research_core.core.hitl.runtime_facade import (
+            RuntimeFacade,
+            set_current_runtime,
+        )
+
+        pending = snapshot.pending_human_request
+        if pending is None:
+            raise ValueError("Cannot resume: snapshot has no pending_human_request")
+
+        # Restore module state (context manager, monitor, inline skills, ContextVars).
+        self._restore_runtime_snapshot(snapshot)
+
+        # Resolve the pending tool from the snapshot's current tool batch.
+        pending_tool_call = None
+        for call in snapshot.current_tool_calls or []:
+            if call.get("id") == pending.tool_call_id:
+                pending_tool_call = call
+                break
+        if pending_tool_call is None:
+            # Snapshot may not track the tool batch (older pause points); fall
+            # back to reconstructing from the PendingHumanRequest payload if
+            # possible.
+            payload = pending.payload or {}
+            pending_tool_call = {
+                "id": pending.tool_call_id,
+                "tool_name": payload.get("tool") or payload.get("tool_name", ""),
+                "server_name": payload.get("server_name", ""),
+                "arguments": snapshot.effective_arguments or payload.get("args", {}),
+            }
+
+        # Merge approver-supplied argument overrides into effective arguments.
+        effective_args = dict(snapshot.effective_arguments or pending_tool_call.get("arguments") or {})
+        if decision.approved and decision.payload and isinstance(decision.payload.get("args"), dict):
+            effective_args.update(decision.payload["args"])
+
+        # Restore message_history as the loop's working buffer.
+        message_history = list(snapshot.message_history)
+
+        # Audit event onto transcript first (cheap, no hook dispatch). The
+        # ``on_resume`` / ``on_human_request_resumed`` hooks then fire for
+        # business-side handlers.
+        if self.transcript is not None:
+            from mem_deep_research_core.core.transcript import EventType as ET
+
+            try:
+                self.transcript.record(
+                    event_type=ET.HITL_REQUEST_RESUMED,
+                    data={
+                        "request_id": pending.request_id,
+                        "tool_call_id": pending.tool_call_id,
+                        "approved": decision.approved,
+                        "reason": (decision.reason or "")[:200],
+                        "decided_by": decision.decided_by,
+                    },
+                    turn=pending.turn_number,
+                    agent_name=self.agent_name,
+                )
+            except Exception as exc:  # pragma: no cover — best-effort
+                logger.debug("[HITL] transcript HITL_REQUEST_RESUMED failed: %s", exc)
+
+        # Two hooks fire here, on purpose:
+        # - on_resume (system-resource): generic durable-execution rebuild
+        #   (MCP sessions, DB pools, etc). Not HITL-specific.
+        # - on_human_request_resumed (HITL audit): records the resume event
+        #   for transcript / approval-trail purposes.
+        # Each fires independently so a broken business notifier doesn't
+        # block the resource rebuild path.
+        for hook_name in ("on_resume", "on_human_request_resumed"):
+            try:
+                await self.hooks.call(
+                    hook_name,
+                    HookContext(
+                        hook_name=hook_name,
+                        turn_number=pending.turn_number,
+                        extra={
+                            "snapshot": snapshot,
+                            "decision": decision,
+                            "request": pending,
+                        },
+                    ),
+                )
+            except Exception as hook_err:  # pragma: no cover — best-effort
+                logger.warning(
+                    "[HITL] %s hook failed for %s: %s",
+                    hook_name,
+                    pending.request_id,
+                    hook_err,
+                )
+
+        # Bind the runtime facade for the resumed run. HITL config flags
+        # stay consistent with the original run via cfg.hitl.
+        hitl_cfg = self.cfg.get("hitl", {}) if hasattr(self.cfg, "get") else {}
+        runtime_facade = RuntimeFacade(
+            hooks=self.hooks,
+            enabled=bool(hitl_cfg.get("enabled", True)),
+            transcript=self.transcript,
+            agent_name=self.agent_name,
+        )
+        runtime_token = set_current_runtime(runtime_facade)
+        try:
+            if not decision.approved:
+                # Two strategies, configurable via cfg.hitl.rejection_strategy:
+                # - "tool_error" (default): inject a rejection tool_result so
+                #   the LLM can react and continue (e.g. acknowledge,
+                #   suggest alternatives, abort gracefully on its own).
+                # - "abort_task": skip LLM entirely, raise HitlRejectedError.
+                #   Pipeline translates to status=failed. Use when rejected
+                #   operations must never have downstream consequences.
+                rejection_strategy = str(
+                    hitl_cfg.get("rejection_strategy", "tool_error")
+                )
+                if rejection_strategy == "abort_task":
+                    from mem_deep_research_core.core.hitl.exceptions import (
+                        HitlRejectedError,
+                    )
+
+                    raise HitlRejectedError(pending, decision)
+
+                # tool_error path: inject a rejected-tool result so the LLM can react.
+                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                    {
+                        "server_name": pending_tool_call.get("server_name", ""),
+                        "tool_name": pending_tool_call.get("tool_name", ""),
+                        "error": f"[HITL rejected] {decision.reason or 'user rejected'}",
+                    }
+                )
+                message_history.append(
+                    make_msg(
+                        "tool_result",
+                        tool_result_for_llm,
+                        MT.TOOL_RESULT,
+                    )
+                )
+            else:
+                # Execute the pending tool with resolved arguments. Skip
+                # on_tool_start to respect the "hook fires once" contract.
+                pending_tool_call = dict(pending_tool_call, arguments=effective_args)
+                tool_result, _dur = await self.tool_executor.execute_single_tool(
+                    server_name=pending_tool_call.get("server_name", ""),
+                    tool_name=pending_tool_call.get("tool_name", ""),
+                    arguments=effective_args,
+                    call_id=pending_tool_call.get("id", ""),
+                    agent_name=self.agent_name,
+                    turn_number=pending.turn_number,
+                )
+                tool_result_for_llm = self.output_formatter.format_tool_result_for_user(
+                    tool_result
+                )
+                message_history.append(
+                    make_msg("tool_result", tool_result_for_llm, MT.TOOL_RESULT)
+                )
+
+            # Re-enter the normal loop with skip_init=True so the module
+            # state we just restored (monitor counters, session memory,
+            # context manager offload/dedup, inline-skill pending list)
+            # survives into the resumed turns. The post-tool state is
+            # already folded into message_history above.
+            return await self._run_inner(
+                system_prompt=system_prompt,
+                message_history=message_history,
+                tool_definitions=tool_definitions,
+                main_agent_prompt_instance=main_agent_prompt_instance,
+                task_engine_cfg=task_engine_cfg,
+                task_description=task_description,
+                task_guidance=task_guidance,
+                keep_tool_result=keep_tool_result,
+                resume_from=None,
+                skip_init=True,
+            )
+        except PendingHumanException:
+            # A second pending (same or different tool) — bubble for a
+            # fresh checkpoint. Phase 3 merges this into the existing one.
+            raise
+        finally:
+            from mem_deep_research_core.core.hitl.runtime_facade import (
+                _runtime_var,
+            )
+
+            _runtime_var.reset(runtime_token)
+
+    def _restore_runtime_snapshot(self, snapshot: "RuntimeSnapshot") -> None:
+        """Rehydrate modules from a RuntimeSnapshot produced by
+        :meth:`_build_runtime_snapshot`.
+
+        Caller is responsible for rebuilding message_history / turn cursor
+        into loop-local variables — this method only touches ``self``-owned
+        state (session memory, todo tracker, context manager, monitor,
+        inline skill selector, ContextVars).
+        """
+        from mem_deep_research_core.core.hitl.runtime_snapshot import (
+            restore_snapshot,
+        )
+        from mem_deep_research_core.core.memory import SessionMemory
+
+        restore_snapshot(
+            snapshot,
+            context_manager=self.context_manager,
+            monitor=self.monitor,
+            inline_skill_selector=self.inline_skill_selector,
+            llm_client=self.llm_client,
+        )
+
+        # Session memory restoration — new instance so threading.Lock is fresh.
+        self.session_memory = SessionMemory.from_dict(snapshot.session_memory or {})
+
+        # Todo tracker restoration preserves the enabled flag.
+        if snapshot.todo_state is not None and self.todo_tracker is not None:
+            from mem_deep_research_core.core.todo_tracker import TodoTracker
+
+            self.todo_tracker = TodoTracker.from_dict(
+                snapshot.todo_state, enabled=self.todo_tracker.enabled
+            )
 
     def _record_event(self, event_type, data=None, turn=0, ref_event_id=None, duration_ms=None):
         """Record a transcript event (no-op if transcript not configured)."""
@@ -706,20 +1116,78 @@ class MainLoopRunner:
         except Exception:
             pass
 
-        async with self._observers.around_agent_run(_obs_ctx):
-            final_answer, is_simple = await self._run_inner(
-                system_prompt,
-                message_history,
-                tool_definitions,
-                main_agent_prompt_instance,
-                task_engine_cfg,
-                task_description,
-                task_guidance,
-                keep_tool_result,
-                resume_from,
+        # Bind a RuntimeFacade for the duration of the run so HITL hooks can
+        # reach ctx.runtime.wait_for_human(...). Sub-agents inherit this same
+        # facade via ContextVar propagation; the sub-agent restriction is
+        # enforced inside wait_for_human() via _is_sub_agent_var.
+        from mem_deep_research_core.core.hitl.runtime_facade import (
+            RuntimeFacade,
+            set_current_runtime,
+        )
+
+        # Resolve HITL config (falls back to defaults when unconfigured).
+        hitl_cfg = self.cfg.get("hitl", {}) if hasattr(self.cfg, "get") else {}
+        runtime_facade = RuntimeFacade(
+            hooks=self.hooks,
+            enabled=bool(hitl_cfg.get("enabled", True)),
+            transcript=self.transcript,
+            agent_name=self.agent_name,
+        )
+        runtime_token = set_current_runtime(runtime_facade)
+        try:
+            async with self._observers.around_agent_run(_obs_ctx):
+                try:
+                    final_answer, is_simple = await self._run_inner(
+                        system_prompt,
+                        message_history,
+                        tool_definitions,
+                        main_agent_prompt_instance,
+                        task_engine_cfg,
+                        task_description,
+                        task_guidance,
+                        keep_tool_result,
+                        resume_from,
+                    )
+                except PendingHumanException as pending:
+                    # HITL suspend — attach a RuntimeSnapshot built from the
+                    # live state we've been tracking each turn and re-raise.
+                    # Pipeline.execute_task_pipeline catches and persists it.
+                    snapshot = self._build_runtime_snapshot(
+                        pending_request=pending.request,
+                        **self._hitl_state.as_kwargs(),
+                    )
+                    pending.snapshot = snapshot
+                    # Fire on_suspend before re-raise so hook authors can
+                    # close MCP sessions / flush pending writes without
+                    # racing the pipeline's checkpoint save.
+                    try:
+                        await self.hooks.call(
+                            "on_suspend",
+                            HookContext(
+                                hook_name="on_suspend",
+                                turn_number=pending.request.turn_number,
+                                extra={
+                                    "request": pending.request,
+                                    "snapshot": snapshot,
+                                },
+                            ),
+                        )
+                    except Exception as hook_err:  # pragma: no cover — best-effort
+                        logger.warning(
+                            "[HITL] on_suspend hook failed for %s: %s",
+                            pending.request.request_id,
+                            hook_err,
+                        )
+                    _obs_ctx.final_answer = ""
+                    raise
+                _obs_ctx.final_answer = final_answer
+                return final_answer, is_simple
+        finally:
+            from mem_deep_research_core.core.hitl.runtime_facade import (
+                _runtime_var,
             )
-            _obs_ctx.final_answer = final_answer
-            return final_answer, is_simple
+
+            _runtime_var.reset(runtime_token)
 
     async def _run_inner(
         self,
@@ -732,17 +1200,34 @@ class MainLoopRunner:
         task_guidance: str,
         keep_tool_result: int,
         resume_from: dict | None = None,
+        skip_init: bool = False,
     ) -> tuple[str, bool]:
-        """原 run() 主体；被 observer context manager 包裹。"""
+        """原 run() 主体；被 observer context manager 包裹。
+
+        Args:
+            skip_init: When True, skip the monitor / context_manager /
+                session_memory / inline_skill_selector reset. Required for
+                HITL resume (``run_from_tool_cursor``) so ``_restore_runtime_snapshot``
+                state is preserved. Must NOT be set on a fresh run — leftover
+                state from a prior task would leak in.
+        """
         max_turns = self.cfg.main_agent.max_turns
         if max_turns < 0:
             max_turns = sys.maxsize
         max_tool_calls = self.cfg.main_agent.max_tool_calls_per_turn
 
-        # 初始化监控和计数器
-        self.monitor.reset()
-        self.context_manager.reset()
-        self.session_memory = SessionMemory()  # Reset session memory between runs
+        if not skip_init:
+            # 初始化监控和计数器
+            self.monitor.reset()
+            self.context_manager.reset()
+            self.session_memory = SessionMemory()  # Reset session memory between runs
+            if self.inline_skill_selector:
+                self.inline_skill_selector.reset()
+
+        # These two bindings must run on both fresh and resumed paths: they
+        # re-attach the (possibly restored) session_memory to the context
+        # manager and re-wire the profile. Idempotent, so no harm running
+        # them again after a restore.
         self.context_manager.set_session_memory(self.session_memory)
         # Phase 2a：注入 profile，让 window_strategy 在 on_compact 时触发 strategy 链
         self.context_manager.set_profile(self.profile)
@@ -752,8 +1237,6 @@ class MainLoopRunner:
         token_budget = TokenBudgetTracker(budget=task_token_budget)
         if token_budget.enabled:
             logger.info(f"[{self.agent_name}] Token budget: {task_token_budget} tokens")
-        if self.inline_skill_selector:
-            self.inline_skill_selector.reset()
 
         # Resume: restore state from previous run
         if resume_from:
@@ -769,7 +1252,7 @@ class MainLoopRunner:
         await self.stream_handler.stream_start_llm(self.agent_name)
 
         # Hook: on_agent_start
-        self.hooks.call(
+        await self.hooks.call(
             "on_agent_start",
             HookContext(
                 hook_name="on_agent_start",
@@ -904,6 +1387,22 @@ class MainLoopRunner:
             self._record_event("turn_start", {"turn": turn_count}, turn=turn_count)
             logger.debug(f"\n--- Main Agent Turn {turn_count} ---")
 
+            # HITL: sync live state so a mid-turn PendingHumanException has a
+            # fresh snapshot source. Cheap dict write — no allocation unless
+            # a value actually changed.
+            self._update_hitl_state(
+                task_description=task_description,
+                message_history=message_history,
+                turn_count=turn_count,
+                last_assistant_text=last_assistant_text,
+                task_failed=task_failed,
+                total_tool_calls_executed=total_tool_calls_executed,
+                effective_mode=effective_mode,
+                reasoning_effort=getattr(self.llm_client, "reasoning_effort", None),
+                reflection_pending=_reflection_pending,
+                adaptive_pending=_adaptive_pending,
+            )
+
             # Profile hook: on_turn_start（Phase 1 no-op for StandardProfile）
             await self.profile.on_turn_start(
                 self._build_profile_ctx(
@@ -917,7 +1416,7 @@ class MainLoopRunner:
             )
 
             # Hook: on_turn_start
-            self.hooks.call(
+            await self.hooks.call(
                 "on_turn_start",
                 HookContext(
                     hook_name="on_turn_start",
@@ -1026,7 +1525,7 @@ class MainLoopRunner:
                 )
                 # Hook: on_offload_evidence_prep — append tool-specific guidance
                 if self.hooks.has_hooks("on_offload_evidence_prep"):
-                    hook_result = self.hooks.call(
+                    hook_result = await self.hooks.call(
                         "on_offload_evidence_prep",
                         HookContext(
                             hook_name="on_offload_evidence_prep",
@@ -1435,7 +1934,7 @@ class MainLoopRunner:
                             f"history now {len(message_history)} messages",
                             "info",
                         )
-                        self.hooks.call(
+                        await self.hooks.call(
                             "on_context_compact",
                             HookContext(
                                 hook_name="on_context_compact",
@@ -1482,7 +1981,7 @@ class MainLoopRunner:
 
             # Hook: on_tool_filter — 去重后、执行前，可修改/重排/拦截工具调用列表
             if to_execute and self.hooks.has_hooks("on_tool_filter"):
-                filtered = self.hooks.call(
+                filtered = await self.hooks.call(
                     "on_tool_filter",
                     HookContext(
                         hook_name="on_tool_filter",
@@ -1677,7 +2176,7 @@ class MainLoopRunner:
 
             # Hook: on_context_compact — 压缩发生后通知业务层
             if action is not None:
-                self.hooks.call(
+                await self.hooks.call(
                     "on_context_compact",
                     HookContext(
                         hook_name="on_context_compact",
@@ -1703,9 +2202,19 @@ class MainLoopRunner:
             if assistant_response_text is not None:
                 last_assistant_text = assistant_response_text
 
+            # HITL: refresh live state after tools executed so the next
+            # mid-turn PendingHumanException captures up-to-date counters.
+            self._update_hitl_state(
+                message_history=message_history,
+                last_assistant_text=last_assistant_text,
+                task_failed=task_failed,
+                total_tool_calls_executed=total_tool_calls_executed,
+                assistant_response_text=assistant_response_text or "",
+            )
+
             # Hook: on_turn_end
             tool_calls_count = len(tool_calls[0]) if tool_calls and len(tool_calls) > 0 else 0
-            self.hooks.call(
+            await self.hooks.call(
                 "on_turn_end",
                 HookContext(
                     hook_name="on_turn_end",
@@ -1761,7 +2270,7 @@ class MainLoopRunner:
 
                 # Hook: on_reflection_build — 可修改反思 prompt
                 if self.hooks.has_hooks("on_reflection_build"):
-                    modified_prompt = self.hooks.call(
+                    modified_prompt = await self.hooks.call(
                         "on_reflection_build",
                         HookContext(
                             hook_name="on_reflection_build",
@@ -1792,7 +2301,7 @@ class MainLoopRunner:
         )
 
         # Hook: on_agent_end
-        self.hooks.call(
+        await self.hooks.call(
             "on_agent_end",
             HookContext(
                 hook_name="on_agent_end",
@@ -2049,7 +2558,7 @@ class MainLoopRunner:
                         ),
                     },
                 )
-                hook_result = self.hooks.call("on_route_classify", hook_ctx)
+                hook_result = self.hooks.call_sync("on_route_classify", hook_ctx)
                 _deterministic_result = router._parse_hook_result(hook_result)
 
             # 2. 结构信号路由（零成本）
@@ -2226,6 +2735,10 @@ class MainLoopRunner:
                                 parent_context_manager=self.context_manager,
                             )
                             return call["id"], call["server_name"], call["tool_name"], result
+                        except PendingHumanException:
+                            # HITL suspend must propagate past this catch; outer
+                            # main loop owns the checkpoint decision (Phase 2).
+                            raise
                         except Exception as e:
                             logger.error(f"Sub-agent '{call['server_name']}' failed: {e}")
                             return (
@@ -2243,8 +2756,12 @@ class MainLoopRunner:
                 # Normalize any unexpected exceptions (e.g., CancelledError escaping
                 # the inner try) into error tuples so the rest of the pipeline
                 # (offload/transcript/semaphore release) runs to completion.
+                # PendingHumanException is an explicit exception: it MUST bubble
+                # so the outer main loop can checkpoint (Phase 2 contract).
                 _normalized: list = []
                 for i, item in enumerate(agent_results):
+                    if isinstance(item, PendingHumanException):
+                        raise item
                     if isinstance(item, BaseException):
                         call = agent_calls[i]
                         logger.error(
@@ -2519,7 +3036,21 @@ class MainLoopRunner:
                 )
                 tasks = [self._execute_one_regular_tool(c) for c in batch_calls]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # HITL Phase 2: if any call in this concurrent batch hit a
+                # PendingHumanException, we still drain the batch (other
+                # tools are already running / finished) so the checkpoint
+                # captures their completed results via offload refs. Only
+                # the first pending is honoured — later pendings wait for
+                # resume (Phase 3 adds batch-pending support).
+                first_pending: PendingHumanException | None = None
+                completed_tool_results: list[tuple[str, str]] = []
+
                 for i, result in enumerate(results):
+                    if isinstance(result, PendingHumanException):
+                        if first_pending is None:
+                            first_pending = result
+                        continue
                     if isinstance(result, Exception):
                         call = batch_calls[i]
                         logger.error(f"Concurrent tool {call.get('tool_name')} failed: {result}")
@@ -2531,6 +3062,24 @@ class MainLoopRunner:
                         )
                     else:
                         all_results.append(result)
+                        # Completed result's offload ref (if any) is the
+                        # durable handle used by resume to re-associate it
+                        # with its tool_call_id.
+                        call_id, tool_result_for_llm = result
+                        offload_refs = self.context_manager.extract_offload_refs(
+                            tool_result_for_llm
+                        )
+                        if offload_refs:
+                            completed_tool_results.append((call_id, offload_refs[0]))
+
+                if first_pending is not None:
+                    # Record batch-level completed results on the HITL state
+                    # bag so _build_runtime_snapshot captures them.
+                    if completed_tool_results:
+                        existing = list(self._hitl_state.completed_tool_results or [])
+                        existing.extend(completed_tool_results)
+                        self._update_hitl_state(completed_tool_results=existing)
+                    raise first_pending
             else:
                 # 串行执行（non-concurrent 或单个 concurrent）
                 for call in batch_calls:
@@ -2553,6 +3102,9 @@ class MainLoopRunner:
                     spawn_result = await self._run_spawned_agent(
                         task_desc, keep_tool_result, max_turns=spawn_max_turns
                     )
+            except PendingHumanException:
+                # HITL suspend — let it propagate to the outer main loop.
+                raise
             except Exception as e:
                 logger.error(f"spawn_agent failed: {e}")
                 spawn_result = f"[Spawn Error] {str(e)[:500]}"
@@ -2586,6 +3138,8 @@ class MainLoopRunner:
             )
             out = []
             for i, r in enumerate(results):
+                if isinstance(r, PendingHumanException):
+                    raise r
                 if isinstance(r, Exception):
                     logger.error(f"spawn_agent parallel task failed: {r}")
                     out.append((

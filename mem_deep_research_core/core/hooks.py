@@ -31,7 +31,9 @@
         return original_fn(ctx)  # 其他工具用原逻辑
 """
 
+import asyncio
 import bisect
+import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -42,6 +44,44 @@ from mem_deep_research_core.exceptions import GuardrailError
 logger = logging.getLogger("mem_deep_research")
 
 T = TypeVar("T")
+
+
+def _is_awaitable(value: Any) -> bool:
+    """Return True if value is a coroutine/awaitable that should be awaited."""
+    return inspect.iscoroutine(value) or inspect.isawaitable(value)
+
+
+def _get_pending_human_exception_cls() -> type[BaseException]:
+    """Resolve :class:`PendingHumanException` lazily to avoid import cycles.
+
+    hooks.py is imported extremely early; hitl.exceptions depends on
+    hitl.types, which is fine but we prefer to keep hooks.py self-contained
+    and avoid a top-level import side effect.
+    """
+    from mem_deep_research_core.core.hitl.exceptions import PendingHumanException
+
+    return PendingHumanException
+
+
+def _get_hitl_rejected_cls() -> type[BaseException]:
+    """Resolve :class:`HitlRejectedError` lazily (same rationale as above).
+
+    Like ``PendingHumanException``, this is a runtime control-flow exception
+    that must propagate past the hook fallthrough so the pipeline catch can
+    translate it to ``status=failed``.
+    """
+    from mem_deep_research_core.core.hitl.exceptions import HitlRejectedError
+
+    return HitlRejectedError
+
+
+class AsyncHookInSyncContextError(RuntimeError):
+    """Raised by :meth:`HookRegistry.call_sync` when a registered hook returns a coroutine.
+
+    Treated as a hard programmer error: hook author used async in a sync
+    call site. Propagates through the fallthrough catch-all so the bug
+    surfaces immediately instead of being silently masked.
+    """
 
 
 @dataclass
@@ -81,6 +121,19 @@ class HookContext:
 
     # 额外数据 (观测性数据如 assistant_text, message_count, total_tool_calls 等通过此字段传递)
     extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def runtime(self):
+        """Return the current :class:`RuntimeFacade`, resolved from ContextVar.
+
+        Imported lazily to avoid a circular import between hooks.py and
+        hitl/runtime_facade.py (the facade depends on HookRegistry).
+        """
+        from mem_deep_research_core.core.hitl.runtime_facade import (
+            get_current_runtime,
+        )
+
+        return get_current_runtime()
 
 
 # 钩子函数类型: (context, original_fn) -> result
@@ -133,6 +186,14 @@ class HookRegistry:
         "on_offload_evidence_prep",  # offload evidence sidecar prompt 构建 (可追加 tool-specific 指导)
         # 输入编译
         "on_query_compile",  # 用户 query 编译后 (可修改 query / 追加 attachments)
+        # Durable execution / HITL (Phase 0: 注册但未落地触发点)
+        "on_suspend",  # 任务 suspend 前 (资源清理, 如 close MCP session)
+        "on_resume",  # 任务 resume 后 (资源重建)
+        # HITL: 人审批请求生命周期通知 (业务侧 → email/Slack/webhook/transcript)
+        "on_human_request_created",  # canonical name (v1.3.0+)
+        "on_human_request_decided",  # decision delivered to wait_for_human
+        "on_human_request_resumed",  # resume_with_human_decision 入口触发
+        "on_await_human",  # DEPRECATED alias of on_human_request_created — fire alongside for backward compat; remove in v1.4.0
     ]
 
     def __init__(self):
@@ -190,11 +251,12 @@ class HookRegistry:
         """
         self._default_fns[hook_name] = default_fn
 
-    def call(self, hook_name: str, ctx: HookContext) -> Any:
+    async def call(self, hook_name: str, ctx: HookContext) -> Any:
         """
-        调用钩子
+        Async 调用钩子。
 
         按优先级链式调用所有注册的钩子，每个钩子都可以选择是否调用下一个。
+        支持同步钩子（原生执行，不走 to_thread）和异步钩子（await）。
 
         Args:
             hook_name: 钩子名称
@@ -211,22 +273,43 @@ class HookRegistry:
         default_fn = self._default_fns.get(hook_name, lambda c: None)
 
         if not registered:
-            # 没有注册钩子，直接执行默认逻辑
-            return default_fn(ctx)
+            result = default_fn(ctx)
+            if _is_awaitable(result):
+                result = await result
+            return result
 
         # 构建调用链（每个用户钩子包裹 try-except，避免一个坏钩子终止整个运行）
+        # Chain 返回值可能是同步值或 coroutine；调用方负责 await。
         def build_chain(remaining_hooks, final_fn):
             if not remaining_hooks:
-                return final_fn
+                async def terminal(c: HookContext):
+                    result = final_fn(c)
+                    if _is_awaitable(result):
+                        result = await result
+                    return result
+
+                return terminal
 
             _, current_hook = remaining_hooks[0]
-            next_fn = build_chain(remaining_hooks[1:], final_fn)
+            next_chain = build_chain(remaining_hooks[1:], final_fn)
 
-            def chain_fn(c: HookContext):
+            pending_human_cls = _get_pending_human_exception_cls()
+            hitl_rejected_cls = _get_hitl_rejected_cls()
+
+            async def chain_fn(c: HookContext):
                 try:
-                    return current_hook(c, next_fn)
-                except (GuardrailError, KeyboardInterrupt, SystemExit):
-                    raise  # 护栏异常和系统异常不能被吞掉
+                    result = current_hook(c, next_chain)
+                    if _is_awaitable(result):
+                        result = await result
+                    return result
+                except (
+                    GuardrailError,
+                    KeyboardInterrupt,
+                    SystemExit,
+                    pending_human_cls,
+                    hitl_rejected_cls,
+                ):
+                    raise  # 护栏/系统异常/HITL suspend / HITL abort 不能被吞掉
                 except Exception as e:
                     hook_label = getattr(current_hook, "__name__", repr(current_hook))
                     logger.error(
@@ -234,8 +317,79 @@ class HookRegistry:
                         f"Falling through to next handler.",
                         exc_info=True,
                     )
-                    # Fall through to next hook / default
-                    return next_fn(c)
+                    return await next_chain(c)
+
+            return chain_fn
+
+        chain = build_chain(registered, default_fn)
+        return await chain(ctx)
+
+    def call_sync(self, hook_name: str, ctx: HookContext) -> Any:
+        """
+        同步调用钩子（仅用于同步上下文）。
+
+        所有注册的 hook 和 default_fn 都必须是同步函数，否则抛 RuntimeError。
+        Phase 0 保留同步路径，让纯同步 caller 不需要引入 event loop。
+
+        Args:
+            hook_name: 钩子名称
+            ctx: 钩子上下文
+
+        Returns:
+            钩子执行结果
+        """
+        if hook_name not in self.SUPPORTED_HOOKS:
+            raise ValueError(f"Unknown hook: {hook_name}")
+
+        ctx.hook_name = hook_name
+        registered = self._hooks.get(hook_name, [])
+        default_fn = self._default_fns.get(hook_name, lambda c: None)
+
+        def ensure_sync(result: Any, where: str) -> Any:
+            if _is_awaitable(result):
+                raise AsyncHookInSyncContextError(
+                    f"[Hooks] call_sync('{hook_name}') got async result from {where}. "
+                    f"Use `await hooks.call(...)` in an async context, "
+                    f"or register a synchronous hook."
+                )
+            return result
+
+        if not registered:
+            return ensure_sync(default_fn(ctx), "default_fn")
+
+        def build_chain(remaining_hooks, final_fn):
+            if not remaining_hooks:
+                def terminal(c: HookContext):
+                    return ensure_sync(final_fn(c), "default_fn")
+
+                return terminal
+
+            _, current_hook = remaining_hooks[0]
+            next_chain = build_chain(remaining_hooks[1:], final_fn)
+
+            pending_human_cls = _get_pending_human_exception_cls()
+            hitl_rejected_cls = _get_hitl_rejected_cls()
+
+            def chain_fn(c: HookContext):
+                try:
+                    return ensure_sync(current_hook(c, next_chain), repr(current_hook))
+                except (
+                    GuardrailError,
+                    KeyboardInterrupt,
+                    SystemExit,
+                    AsyncHookInSyncContextError,
+                    pending_human_cls,
+                    hitl_rejected_cls,
+                ):
+                    raise
+                except Exception as e:
+                    hook_label = getattr(current_hook, "__name__", repr(current_hook))
+                    logger.error(
+                        f"[Hooks] Hook '{hook_name}' ({hook_label}) raised {type(e).__name__}: {e}. "
+                        f"Falling through to next handler.",
+                        exc_info=True,
+                    )
+                    return next_chain(c)
 
             return chain_fn
 
@@ -397,6 +551,42 @@ def on_offload_evidence_prep(priority: int = 0):
 def on_query_compile(priority: int = 0):
     """用户 query 编译后钩子 — 可修改 query 或追加 attachments"""
     return hooks.register("on_query_compile", priority)
+
+
+def on_suspend(priority: int = 0):
+    """任务 suspend 前钩子 — 资源清理（close MCP session / flush writes）"""
+    return hooks.register("on_suspend", priority)
+
+
+def on_resume(priority: int = 0):
+    """任务 resume 后钩子 — 重建外部资源"""
+    return hooks.register("on_resume", priority)
+
+
+def on_human_request_created(priority: int = 0):
+    """HITL 请求创建时钩子 — 业务侧通知审批者 (Slack / email / UI / webhook)。
+
+    v1.3.0 起的官方名称；同时仍 fire 旧名 ``on_await_human`` 一个版本周期。
+    """
+    return hooks.register("on_human_request_created", priority)
+
+
+def on_human_request_decided(priority: int = 0):
+    """HITL 决定送达时钩子 — 用于审计追溯 (写 transcript / 通知请求方)。"""
+    return hooks.register("on_human_request_decided", priority)
+
+
+def on_human_request_resumed(priority: int = 0):
+    """HITL resume 入口触发时钩子 — 用于审计追溯。"""
+    return hooks.register("on_human_request_resumed", priority)
+
+
+def on_await_human(priority: int = 0):
+    """[DEPRECATED v1.3.0] use on_human_request_created instead.
+
+    Will be removed in v1.4.0. Both hooks fire on the same event for now.
+    """
+    return hooks.register("on_await_human", priority)
 
 
 # ============================================================

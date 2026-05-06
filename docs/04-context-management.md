@@ -157,6 +157,80 @@ context_manager:
   compact_keep_recent: 3      # 保留最近轮数
 ```
 
+## 结果生命周期（Result Lifecycle）
+
+工具结果从产生到压缩到恢复的完整链路。v1.3.0 把这条链作为 Runtime Contract 收口，每个阶段有明确的状态转换：
+
+```text
+                  ┌──────────────────────────────────────────────────┐
+                  │  ToolExecutor.execute_single_tool                │
+                  │  → format → tool_result_for_llm dict             │
+                  └──────────────────────────────────────────────────┘
+                                       │
+                                       ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  ContextManager.backup_large_result(result, tool, turn)     │
+        │                                                             │
+        │  if len(result) >= result_offload_threshold:                │
+        │      write to <offload_dir>/<ref>.txt                       │
+        │      OffloadRecord(state="backed_up") in registry           │
+        │      message["_offload_refs"] = [ref]                       │
+        └─────────────────────────────────────────────────────────────┘
+                                       │
+                              (turns accumulate)
+                                       │
+                                       ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  ContextManager.finalize_offload_candidates(...)            │
+        │                                                             │
+        │  for msg older than keep_recent:                            │
+        │      replace content with [OFFLOADED:ref|chars] marker      │
+        │      msg["_type"] = MT.OFFLOADED                            │
+        │      OffloadRecord.state := "offloaded"                     │
+        └─────────────────────────────────────────────────────────────┘
+                                       │
+                       (orthogonal: token pressure)
+                                       │
+                                       ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  ContextManager.apply_compact / apply_summarize             │
+        │  → ObservationMasking → LLMSummarize → BinaryReduction      │
+        │  (only operates on message TEXT; offload registry untouched)│
+        └─────────────────────────────────────────────────────────────┘
+                                       │
+                       (LLM requests detail back)
+                                       │
+                                       ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  read_result(ref)  →  ContextManager.restore_single_file    │
+        │  reads the .txt file, returns full text. Marker stays put;  │
+        │  the LLM sees the read_result tool call's response.         │
+        └─────────────────────────────────────────────────────────────┘
+                                       │
+                          (process restart / HITL resume)
+                                       │
+                                       ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  ContextManager.restore_offloaded_content(message_history)  │
+        │  →  scan for [OFFLOADED:...] markers, optionally reload     │
+        │  →  _rebuild_registry_from_history rebuilds OffloadRecord   │
+        │     from message sidecar fields, even if registry was lost. │
+        └─────────────────────────────────────────────────────────────┘
+```
+
+关键不变量（被 e2e 测试 `tests/test_result_lifecycle_e2e.py` 锁定）：
+
+- 每个 disk 上的 `.txt` 文件对应一条 registry entry，反之亦然 — 没有 orphan 文件，没有 dangling registry。
+- `_offload_refs` sidecar 字段是 durable handle 列表；`OFFLOADED:` marker 是状态升级信号。冷启动 (`_rebuild_registry_from_history`) 同时看到两者时，marker 优先（`state="offloaded"`）。
+- offload 与 compact 正交：observation masking 只改 message TEXT，不动 offload registry；offload 只改大结果消息的 `content` 和 `_type`，不动其他消息。
+- `read_result(ref)` 在任何 marker 状态下都能拉回原文（只要 `.txt` 仍在 disk 上）。
+- HITL resume / process restart 后通过 `RuntimeSnapshot.context_manager_state`（含 `offload_registry` / `dedup_cache` / `compacted_turns`）一次性恢复，无需重读 disk；冷启动的 `_rebuild_registry_from_history` 是 fallback。
+
+代码引用：
+- `mem_deep_research_core/core/context_manager.py` — `backup_large_result` / `finalize_offload_candidates` / `apply_compact` / `restore_single_file` / `_rebuild_registry_from_history` / `merge_offload_registry`
+- `mem_deep_research_core/core/main_loop.py::_maybe_offload_result` — 每轮工具结果走的 offload 入口
+- `tests/test_result_lifecycle_e2e.py` — 7-stage 端到端回归
+
 ## ContextManager API
 
 ```python

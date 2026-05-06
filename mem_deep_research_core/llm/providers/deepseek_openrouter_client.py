@@ -58,6 +58,23 @@ class DeepSeekOpenRouterClient(OpenAICompatibleClient):
             params["tools"] = pending
         return params
 
+    # ------------------------------------------------------------------
+    # ContextVar snapshot contract (HITL / durable execution)
+    # ------------------------------------------------------------------
+
+    def save_contextvar_state(self) -> dict:
+        state = super().save_contextvar_state()
+        state["pending_tool_list"] = _pending_tool_list_var.get(None)
+        state["native_tool_name_map"] = _native_tool_name_map_var.get(None)
+        return state
+
+    def restore_contextvar_state(self, state: dict) -> None:
+        super().restore_contextvar_state(state)
+        if "pending_tool_list" in state:
+            _pending_tool_list_var.set(state["pending_tool_list"])
+        if "native_tool_name_map" in state:
+            _native_tool_name_map_var.set(state["native_tool_name_map"])
+
     def process_llm_response(
         self, llm_response, message_history, agent_type="main"
     ) -> tuple[str, bool]:

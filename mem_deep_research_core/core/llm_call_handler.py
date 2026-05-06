@@ -158,7 +158,7 @@ class LLMCallHandler:
             # Guardrail: pre-LLM validation
             if self._hooks.has_hooks("on_before_llm_call"):
                 try:
-                    self._hooks.call(
+                    await self._hooks.call(
                         "on_before_llm_call",
                         HookContext(
                             hook_name="on_before_llm_call",
@@ -210,7 +210,7 @@ class LLMCallHandler:
                     # Guardrail: post-LLM validation
                     if assistant_response_text and self._hooks.has_hooks("on_after_llm_call"):
                         try:
-                            self._hooks.call(
+                            await self._hooks.call(
                                 "on_after_llm_call",
                                 HookContext(
                                     hook_name="on_after_llm_call",
@@ -351,7 +351,7 @@ class SummaryHandler:
             )
 
             # Hook: on_summarize_prompt_build
-            hook_result = self._hooks.call(
+            hook_result = await self._hooks.call(
                 "on_summarize_prompt_build",
                 HookContext(
                     hook_name="on_summarize_prompt_build",

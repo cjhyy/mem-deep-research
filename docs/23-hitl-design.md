@@ -396,9 +396,11 @@ context fingerprint 保证 resume 时 MCP server env 一致，冷启动成本只
 
 ### 同步 HITL 与 checkpoint 的关系
 
-同步 HITL 默认**不存 checkpoint**（进程崩溃 → 任务失败 → 用户重试）。
+同步 HITL **不存 checkpoint**（进程崩溃 → 任务失败 → 用户重试）。
 
-提供可选配置 `durable_sync_hitl: bool`，显式启用后同步路径也存 checkpoint。默认关闭，避免每个工具调用多 100ms+ 磁盘 I/O。
+> 旧设计提议过可选 `durable_sync_hitl` 让同步路径也持久化，v1.3.0 ship 时删除：
+> 真正需要崩溃恢复的是 async 路径，已经做了；sync 等待几秒到分钟级，崩了重试就行，
+> 多 100ms+ 磁盘 I/O 不划算。
 
 ## 新增模块
 

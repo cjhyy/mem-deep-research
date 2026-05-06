@@ -191,6 +191,27 @@ class LLMProviderClientBase(ABC):
         self.task_id = task_id
         _temperature_override_var.set(None)
 
+    # ------------------------------------------------------------------
+    # ContextVar snapshot contract (HITL / durable execution)
+    # ------------------------------------------------------------------
+
+    def save_contextvar_state(self) -> dict:
+        """Capture ContextVar state owned by this provider for snapshot.
+
+        Subclasses that introduce additional ContextVars must override,
+        extending the dict returned by super().save_contextvar_state().
+        """
+        return {"temperature_override": _temperature_override_var.get(None)}
+
+    def restore_contextvar_state(self, state: dict) -> None:
+        """Restore ContextVar state captured by save_contextvar_state().
+
+        Unknown keys are ignored to keep forward-compat with future provider
+        subclasses that snapshot additional vars.
+        """
+        if "temperature_override" in state:
+            _temperature_override_var.set(state["temperature_override"])
+
     @abstractmethod
     def _create_client(self, config: DictConfig) -> Any:
         """Create specific LLM client"""

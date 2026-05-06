@@ -43,7 +43,7 @@ try:
 
     __version__ = _pkg_version("mem-deep-research")
 except Exception:
-    __version__ = "1.2.3"  # fallback when not installed as package
+    __version__ = "1.3.0"  # fallback when not installed as package
 __author__ = "maki maki"
 
 __all__ = [

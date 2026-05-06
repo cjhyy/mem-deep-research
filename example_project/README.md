@@ -59,11 +59,24 @@ example_project/
 │   └── prompts/                # 自定义 Prompt 模板
 ├── hooks.py                    # 生命周期钩子（自动加载）
 ├── run.py                      # 入口脚本
+├── observability_example.py    # Observer 接入示例
+├── hitl_demo.py                # HITL 四种流程演示（不调 LLM）
 ├── .env                        # API 密钥
 └── logs/                       # 运行日志 + 卸载结果 + 长期记忆
     ├── offloaded_results/      # 大工具结果文件
     └── memory/                 # 长期记忆存储
 ```
+
+## HITL（人审批）演示
+
+```bash
+python hitl_demo.py
+```
+
+不调 LLM、不真跑工具，4 条流程展示 v1.3.0 HITL API：批准 / 拒绝（注入 tool_error）/ 拒绝（abort_task）/ 超时 → 持久化 checkpoint → resume。
+最后打印 transcript 审计追溯（created / decided 事件，可对接合规系统）。
+
+把 `make_approval_hook` 注册到自己项目 `hooks.py` 的 `on_tool_start`，把 `mock_approver` 换成 Slack / email / web UI 通知器即可上生产。
 
 ## 添加搜索能力
 

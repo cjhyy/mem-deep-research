@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Any
 
 from mem_deep_research_core.core.constants import TOOL_TRANSIENT_ERRORS
+from mem_deep_research_core.core.hitl.exceptions import PendingHumanException
 from mem_deep_research_core.core.hooks import HookContext, HookRegistry
 from mem_deep_research_core.core.secure_context import resolve_placeholders_in_args
 from mem_deep_research_core.core.tool_result_formatter import ToolResultFormatter
@@ -179,6 +180,16 @@ class ToolExecutor:
             agent_name=agent_name,
             turn_number=turn_number,
         )
+        # Bind HITL runtime context so wait_for_human() records which tool
+        # originated any pending decision (see hitl/runtime_facade.py).
+        from mem_deep_research_core.core.hitl.runtime_facade import (
+            get_current_runtime,
+        )
+
+        runtime = get_current_runtime()
+        if runtime is not None:
+            runtime.bind_tool_context(tool_call_id=call_id, turn_number=turn_number)
+
         async with self._observers.around_tool_call(_obs_ctx):
             return await self._execute_single_tool_inner(
                 _obs_ctx, server_name, tool_name, arguments, agent_name,
@@ -221,7 +232,7 @@ class ToolExecutor:
 
             # Hook: on_tool_start — 可修改 arguments（深拷贝防止污染原始记录）
             arguments = copy.deepcopy(arguments)
-            modified = self._hooks.call(
+            modified = await self._hooks.call(
                 "on_tool_start",
                 HookContext(
                     hook_name="on_tool_start",
@@ -244,7 +255,7 @@ class ToolExecutor:
             tool_result = self._post_process_tool_result(tool_name, tool_result)
 
             # Hook: on_tool_end — 可修改 tool_result
-            modified_result = self._hooks.call(
+            modified_result = await self._hooks.call(
                 "on_tool_end",
                 HookContext(
                     hook_name="on_tool_end",
@@ -292,6 +303,13 @@ class ToolExecutor:
             _obs_ctx.result = tool_result
             _obs_ctx.duration_ms = call_duration_ms
             return tool_result, call_duration_ms
+
+        except PendingHumanException:
+            # HITL durable-suspend signal — MUST NOT be wrapped into a tool error
+            # result. The outer MainLoopRunner catches this and builds a
+            # checkpoint (Phase 2). Phase 1 lets it propagate to the caller,
+            # which lifts it to the hook that originated the timeout.
+            raise
 
         except Exception as e:
             call_end_time = time.time()

@@ -44,7 +44,7 @@ async def post_process_final_answer(
 
     if hooks is not None and hooks.has_hooks("on_final_answer"):
         original_text = final_answer_text
-        hook_result = hooks.call(
+        hook_result = await hooks.call(
             "on_final_answer",
             HookContext(
                 hook_name="on_final_answer",

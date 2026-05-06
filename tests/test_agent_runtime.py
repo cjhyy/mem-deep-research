@@ -50,7 +50,7 @@ class TestRuntimeIsolation:
         assert rt1.config_loader is not rt2.config_loader
 
     def test_hook_call_isolation(self):
-        """Hooks registered on rt1 don't fire when rt2.hooks.call() is invoked."""
+        """Hooks registered on rt1 don't fire when rt2.hooks.call_sync() is invoked."""
         rt1 = AgentRuntime()
         rt2 = AgentRuntime()
 
@@ -67,10 +67,10 @@ class TestRuntimeIsolation:
 
         ctx = HookContext(hook_name="on_agent_start", query="test")
 
-        rt2.hooks.call("on_agent_start", ctx)
-        assert calls == [], "rt1's hook should NOT fire on rt2.hooks.call()"
+        rt2.hooks.call_sync("on_agent_start", ctx)
+        assert calls == [], "rt1's hook should NOT fire on rt2.hooks.call_sync()"
 
-        rt1.hooks.call("on_agent_start", ctx)
+        rt1.hooks.call_sync("on_agent_start", ctx)
         assert calls == ["rt1"]
 
     def test_set_default_isolation(self):
@@ -81,8 +81,8 @@ class TestRuntimeIsolation:
         rt1.hooks.set_default("on_agent_start", lambda ctx: "default_rt1")
 
         ctx = HookContext(hook_name="on_agent_start", query="test")
-        assert rt1.hooks.call("on_agent_start", ctx) == "default_rt1"
-        assert rt2.hooks.call("on_agent_start", ctx) is None  # no default set
+        assert rt1.hooks.call_sync("on_agent_start", ctx) == "default_rt1"
+        assert rt2.hooks.call_sync("on_agent_start", ctx) is None  # no default set
 
 
 # ============================================================
@@ -118,7 +118,7 @@ class TestSetupHookDefaults:
         # Instance should have defaults
         ctx = HookContext(hook_name="on_agent_start", query="test")
         # Should not raise — default is registered
-        rt.hooks.call("on_agent_start", ctx)
+        rt.hooks.call_sync("on_agent_start", ctx)
 
         # Global should NOT have these defaults (we cleared in fixture)
         assert "on_agent_start" not in global_hooks._default_fns or \

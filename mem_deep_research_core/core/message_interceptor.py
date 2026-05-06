@@ -169,7 +169,7 @@ class MessageInterceptorHandler:
             result, reasoning_blocks = self.key_message_interceptor.process(message, is_last)
 
             # Hook: on_message_intercept
-            hook_result = self._hooks.call(
+            hook_result = await self._hooks.call(
                 "on_message_intercept",
                 HookContext(
                     hook_name="on_message_intercept",

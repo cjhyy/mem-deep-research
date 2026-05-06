@@ -155,7 +155,7 @@ class ToolResultFormatter:
             context=self.context,
             extra=extra,
         )
-        return self._hooks.call("on_thinking_generate", ctx)
+        return self._hooks.call_sync("on_thinking_generate", ctx)
 
     def extract_tool_query_info(self, tool_name: str, arguments: dict) -> str | None:
         """
@@ -205,4 +205,4 @@ class ToolResultFormatter:
             arguments=arguments or {},
             context=self.context,
         )
-        return self._hooks.call("on_tool_result_format", ctx)
+        return self._hooks.call_sync("on_tool_result_format", ctx)

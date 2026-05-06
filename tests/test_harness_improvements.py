@@ -556,7 +556,7 @@ class TestInputCompilerHook:
     def test_hook_modifies_query_string(self):
         mock_hooks = MagicMock()
         mock_hooks.has_hooks.return_value = True
-        mock_hooks.call.return_value = "modified query"
+        mock_hooks.call_sync.return_value = "modified query"
 
         result = InputCompiler(hooks=mock_hooks).compile("original query")
         assert result.query == "modified query"
@@ -564,7 +564,7 @@ class TestInputCompilerHook:
     def test_hook_modifies_query_dict(self):
         mock_hooks = MagicMock()
         mock_hooks.has_hooks.return_value = True
-        mock_hooks.call.return_value = {
+        mock_hooks.call_sync.return_value = {
             "query": "dict modified query",
             "attachments": [{"type": "custom", "data": "extra"}],
         }
@@ -579,12 +579,12 @@ class TestInputCompilerHook:
 
         result = InputCompiler(hooks=mock_hooks).compile("just a query")
         assert result.query == "just a query"
-        mock_hooks.call.assert_not_called()
+        mock_hooks.call_sync.assert_not_called()
 
     def test_hook_returns_none_no_change(self):
         mock_hooks = MagicMock()
         mock_hooks.has_hooks.return_value = True
-        mock_hooks.call.return_value = None
+        mock_hooks.call_sync.return_value = None
 
         result = InputCompiler(hooks=mock_hooks).compile("unchanged query")
         assert result.query == "unchanged query"

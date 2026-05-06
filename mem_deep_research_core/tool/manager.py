@@ -111,7 +111,7 @@ def update_server_params_with_context(
         context=context,
     )
 
-    return hook_registry.call("on_env_inject", ctx)
+    return hook_registry.call_sync("on_env_inject", ctx)
 
 
 def with_timeout(timeout_s: float = 300.0):

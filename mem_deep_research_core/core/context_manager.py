@@ -221,10 +221,43 @@ class ContextManagerConfig:
     enable_evidence_extraction: bool = True
 
     def __post_init__(self):
+        # Cross-field: window strategy ordering must be coherent.
         if self.compact_at_ratio >= self.summarize_at_ratio:
             raise ValueError(
                 f"compact_at_ratio ({self.compact_at_ratio}) must be less than "
                 f"summarize_at_ratio ({self.summarize_at_ratio})"
+            )
+
+        # Per-field bounds — catch typos ("8" instead of "0.8") and silly inputs
+        # at config load instead of letting downstream code divide by them.
+        if not 0.0 < self.compact_at_ratio < 1.0:
+            raise ValueError(
+                f"compact_at_ratio must be in (0.0, 1.0), got {self.compact_at_ratio}"
+            )
+        if not 0.0 < self.summarize_at_ratio <= 1.0:
+            raise ValueError(
+                f"summarize_at_ratio must be in (0.0, 1.0], got {self.summarize_at_ratio}"
+            )
+        if self.compact_keep_recent < 1:
+            raise ValueError(
+                f"compact_keep_recent must be >= 1, got {self.compact_keep_recent}"
+            )
+        if self.compact_preview_length < 0:
+            raise ValueError(
+                f"compact_preview_length must be >= 0, got {self.compact_preview_length}"
+            )
+        if self.max_dedup_cache_size < 0:
+            raise ValueError(
+                f"max_dedup_cache_size must be >= 0, got {self.max_dedup_cache_size}"
+            )
+        if self.chars_per_token <= 0:
+            raise ValueError(
+                f"chars_per_token must be > 0, got {self.chars_per_token}"
+            )
+        if self.result_offload_threshold < 0:
+            raise ValueError(
+                f"result_offload_threshold must be >= 0 (0 = disabled), "
+                f"got {self.result_offload_threshold}"
             )
 
 
@@ -337,6 +370,22 @@ class ContextManager:
         """Set the directory for offloading large results."""
         self._offload_dir = path
 
+    @staticmethod
+    def extract_offload_refs(tool_result_for_llm: dict | None) -> list[str]:
+        """Return offload refs attached to a formatted tool-result dict, if any.
+
+        Centralises knowledge of the ``_offload_refs`` sidecar field so
+        callers (HITL concurrent-batch suspend, resume restore, etc.) don't
+        embed the literal field name. Returns ``[]`` when the dict has no
+        offload refs or is None.
+        """
+        from mem_deep_research_core.core.constants import MSG_FIELD_OFFLOAD_REFS
+
+        if not isinstance(tool_result_for_llm, dict):
+            return []
+        refs = tool_result_for_llm.get(MSG_FIELD_OFFLOAD_REFS)
+        return list(refs) if refs else []
+
     def _generate_offload_ref(self) -> str:
         """生成稳定的逻辑引用（短 UUID），含碰撞重试"""
         for _ in range(10):
@@ -374,7 +423,7 @@ class ContextManager:
         from mem_deep_research_core.core.hooks import HookContext
 
         if self._hooks is not None and self._hooks.has_hooks("on_result_offload"):
-            hook_result = self._hooks.call(
+            hook_result = self._hooks.call_sync(
                 "on_result_offload",
                 HookContext(
                     hook_name="on_result_offload",
@@ -469,7 +518,7 @@ class ContextManager:
             # Hook: on_result_restore — 用户可覆盖读取后端
             original_content = None
             if self._hooks is not None and self._hooks.has_hooks("on_result_restore"):
-                hook_result = self._hooks.call(
+                hook_result = self._hooks.call_sync(
                     "on_result_restore",
                     HookContext(
                         hook_name="on_result_restore",
@@ -547,7 +596,12 @@ class ContextManager:
                         state="backed_up",
                     )
 
-            # Case 2: messages still carrying OFFLOADED markers
+            # Case 2: messages still carrying OFFLOADED markers.
+            # An offloaded message keeps its ``_offload_refs`` sidecar
+            # (Case 1 saw it and recorded state="backed_up"), so we must
+            # *upgrade* the state to "offloaded" when we see the marker —
+            # the marker is the authoritative signal that content was
+            # replaced, while ``_offload_refs`` is the durable handle list.
             content = msg.get("content")
             if not isinstance(content, list) or not content:
                 continue
@@ -562,13 +616,19 @@ class ContextManager:
             ):
                 ref = match.group(1)
                 chars = int(match.group(2))
-                if ref not in self._offload_registry:
+                existing = self._offload_registry.get(ref)
+                if existing is None:
                     self._offload_registry[ref] = OffloadRecord(
                         ref=ref,
                         turn=0,
                         char_count=chars,
                         state="offloaded",
                     )
+                else:
+                    # Upgrade Case 1's "backed_up" guess to "offloaded".
+                    existing.state = "offloaded"
+                    if not existing.char_count:
+                        existing.char_count = chars
 
         if self._offload_registry:
             logger.info(
@@ -590,7 +650,7 @@ class ContextManager:
 
         # Hook: on_result_restore
         if self._hooks is not None and self._hooks.has_hooks("on_result_restore"):
-            hook_result = self._hooks.call(
+            hook_result = self._hooks.call_sync(
                 "on_result_restore",
                 HookContext(
                     hook_name="on_result_restore",
@@ -1269,6 +1329,44 @@ class ContextManager:
     # ============================================================
     # 工具方法
     # ============================================================
+
+    # ------------------------------------------------------------------
+    # Snapshot contract (HITL / durable execution)
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """Capture internal state for RuntimeSnapshot.
+
+        Returns a dict of live references (not a deep copy). The snapshot
+        is intended to be handed straight to :meth:`restore` on a fresh
+        ContextManager or written out via HITL checkpoint store.
+        Session memory / profile references are *not* snapshotted — callers
+        must re-attach those after restore.
+        """
+        return {
+            "current_turn": self._current_turn,
+            "offload_registry": dict(self._offload_registry),
+            "dedup_cache": dict(self._dedup_cache),
+            "call_registry": list(self._call_registry),
+            "compacted_turns": set(self._compacted_turns),
+        }
+
+    def restore(self, state: dict) -> None:
+        """Restore internal state from a snapshot produced by :meth:`snapshot`.
+
+        Ignores keys not present in the snapshot so that newer snapshots
+        carrying extra fields remain loadable by older code.
+        """
+        if "current_turn" in state:
+            self._current_turn = state["current_turn"]
+        if "offload_registry" in state:
+            self._offload_registry = dict(state["offload_registry"])
+        if "dedup_cache" in state:
+            self._dedup_cache = dict(state["dedup_cache"])
+        if "call_registry" in state:
+            self._call_registry = list(state["call_registry"])
+        if "compacted_turns" in state:
+            self._compacted_turns = set(state["compacted_turns"])
 
     def reset(self) -> None:
         """重置所有状态"""

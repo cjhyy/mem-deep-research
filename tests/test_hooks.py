@@ -23,7 +23,7 @@ class TestHookRegistration:
             return "hooked"
 
         registry.register_fn("on_agent_start", my_hook)
-        result = registry.call("on_agent_start", HookContext(hook_name="on_agent_start"))
+        result = registry.call_sync("on_agent_start", HookContext(hook_name="on_agent_start"))
         assert result == "hooked"
         assert called == ["on_agent_start"]
 
@@ -34,7 +34,7 @@ class TestHookRegistration:
         def my_hook(ctx, original_fn):
             return "decorated"
 
-        result = registry.call("on_tool_end", HookContext(hook_name="on_tool_end"))
+        result = registry.call_sync("on_tool_end", HookContext(hook_name="on_tool_end"))
         assert result == "decorated"
 
     def test_unknown_hook_raises(self, registry):
@@ -46,7 +46,7 @@ class TestHookRegistration:
             registry.register_fn("on_nonexistent", lambda c, o: None)
 
         with pytest.raises(ValueError, match="Unknown hook"):
-            registry.call("on_nonexistent", HookContext(hook_name="on_nonexistent"))
+            registry.call_sync("on_nonexistent", HookContext(hook_name="on_nonexistent"))
 
 
 class TestHookChaining:
@@ -67,7 +67,7 @@ class TestHookChaining:
         registry.register_fn("on_turn_start", hook_low, priority=1)
         registry.register_fn("on_turn_start", hook_high, priority=10)
 
-        registry.call("on_turn_start", HookContext(hook_name="on_turn_start"))
+        registry.call_sync("on_turn_start", HookContext(hook_name="on_turn_start"))
         assert order == ["high", "low"]
 
     def test_chain_with_default(self, registry):
@@ -79,7 +79,7 @@ class TestHookChaining:
             return base + "_enhanced"
 
         registry.register_fn("on_agent_start", my_hook)
-        result = registry.call("on_agent_start", HookContext(hook_name="on_agent_start"))
+        result = registry.call_sync("on_agent_start", HookContext(hook_name="on_agent_start"))
         assert result == "default_result_enhanced"
 
     def test_hook_overrides_default(self, registry):
@@ -90,7 +90,7 @@ class TestHookChaining:
             return "completely_overridden"
 
         registry.register_fn("on_agent_end", override_hook)
-        result = registry.call("on_agent_end", HookContext(hook_name="on_agent_end"))
+        result = registry.call_sync("on_agent_end", HookContext(hook_name="on_agent_end"))
         assert result == "completely_overridden"
 
 
@@ -100,12 +100,12 @@ class TestHookDefaults:
     def test_no_hooks_uses_default(self, registry):
         """无注册钩子时走默认实现"""
         registry.set_default("on_turn_end", lambda ctx: "default_turn_end")
-        result = registry.call("on_turn_end", HookContext(hook_name="on_turn_end"))
+        result = registry.call_sync("on_turn_end", HookContext(hook_name="on_turn_end"))
         assert result == "default_turn_end"
 
     def test_no_hooks_no_default_returns_none(self, registry):
         """无注册钩子且无默认实现返回 None"""
-        result = registry.call("on_agent_start", HookContext(hook_name="on_agent_start"))
+        result = registry.call_sync("on_agent_start", HookContext(hook_name="on_agent_start"))
         assert result is None
 
 
@@ -201,7 +201,7 @@ class TestNewHooks:
             {"tool_name": "blocked", "arguments": {}},
             {"tool_name": "read", "arguments": {}},
         ]
-        result = registry.call(
+        result = registry.call_sync(
             "on_tool_filter",
             HookContext(hook_name="on_tool_filter", tool_calls_batch=batch),
         )
@@ -218,11 +218,11 @@ class TestNewHooks:
             return original_fn(ctx)
 
         registry.register_fn("on_context_compact", compact_hook)
-        registry.call(
+        registry.call_sync(
             "on_context_compact",
             HookContext(hook_name="on_context_compact", compact_action="masking"),
         )
-        registry.call(
+        registry.call_sync(
             "on_context_compact",
             HookContext(hook_name="on_context_compact", compact_action="emergency"),
         )
@@ -235,7 +235,7 @@ class TestNewHooks:
             return ctx.result + "\n\nFocus on data quality."
 
         registry.register_fn("on_reflection_build", reflection_hook)
-        result = registry.call(
+        result = registry.call_sync(
             "on_reflection_build",
             HookContext(hook_name="on_reflection_build", result="Original reflection"),
         )
@@ -243,7 +243,7 @@ class TestNewHooks:
 
     def test_on_tool_filter_not_registered_returns_default(self, registry):
         """on_tool_filter 未注册时返回 None (默认行为)"""
-        result = registry.call(
+        result = registry.call_sync(
             "on_tool_filter",
             HookContext(hook_name="on_tool_filter", tool_calls_batch=[{"tool_name": "a"}]),
         )
@@ -256,7 +256,7 @@ class TestNewHooks:
             return ctx.result + " [reviewed]"
 
         registry.register_fn("on_final_answer", final_answer_hook)
-        result = registry.call(
+        result = registry.call_sync(
             "on_final_answer",
             HookContext(hook_name="on_final_answer", result="Base answer"),
         )

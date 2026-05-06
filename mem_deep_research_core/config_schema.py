@@ -407,6 +407,49 @@ class BenchmarkConfig(BaseModel):
     name: str = Field(default="custom", description="Benchmark 名称")
 
 
+class HitlConfig(BaseModel):
+    """HITL (human-in-the-loop) 配置 (v1.3.0+)"""
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether wait_for_human() is honoured. Disable to force all "
+        "approval hooks to return immediately (useful for tests).",
+    )
+    checkpoint_dir: str | None = Field(
+        default=None,
+        description="Directory for HITL checkpoints. Falls back to output_dir "
+        "or the log file's parent when unset.",
+    )
+    sweep_on_start: bool = Field(
+        default=False,
+        description="If True, DeepResearch.initialize() runs "
+        "sweep_expired_checkpoints() before the first task. Default False "
+        "so short-lived scripts stay fast.",
+    )
+    rejection_strategy: str = Field(
+        default="tool_error",
+        description="How a HumanDecision(approved=False) propagates: "
+        "'tool_error' (default) injects a [HITL rejected] tool result so the "
+        "LLM can react and continue; 'abort_task' terminates the task with "
+        "status=failed and error=HITL rejected, no further LLM calls. "
+        "Choose 'abort_task' when rejected operations should never have "
+        "downstream consequences (e.g. high-stakes financial actions).",
+    )
+
+    @field_validator("rejection_strategy")
+    @classmethod
+    def _validate_rejection_strategy(cls, v):
+        allowed = {"tool_error", "abort_task"}
+        if v not in allowed:
+            raise ValueError(
+                f"rejection_strategy must be one of {sorted(allowed)}, got {v!r}"
+            )
+        return v
+
+    class Config:
+        extra = "allow"
+
+
 class AgentConfig(BaseModel):
     """完整的 Agent 配置"""
 
@@ -415,6 +458,7 @@ class AgentConfig(BaseModel):
     benchmark: BenchmarkConfig = Field(
         default_factory=BenchmarkConfig, description="Benchmark 配置"
     )
+    hitl: HitlConfig = Field(default_factory=HitlConfig, description="HITL 配置 (v1.3.0+)")
     output_dir: str = Field(default="logs/", description="输出目录")
 
     @field_validator("sub_agents")
@@ -452,6 +496,52 @@ class ToolConfig(BaseModel):
         return v
 
 
+# Top-level keys we recognise. Anything outside this set is allowed (Hydra
+# defaults, _target_, env-injection, project extensions), but if a key
+# looks suspiciously close to a known one we warn — typo catch.
+_KNOWN_TOP_LEVEL_KEYS = frozenset({
+    "main_agent",
+    "sub_agents",
+    "benchmark",
+    "hitl",
+    "output_dir",
+    # Hydra / framework metadata
+    "defaults",
+    "_target_",
+    "_recursive_",
+    "_partial_",
+    "env",
+    "hydra",
+})
+
+
+def _detect_top_level_typos(config_dict: dict[str, Any]) -> list[str]:
+    """Return human-readable warnings for top-level keys that look like typos.
+
+    Uses a cheap edit-distance heuristic: if an unknown key is within edit
+    distance 2 of a known key, it's almost certainly a typo. ``main_agnt``
+    silently picking up Hydra-default values has bitten users; this surfaces
+    the mistake at config-load.
+    """
+    import difflib
+
+    warnings: list[str] = []
+    for key in config_dict.keys():
+        if key in _KNOWN_TOP_LEVEL_KEYS or key.startswith("_"):
+            continue
+        # Top 1 close match within ratio 0.75; difflib's ratio loosely
+        # corresponds to "two-edit-distance" for ~10-char strings.
+        close = difflib.get_close_matches(
+            key, _KNOWN_TOP_LEVEL_KEYS, n=1, cutoff=0.75
+        )
+        if close:
+            warnings.append(
+                f"top-level key {key!r} looks like a typo of {close[0]!r}; "
+                f"check spelling or prefix with `_` if it's intentional"
+            )
+    return warnings
+
+
 def validate_agent_config(config_dict: dict[str, Any]) -> AgentConfig:
     """
     验证 Agent 配置字典。
@@ -465,6 +555,16 @@ def validate_agent_config(config_dict: dict[str, Any]) -> AgentConfig:
     Raises:
         pydantic.ValidationError: 配置验证失败
     """
+    # Pre-flight typo check — log warnings before Pydantic runs so users see
+    # the suspicious key name in the same error block as any schema errors.
+    typo_warnings = _detect_top_level_typos(config_dict)
+    if typo_warnings:
+        import logging
+
+        log = logging.getLogger("mem_deep_research")
+        for w in typo_warnings:
+            log.warning(f"[Config] {w}")
+
     return AgentConfig.model_validate(config_dict)
 
 

@@ -149,7 +149,7 @@ class LLMRouter:
                     ),
                 },
             )
-            hook_result = self.hooks.call("on_route_classify", hook_ctx)
+            hook_result = await self.hooks.call("on_route_classify", hook_ctx)
             result = self._parse_hook_result(hook_result)
             if result is not None:
                 logger.info(f"[LLMRouter] Hook classified as: {result.mode}")
@@ -297,7 +297,7 @@ class LLMRouter:
                 },
             )
 
-            hook_result = self.hooks.call("on_route_apply", hook_ctx)
+            hook_result = self.hooks.call_sync("on_route_apply", hook_ctx)
             effort_changed = False
             if isinstance(hook_result, dict):
                 result.mode = hook_result.get("mode", result.mode)

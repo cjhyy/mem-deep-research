@@ -283,6 +283,97 @@ class TestConfigValidationFailFast:
         with pytest.raises(ConfigValidationError, match="critical"):
             dr._validate_config()
 
+    def test_cross_field_invariant_raises(self):
+        """Cross-field invariant (compact_at_ratio >= summarize_at_ratio) is critical.
+
+        Regression: previously fell through to "warning + defaults", silently
+        discarding the user's invalid ratios.
+        """
+        from mem_deep_research_core.deep_research import DeepResearch
+        from mem_deep_research_core.exceptions import ConfigValidationError
+
+        dr = DeepResearch.__new__(DeepResearch)
+        dr._cfg = OmegaConf.create({
+            "main_agent": {
+                "llm": {
+                    "provider_class": "ClaudeAnthropicClient",
+                    "model_name": "claude-sonnet-4",
+                },
+                "context_manager": {
+                    "compact_at_ratio": 0.9,
+                    "summarize_at_ratio": 0.5,
+                },
+            }
+        })
+        with pytest.raises(ConfigValidationError, match="compact_at_ratio"):
+            dr._validate_config()
+
+
+class TestContextManagerConfigBounds:
+    """Per-field bounds on ContextManagerConfig — fail-fast at construct time."""
+
+    def test_compact_keep_recent_must_be_positive(self):
+        from mem_deep_research_core.core.context_manager import ContextManagerConfig
+
+        with pytest.raises(ValueError, match="compact_keep_recent"):
+            ContextManagerConfig(compact_keep_recent=0)
+
+    def test_chars_per_token_must_be_positive(self):
+        from mem_deep_research_core.core.context_manager import ContextManagerConfig
+
+        with pytest.raises(ValueError, match="chars_per_token"):
+            ContextManagerConfig(chars_per_token=0)
+
+    def test_negative_offload_threshold_rejected(self):
+        from mem_deep_research_core.core.context_manager import ContextManagerConfig
+
+        with pytest.raises(ValueError, match="result_offload_threshold"):
+            ContextManagerConfig(result_offload_threshold=-1)
+
+    def test_compact_ratio_out_of_range(self):
+        from mem_deep_research_core.core.context_manager import ContextManagerConfig
+
+        # Common typo: 8 instead of 0.8 — caught immediately.
+        with pytest.raises(ValueError, match="compact_at_ratio"):
+            ContextManagerConfig(compact_at_ratio=8.0, summarize_at_ratio=10.0)
+
+
+class TestTopLevelTypoDetection:
+    """Hydra-style configs allow extras, but typos of known sections are warned."""
+
+    def test_typo_warning_for_main_agnt(self, caplog):
+        import logging
+
+        from mem_deep_research_core.config_schema import _detect_top_level_typos
+
+        warnings = _detect_top_level_typos({
+            "main_agnt": {"llm": {}},  # typo of main_agent
+            "sub_agents": None,
+        })
+        assert any("main_agnt" in w and "main_agent" in w for w in warnings)
+
+    def test_unknown_extension_key_not_flagged(self):
+        """Project extensions (e.g. ``my_custom_section``) shouldn't warn —
+        only keys close to a known one trigger the heuristic."""
+        from mem_deep_research_core.config_schema import _detect_top_level_typos
+
+        warnings = _detect_top_level_typos({
+            "main_agent": {},
+            "my_custom_thing": {},  # too different from any known key
+        })
+        assert warnings == []
+
+    def test_underscore_prefix_skipped(self):
+        """Hydra metadata keys like ``_target_`` aren't flagged."""
+        from mem_deep_research_core.config_schema import _detect_top_level_typos
+
+        warnings = _detect_top_level_typos({
+            "_target_": "x",
+            "_recursive_": True,
+            "main_agent": {},
+        })
+        assert warnings == []
+
 
 # ============================================================
 # P1-4: InputCompiler @file security

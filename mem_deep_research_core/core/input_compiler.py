@@ -148,7 +148,7 @@ class InputCompiler:
 
         # 3. Hook: on_query_compile — 允许业务侧修改
         if self.hooks.has_hooks("on_query_compile"):
-            hook_result = self.hooks.call(
+            hook_result = self.hooks.call_sync(
                 "on_query_compile",
                 HookContext(
                     hook_name="on_query_compile",

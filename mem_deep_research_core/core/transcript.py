@@ -79,6 +79,11 @@ class EventType(str, Enum):
     ERROR = "error"
     CHECKPOINT = "checkpoint"
 
+    # HITL audit trail (v1.3.0+) — request lifecycle for compliance / replay
+    HITL_REQUEST_CREATED = "hitl_request_created"
+    HITL_REQUEST_DECIDED = "hitl_request_decided"
+    HITL_REQUEST_RESUMED = "hitl_request_resumed"
+
 
 @dataclass
 class TranscriptEvent:

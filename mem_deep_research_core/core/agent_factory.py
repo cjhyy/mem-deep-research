@@ -54,10 +54,14 @@ class AgentTaskResult:
     final_answer: str
     boxed_answer: str
     log_path: pathlib.Path
-    status: str  # "completed", "failed", "interrupted"
+    status: str  # "completed" | "failed" | "interrupted" | "awaiting_human"
     duration_seconds: float
     error: str | None = None
     error_type: str | None = None  # v0.3: "llm_error", "tool_error", "config_error", "timeout"
+
+    # v1.3.0 HITL — set when status == "awaiting_human"
+    checkpoint_id: str | None = None
+    pending_human_request: Any | None = None  # PendingHumanRequest
 
 
 class AgentFactory:
@@ -241,6 +245,19 @@ class AgentFactory:
 
         self._initialized = True
 
+        # HITL: optional sweep of expired checkpoints on startup.
+        hitl_cfg = cfg.get("hitl", {}) if hasattr(cfg, "get") else {}
+        if hitl_cfg and bool(hitl_cfg.get("sweep_on_start", False)):
+            try:
+                swept = await self.sweep_expired_checkpoints()
+                if swept:
+                    logger.info(
+                        f"[HITL] Swept {len(swept)} expired checkpoints on startup"
+                    )
+            except Exception as exc:
+                # Don't block startup on sweep failures — log and continue.
+                logger.warning(f"[HITL] sweep_on_start failed: {exc}")
+
     def _generate_task_id(self) -> str:
         """生成任务 ID"""
         return f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -288,7 +305,14 @@ class AgentFactory:
             on_progress("started", {"task_id": task_id, "task": task})
 
         try:
-            final_answer, boxed_answer, log_file, pipeline_status = await execute_task_pipeline(
+            (
+                final_answer,
+                boxed_answer,
+                log_file,
+                pipeline_status,
+                checkpoint_id,
+                pending_request,
+            ) = await execute_task_pipeline(
                 cfg=self.agent_config.cfg,
                 task_name="agent_task",
                 task_id=task_id,
@@ -315,10 +339,12 @@ class AgentFactory:
                 log_path=log_file,
                 status=pipeline_status,
                 duration_seconds=duration,
+                checkpoint_id=checkpoint_id,
+                pending_human_request=pending_request,
             )
 
             if on_progress:
-                on_progress("completed", result)
+                on_progress("completed" if pipeline_status == "completed" else pipeline_status, result)
 
             return result
 
@@ -353,6 +379,107 @@ class AgentFactory:
                 on_progress("failed", result)
 
             return result
+
+    async def resume_with_human_decision(
+        self,
+        checkpoint_id: str,
+        decision: Any,
+        *,
+        task_description: str | None = None,
+        task_id: str | None = None,
+        stream_queue: Any | None = None,
+        history: list[dict[str, Any]] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> AgentTaskResult:
+        """Resume a HITL-suspended task by delivering ``decision``.
+
+        ``task_description`` is auto-resolved from the checkpoint snapshot
+        when omitted. Pass it explicitly only for migrating pre-v1.3.0
+        checkpoints whose snapshot predates the field.
+
+        Returns an :class:`AgentTaskResult` with ``status == "completed"``
+        on success, or ``status == "awaiting_human"`` if the resumed run
+        triggers another HITL suspend.
+        """
+        from mem_deep_research_core.core.pipeline import (
+            execute_hitl_resume_pipeline,
+        )
+
+        await self.initialize()
+
+        if task_id is None:
+            task_id = self._generate_task_id()
+
+        log_path = self.agent_config.logs_dir / f"{task_id}.json"
+        start_time = datetime.now()
+
+        try:
+            (
+                final_answer,
+                boxed_answer,
+                log_file,
+                pipeline_status,
+                new_checkpoint_id,
+                pending_request,
+            ) = await execute_hitl_resume_pipeline(
+                cfg=self.agent_config.cfg,
+                task_id=task_id,
+                task_description=task_description,
+                checkpoint_id=checkpoint_id,
+                decision=decision,
+                main_agent_tool_manager=self._main_agent_tool_manager,
+                sub_agent_tool_managers=self._sub_agent_tool_managers,
+                output_formatter=self._output_formatter,
+                log_path=log_path,
+                tool_definitions=self._tool_definitions,
+                stream_queue=stream_queue,
+                history=history,
+                context=context,
+                runtime=self.runtime,
+            )
+            duration = (datetime.now() - start_time).total_seconds()
+            return AgentTaskResult(
+                task_id=task_id,
+                final_answer=final_answer,
+                boxed_answer=boxed_answer,
+                log_path=log_file,
+                status=pipeline_status,
+                duration_seconds=duration,
+                checkpoint_id=new_checkpoint_id,
+                pending_human_request=pending_request,
+            )
+        except Exception as e:
+            duration = (datetime.now() - start_time).total_seconds()
+            logger.error(f"HITL resume failed: {e}", exc_info=True)
+            return AgentTaskResult(
+                task_id=task_id,
+                final_answer=f"Error: {e}",
+                boxed_answer="",
+                log_path=log_path,
+                status="failed",
+                duration_seconds=duration,
+                error=str(e),
+                error_type="unknown",
+            )
+
+    async def sweep_expired_checkpoints(self) -> list[str]:
+        """Delete any HITL checkpoints whose async_timeout has elapsed.
+
+        Returns the list of deleted checkpoint ids (empty when nothing expired).
+        Call this periodically — typically via an out-of-band scheduler — to
+        keep ``<output_dir>/pending/`` tidy.
+        """
+        from mem_deep_research_core.core.hitl.checkpoint_store import (
+            FilesystemCheckpointStore,
+        )
+        from mem_deep_research_core.core.pipeline import _get_hitl_checkpoint_dir
+
+        checkpoint_dir = _get_hitl_checkpoint_dir(
+            self.agent_config.cfg,
+            self.agent_config.logs_dir / "sweeper.placeholder",
+        )
+        store = FilesystemCheckpointStore(checkpoint_dir)
+        return await store.sweep_expired()
 
     async def close(self) -> None:
         """Clean up all resources — call on shutdown.

@@ -289,3 +289,28 @@ class InlineSkillSelector:
         """重置状态"""
         self._pending_skills = []
         self._first_turn = True
+
+    # ------------------------------------------------------------------
+    # Snapshot contract (HITL / durable execution)
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        """Capture transient state (pending skills + first-turn flag) for RuntimeSnapshot.
+
+        Matcher / injector / skill_commands come from config and are *not* snapshotted;
+        callers re-attach them on the restored selector instance.
+        """
+        return {
+            "pending_skills": list(self._pending_skills),
+            "first_turn": self._first_turn,
+            "touched_files": list(self._touched_files),
+        }
+
+    def restore(self, state: dict) -> None:
+        """Restore transient state from a snapshot produced by :meth:`snapshot`."""
+        if "pending_skills" in state:
+            self._pending_skills = list(state["pending_skills"])
+        if "first_turn" in state:
+            self._first_turn = state["first_turn"]
+        if "touched_files" in state:
+            self._touched_files = list(state["touched_files"])

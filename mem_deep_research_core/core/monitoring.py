@@ -129,6 +129,57 @@ class ExecutionMonitor:
         self._last_loop_action = EscalationAction.NONE
         self._soft_timeout_fired = False
 
+    # ------------------------------------------------------------------
+    # Snapshot contract (HITL / durable execution)
+    # ------------------------------------------------------------------
+
+    def state_snapshot(self) -> dict:
+        """Capture monitor state for RuntimeSnapshot.
+
+        ``config`` is *not* snapshotted (it's static / supplied at construction);
+        only mutable state fields are captured.
+        """
+        return {
+            "loop_start_time": self.state.loop_start_time,
+            "last_progress_time": self.state.last_progress_time,
+            "consecutive_empty_turns": self.state.consecutive_empty_turns,
+            "last_response_hash": self.state.last_response_hash,
+            "response_loop_escalation_count": self.state.response_loop_escalation_count,
+            "response_hash_window": list(self.state.response_hash_window),
+            "tool_loop_retry_count": self.state.tool_loop_retry_count,
+            "stall_warned": self.state.stall_warned,
+            "attempted_strategies": list(self.state.attempted_strategies),
+            "last_loop_action": self._last_loop_action.value,
+            "soft_timeout_fired": self._soft_timeout_fired,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """Restore monitor state from a snapshot produced by :meth:`state_snapshot`."""
+        self.state.loop_start_time = state.get("loop_start_time", self.state.loop_start_time)
+        self.state.last_progress_time = state.get(
+            "last_progress_time", self.state.last_progress_time
+        )
+        self.state.consecutive_empty_turns = state.get(
+            "consecutive_empty_turns", self.state.consecutive_empty_turns
+        )
+        self.state.last_response_hash = state.get(
+            "last_response_hash", self.state.last_response_hash
+        )
+        self.state.response_loop_escalation_count = state.get(
+            "response_loop_escalation_count", self.state.response_loop_escalation_count
+        )
+        if "response_hash_window" in state:
+            self.state.response_hash_window = list(state["response_hash_window"])
+        self.state.tool_loop_retry_count = state.get(
+            "tool_loop_retry_count", self.state.tool_loop_retry_count
+        )
+        self.state.stall_warned = state.get("stall_warned", self.state.stall_warned)
+        if "attempted_strategies" in state:
+            self.state.attempted_strategies = list(state["attempted_strategies"])
+        if "last_loop_action" in state:
+            self._last_loop_action = EscalationAction(state["last_loop_action"])
+        self._soft_timeout_fired = state.get("soft_timeout_fired", self._soft_timeout_fired)
+
     @property
     def last_loop_action(self) -> EscalationAction:
         """暴露最后一次循环检测的升级动作"""
